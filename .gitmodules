@@ -1,4 +1,0 @@
-[submodule "bam"]
-	path = bam
-	url = https://github.com/ZaidQureshi/bam.git
-	branch = window_buffer
