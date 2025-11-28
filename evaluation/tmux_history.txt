@@ -1,0 +1,41 @@
+(base) xhk@g124:~$ tmux attach -t 0
+sessions should be nested with care, unset $TMUX to force
+(base) xhk@g124:~$ echo $TMUX
+/tmp//tmux-1004/default,720155,1
+(base) xhk@g124:~$ conda activate pytorch
+(pytorch) xhk@g124:~$ tmux show-options -g | grep history
+history-limit 2000
+(pytorch) xhk@g124:~$ sudo cat history-limit
+[sudo] password for xhk:
+cat: history-limit: No such file or directory
+(pytorch) xhk@g124:~$ sudo cat history-limit 2000
+cat: history-limit: No such file or directory
+cat: 2000: No such file or directory
+(pytorch) xhk@g124:~$ cd hyperion
+(pytorch) xhk@g124:~/hyperion$ cd GIDS
+(pytorch) xhk@g124:~/hyperion/GIDS$ cd evaluation
+(pytorch) xhk@g124:~/hyperion/GIDS/evaluation$ tmux capture-pane -p -S -2000 > tmux_history.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,3 @@
+/home/xhk/hyperion/GIDS/gids_module/build/CMakeFiles/BAM_Feature_Store.dir
+/home/xhk/hyperion/GIDS/gids_module/build/CMakeFiles/edit_cache.dir
+/home/xhk/hyperion/GIDS/gids_module/build/CMakeFiles/rebuild_cache.dir

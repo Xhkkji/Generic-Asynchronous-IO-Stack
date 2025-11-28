@@ -1,0 +1,7 @@
+setup.py
+/home/xhk/hyperion/GIDS/gids_module/build/BAM_Feature_Store/BAM_Feature_Store.so
+/home/xhk/hyperion/GIDS/gids_module/build/BAM_Feature_Store/__init__.py
+/home/xhk/hyperion/GIDS/gids_module/build/cmake_cpp_pybind11.egg-info/PKG-INFO
+/home/xhk/hyperion/GIDS/gids_module/build/cmake_cpp_pybind11.egg-info/SOURCES.txt
+/home/xhk/hyperion/GIDS/gids_module/build/cmake_cpp_pybind11.egg-info/dependency_links.txt
+/home/xhk/hyperion/GIDS/gids_module/build/cmake_cpp_pybind11.egg-info/top_level.txt

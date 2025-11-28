@@ -1,0 +1,8 @@
+setup.py
+GIDS/GIDS.py
+GIDS/__init__.py
+GIDS/test.py
+GIDS.egg-info/PKG-INFO
+GIDS.egg-info/SOURCES.txt
+GIDS.egg-info/dependency_links.txt
+GIDS.egg-info/top_level.txt
