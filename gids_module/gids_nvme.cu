@@ -277,9 +277,9 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
 
   for (uint64_t i = 0; i < num_iter; i++)
   {
-    uint64_t i_ptr = i_ptr_list[i];
+    uint64_t i_ptr = i_ptr_list[i]; // 获取当前iter的[index_num[i], feature_dim]二维数组指针
     uint64_t i_index_ptr = i_index_ptr_list[i];
-    TYPE *tensor_ptr = (TYPE *)i_ptr;
+    TYPE *tensor_ptr = (TYPE *)i_ptr; // [index_num[i], feature_dim]二维数组指针
     int64_t *index_ptr = (int64_t *)i_index_ptr;
 
     uint64_t b_size = blkSize;

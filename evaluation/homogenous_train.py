@@ -19,6 +19,8 @@ from GIDS import GIDS_DGLDataLoader
 from ogb.graphproppred import DglGraphPropPredDataset
 from ogb.nodeproppred import DglNodePropPredDataset, Evaluator
 
+import sys
+
 torch.manual_seed(0)
 dgl.seed(0)
 warnings.filterwarnings("ignore")
@@ -136,6 +138,7 @@ def track_acc_GIDS(g, args, device, label_array=None):
         e2e_time_start = time.time()
         for step, (input_nodes, seeds, blocks, ret) in tqdm.tqdm(enumerate(train_dataloader)):
             # print("step: ", step)
+            
             if(step == warm_up_iter):
                 print("warp up done")
                 train_dataloader.print_stats()
