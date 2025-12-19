@@ -1,0 +1,53 @@
+SSD index: 0
+SQs: 135	CQs: 135	n_qps: 128
+Ctrl sizes: 1
+n pages: 32768
+page size: 4096
+num elements: 563200000000
+n_ranges_bits: 6
+n_ranges_mask: 63
+pages_dma: 0x7fae3c010000	207020610000
+HEREN
+Cond1
+8000 8 1 8000
+GIDS DataLoader Setting
+GIDS:  True
+CPU Feature Buffer:  False
+Window Buffering:  False
+Storage Access Accumulator:  False
+Dataset: CUSTOM
+exc track_acc_GIDS..
+SSD are not assigned
+ssd list:  None
+test_nid:tensor([      6,       7,      10,  ..., 2238725, 2238728, 2238729])
+test_nid shape:torch.Size([447747])
+Finish Making Page Cache
+print stats: 
+print array reset: #READ IOs: 0	#Accesses:35620000	#Misses:22730176	Miss Rate:0.63813	#Hits: 12889824	Hit Rate:0.36187	CLSize:4096	Debug Cnt: 0
+*********************************
+
+print ctrl reset 0: ------------------------------------
+#SSDAccesses:	710318
+
+Kernel Time: 	 1290.47
+Total Access: 	 1113125
+print stats: 
+print array reset: #READ IOs: 0	#Accesses:36012320	#Misses:22816096	Miss Rate:0.633564	#Hits: 13196224	Hit Rate:0.366436	CLSize:4096	Debug Cnt: 0
+*********************************
+
+print ctrl reset 0: ------------------------------------
+#SSDAccesses:	713003
+
+Kernel Time: 	 1288.46
+Total Access: 	 1125385
+warp up done
+GIDS time:  1.5368165969848633
+WB time:  0.0
+Performance for 100 iteration after 1000 iteration
+GIDS time:  1.502657175064087
+WB time:  0.0
+transfer time:  0.041785240173339844
+train time:  0.5295038223266602
+e2e time:  2.081040859222412
+Evaluation:
+Test Acc 56.62%

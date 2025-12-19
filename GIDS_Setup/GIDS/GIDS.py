@@ -348,6 +348,10 @@ class GIDS():
             if(len(self.return_torch_buffer) != 0):
                 return_ten = self.return_torch_buffer.pop(0)
                 return_batch = self.window_buffer.pop(0)
+                # 自加##############################################
+                if isinstance(return_batch, tuple):
+                    return_batch = list(return_batch)
+                # 自加##############################################
                 return_batch.append(return_ten)
                 self.GIDS_time += time.time() - GIDS_time_start
                 return return_batch
@@ -422,6 +426,7 @@ class GIDS():
                 return return_batch
             else:
                 while(1):
+                    # 若未命中就从迭代器获取，否则从窗口缓存获取
                     if(num_iter >= buffer_size):
                         batch = next(it)
                         current_access += len(batch[0])
@@ -435,18 +440,22 @@ class GIDS():
                     required_accesses += self.prev_cpu_access
                     if(current_access > (required_accesses )):
                         break
-
+                
+                # num_iter为当前批次要求的数量，计算得来
                 for i in range(num_iter):
                     batch = self.window_buffer[i]
                     index = batch[0].to(self.gids_device)
                     index_size = len(index)
                     index_size_list.append(index_size)
+                    # 存储要求结点的特征
                     return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device)
                     index_ptr_list.append(index.data_ptr())
-                    return_torch_list.append(return_torch.data_ptr())
-                    self.return_torch_buffer.append(return_torch)
-
+                    return_torch_list.append(return_torch.data_ptr())  # 大小为批次数量，存储所有批次对应的二维数组[index_num[i], feature_dim]指针
+                    self.return_torch_buffer.append(return_torch)  # 存储所有批次的结点特征,[num_iter, index_num[i], feature_dim]
+                # 此处合并所有批次的数据，方便一次取出(下方的pop(0))
                 self.BAM_FS.read_feature_merged(num_iter, return_torch_list, index_ptr_list, index_size_list, dim, self.cache_dim)
+                # print(f"return_torch_list.len:{len(return_torch_list)}")
+                # len(return_torch_list):1, 输出结点数量,即所有结点特征对应的数据地址
                 return_ten = self.return_torch_buffer.pop(0)
                 return_b = self.window_buffer.pop(0)
                 if type(return_b) is tuple:
@@ -461,7 +470,17 @@ class GIDS():
                 cpu_access_count = self.BAM_FS.get_cpu_access_count()
                 self.prev_cpu_access = int(cpu_access_count / num_iter)
                 self.BAM_FS.flush_cpu_access_count()
-
+                
+                # print(f"return_batch[0].shape:{return_batch[0].shape}")  # 节点索引
+                # print(f"return_batch[1].shape:{return_batch[1].shape}")  
+                # print(f"return_batch[2].len:{len(return_batch[2])}")  # list
+                # print(f"return_batch[3].shape:{return_batch[3].shape}") # 特征
+                # len(return_batch):4,元组
+                # return_batch[0].shape:torch.Size([177754])
+                # return_batch[1].shape:torch.Size([1024])
+                # return_batch[2].len:3
+                # return_batch[3].shape:torch.Size([177754, 1024])
+                # 1234567
                 return return_batch
         
         # Storage Access Accumulator is disabled

@@ -1,0 +1,62 @@
+CUDA_VISIBLE_DEVICES=0 sudo /usr/bin/time -v /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py \
+  --data CUSTOM \
+  --custom_dataset_name uk \
+  --custom_root /home/xhk/hyperion/GIDS/data \
+  --epochs 1 \
+  --num_heads 8 \
+  --log_every 1000 \
+  --uva_graph 1 \
+  --GIDS \
+  --batch_size 1024 \
+  --num_classes 10 \
+  --emb_size 128 \
+  --model_type sage \
+  --num_layers 3 \
+  --fan_out '10,5,5' \
+  --cache_size $((1*128)) \
+  --num_ssd 1 \
+  --num_ele $((550*1000*1000*1024)) \
+  --page_size 4096 \
+  --cache_dim 128 2>&1 | tee /home/xhk/hyperion/GIDS/evaluation/logs/bam_uk_1epoch.log 
+
+CUDA_VISIBLE_DEVICES=0 sudo /usr/bin/time -v /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py \
+  --data CUSTOM \
+  --custom_dataset_name uk \
+  --custom_root /home/xhk/hyperion/GIDS/data \
+  --epochs 5 \
+  --num_heads 8 \
+  --log_every 1000 \
+  --uva_graph 1 \
+  --GIDS \
+  --batch_size 1024 \
+  --num_classes 10 \
+  --emb_size 128 \
+  --model_type sage \
+  --num_layers 3 \
+  --fan_out '10,5,5' \
+  --cache_size $((1*128)) \
+  --num_ssd 1 \
+  --num_ele $((550*1000*1000*1024)) \
+  --page_size 4096 \
+  --cache_dim 128 2>&1 | tee /home/xhk/hyperion/GIDS/evaluation/logs/bam_uk_5epoch.log 
+
+CUDA_VISIBLE_DEVICES=0 sudo /usr/bin/time -v /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py \
+  --data CUSTOM \
+  --custom_dataset_name uk \
+  --custom_root /home/xhk/hyperion/GIDS/data \
+  --epochs 10 \
+  --num_heads 8 \
+  --log_every 1000 \
+  --uva_graph 1 \
+  --GIDS \
+  --batch_size 1024 \
+  --num_classes 10 \
+  --emb_size 128 \
+  --model_type sage \
+  --num_layers 3 \
+  --fan_out '10,5,5' \
+  --cache_size $((1*128)) \
+  --num_ssd 1 \
+  --num_ele $((550*1000*1000*1024)) \
+  --page_size 4096 \
+  --cache_dim 128 2>&1 | tee /home/xhk/hyperion/GIDS/evaluation/logs/bam_uk_10epoch.log 

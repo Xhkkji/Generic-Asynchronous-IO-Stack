@@ -1,0 +1,1 @@
+sudo /home/xhk/hyperion/GIDS/bam/build/bin/nvm-readwrite_stripe-bench --input ../data/uk/node_feat.npy   --queue_depth 1024 --access_type 1 --num_queues 128 --threads 102400 --n_ctrls 1 --ioffset 128

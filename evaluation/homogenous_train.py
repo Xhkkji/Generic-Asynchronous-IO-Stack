@@ -1,10 +1,11 @@
 import argparse, datetime
+import os
 import dgl
 import sklearn.metrics
 import torch, torch.nn as nn, torch.optim as optim
 import time, tqdm, numpy as np
 from models import *
-from dataloader import IGB260MDGLDataset, OGBDGLDataset
+from dataloader import IGB260MDGLDataset, OGBDGLDataset, GeneratedDGLDataset
 import csv 
 import warnings
 
@@ -25,6 +26,51 @@ torch.manual_seed(0)
 dgl.seed(0)
 warnings.filterwarnings("ignore")
 
+# 设置数据的根目录、DGL 数据集目录和 PyTorch Geometric 数据集目录
+data_root = os.path.join(os.path.dirname(__file__), '..', 'data')
+dgl_root = os.path.join(data_root, 'dgl_datasets')
+pyg_root = os.path.join(data_root, 'pyg_datasets')
+user_root = os.path.join("/home/lzl/nfs.d/dataset/graph_embedding/LinkPrediction/train_data/")
+rmat_root = os.path.join("/home/lzl/nfs.d/dataset/graph_embedding/graph_data/")
+# 确保目录存在，如果不存在则创建
+for path in [data_root, dgl_root, pyg_root]:
+    os.makedirs(path, exist_ok=True)
+
+# --- 新增：用户自定义数据集配置字典 ---
+USER_DATASET_CONFIG = {
+    'com': {
+        'edgelist_path': os.path.join(user_root, 'com_srt_weg_cn_train.txt'),
+        'feature_dim': 128, 'hidden_dim': 128, 'num_classes': 10,
+    },
+    'LJ': {
+        'edgelist_path': os.path.join(user_root, 'LJ_srt_wei_cn_train.txt'),
+        'feature_dim': 128, 'hidden_dim': 128, 'num_classes': 16,
+    },
+    'soc': {
+        'edgelist_path': os.path.join(user_root, 'soc_srt_wei_cn_train.txt'),
+        'feature_dim': 128, 'hidden_dim': 128, 'num_classes': 10,
+    },
+    'wv': {
+        'edgelist_path': os.path.join(user_root, 'wv_srt_weg_cn_train.txt'),
+        'feature_dim': 128, 'hidden_dim': 128, 'num_classes': 10,
+    },
+    'ytb': {
+        'edgelist_path': os.path.join(user_root, 'ytb_srt_weg_cn_train.txt'),
+        'feature_dim': 128, 'hidden_dim': 128, 'num_classes': 100,
+    },
+    'uk': {
+        'edgelist_path': os.path.join(rmat_root, 'uk2007_srt_weg.txt'),
+        'feature_dim': 64, 'hidden_dim': 64, 'num_classes': 10,
+    },
+    'pa': {
+        'edgelist_path': os.path.join(rmat_root, 'pa_srt_weg_commneg.txt'),
+        'feature_dim': 64, 'hidden_dim': 64, 'num_classes': 10,
+    },
+    'twt': {
+        'edgelist_path': os.path.join(user_root, 'twt.edge'),
+        'feature_dim': 128, 'hidden_dim': 128, 'num_classes': 10,
+    }
+}
 
 @nvtx.annotate("fetch_data_chunk()", color="blue")
 def fetch_data_chunk(test, out_t, page_size, stream_id):
@@ -209,8 +255,7 @@ def track_acc_GIDS(g, args, device, label_array=None):
             blocks = [block.int().to(device) for block in blocks]  # 改
             inputs = blocks[0].srcdata['feat']
      
-            if(args.data == 'IGB'):
-                # labels.append(blocks[-1].dstdata['label'].cpu().numpy())
+            if(args.data == 'IGB' or args.data == 'CUSTOM'):
                 labels.append(blocks[-1].dstdata['label'])
             elif(args.data == 'OGB'):
                 labels.append(blocks[-1].dstdata['label'].cpu().numpy())
@@ -262,13 +307,17 @@ if __name__ == '__main__':
         choices=['experimental', 'small', 'medium', 'large', 'full'], 
         help='size of the datasets')
     parser.add_argument('--num_classes', type=int, default=19, 
-        choices=[19, 2983, 172], help='number of classes')
+        choices=[19, 2983, 172, 16, 10], help='number of classes')
     parser.add_argument('--in_memory', type=int, default=0, 
         choices=[0, 1], help='0:read only mmap_mode=r, 1:load into memory')
     parser.add_argument('--synthetic', type=int, default=0,
         choices=[0, 1], help='0:nlp-node embeddings, 1:random')
     parser.add_argument('--data', type=str, default='IGB')
     parser.add_argument('--emb_size', type=int, default=1024)
+    parser.add_argument('--custom_root', type=str, default=data_root,
+        help='Root directory containing generated datasets (default: ../data)')
+    parser.add_argument('--custom_dataset_name', type=str, default='com',
+        help='Dataset name under custom_root')
     
     # Model
     parser.add_argument('--model_type', type=str, default='gcn',
@@ -342,12 +391,13 @@ if __name__ == '__main__':
         dataset = OGBDGLDataset(args)
         g = dataset[0]
         g  = g.formats('csc')
+    elif(args.data == "CUSTOM"):
+        print("Dataset: CUSTOM")
+        dataset = GeneratedDGLDataset(args)
+        g = dataset[0]
+        g = g.formats('csc')
     else:
         g=None
         dataset=None
     
     track_acc_GIDS(g, args, device, labels)
-
-
-
-

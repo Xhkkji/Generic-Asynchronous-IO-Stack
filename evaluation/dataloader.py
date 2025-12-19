@@ -227,6 +227,73 @@ class IGB260MDGLDataset(DGLDataset):
     def __len__(self):
         return len(self.graphs)
 
+
+class GeneratedDGLDataset(DGLDataset):
+    """Load locally generated homogeneous dataset saved under data/<dataset>."""
+    def __init__(self, args):
+        self.root = args.custom_root
+        self.dataset = args.custom_dataset_name
+        super().__init__(name='GeneratedDGLDataset')
+
+    def _load_mask(self, data_dir, npy_name, csv_name, n_nodes):
+        npy_path = osp.join(data_dir, npy_name)
+        if osp.exists(npy_path):
+            mask = torch.from_numpy(np.load(npy_path)).to(torch.bool)
+            if mask.numel() == n_nodes:
+                return mask
+        csv_path = osp.join(data_dir, csv_name)
+        if osp.exists(csv_path):
+            idx = pd.read_csv(csv_path, header=None).values.T[0]
+            return _idx_to_mask(idx, n_nodes)
+
+        perm = torch.randperm(n_nodes)
+        n_train = int(n_nodes * 0.6)
+        n_val = int(n_nodes * 0.2)
+        train_mask = torch.zeros(n_nodes, dtype=torch.bool)
+        val_mask = torch.zeros(n_nodes, dtype=torch.bool)
+        test_mask = torch.zeros(n_nodes, dtype=torch.bool)
+        train_mask[perm[:n_train]] = True
+        val_mask[perm[n_train:n_train + n_val]] = True
+        test_mask[perm[n_train + n_val:]] = True
+        if 'train' in npy_name:
+            return train_mask
+        if 'val' in npy_name:
+            return val_mask
+        return test_mask
+
+    def process(self):
+        data_dir = osp.join(self.root, self.dataset)
+        edge_path = osp.join(data_dir, 'edge_index.npy')
+        feat_path = osp.join(data_dir, 'node_feat.npy')
+        label_path = osp.join(data_dir, 'node_label.npy')
+
+        edges = torch.from_numpy(np.load(edge_path)).long()
+        features = torch.from_numpy(np.load(feat_path)).float()
+        labels = torch.from_numpy(np.load(label_path)).to(torch.long)
+
+        n_nodes = features.shape[0]
+        g = dgl.graph((edges[:, 0], edges[:, 1]), num_nodes=n_nodes)
+        g = dgl.remove_self_loop(g)
+        g = dgl.add_self_loop(g)
+
+        train_mask = self._load_mask(data_dir, 'train_mask.npy', 'train.csv', n_nodes)
+        val_mask = self._load_mask(data_dir, 'val_mask.npy', 'valid.csv', n_nodes)
+        test_mask = self._load_mask(data_dir, 'test_mask.npy', 'test.csv', n_nodes)
+
+        g.ndata['feat'] = features
+        g.ndata['label'] = labels
+        g.ndata['train_mask'] = train_mask
+        g.ndata['val_mask'] = val_mask
+        g.ndata['test_mask'] = test_mask
+
+        self.graph = g
+
+    def __getitem__(self, i):
+        return self.graph
+
+    def __len__(self):
+        return 1
+
 class OGBDGLDataset(DGLDataset):
     def __init__(self, args):
         self.dir = args.path

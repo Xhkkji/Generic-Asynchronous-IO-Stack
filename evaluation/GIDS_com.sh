@@ -1,0 +1,22 @@
+CUDA_VISIBLE_DEVICES=0 sudo /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py \
+  --data CUSTOM \
+  --custom_dataset_name com \
+  --custom_root /home/xhk/hyperion/GIDS/data \
+  --epochs 5 \
+  --num_heads 8 \
+  --log_every 1000 \
+  --uva_graph 1 \
+  --GIDS \
+  --batch_size 1024 \
+  --num_classes 10 \
+  --emb_size 128 \
+  --model_type sage \
+  --num_layers 3 \
+  --fan_out '10,5,5' \
+  --cache_size $((1*1024)) \
+  --num_ssd 1 \
+  --num_ele $((550*1000*1000*1024)) \
+  --page_size 4096 \
+  --cache_dim 128  \
+  --window_buffer \
+  --wb_size 8
