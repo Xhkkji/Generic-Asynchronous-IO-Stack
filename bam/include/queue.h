@@ -25,111 +25,111 @@ using std::string;
 
 // 修改
 // IO请求结构
-struct IORequest
-{
-    // 请求标识
-    uint32_t req_id;
-    uint16_t cid;    // 命令ID
-    uint16_t sq_pos; // 提交队列位置
+// struct IORequest
+// {
+//     // 请求标识
+//     uint32_t req_id;
+//     uint16_t cid;    // 命令ID
+//     uint16_t sq_pos; // 提交队列位置
 
-    // 页面信息
-    uint32_t pc_entry; // 缓存条目
-    uint64_t page_idx; // 页面索引
-    range_d_t *range;  // 所属range指针
+//     // 页面信息
+//     uint32_t pc_entry; // 缓存条目
+//     uint64_t page_idx; // 页面索引
+//     range_d_t *range;  // 所属range指针
 
-    // IO参数
-    uint64_t starting_lba; // 起始LBA
-    uint32_t n_blocks;     // 块数量
-    bool write;            // 读/写标志
-    uint32_t count;        // 访问计数
+//     // IO参数
+//     uint64_t starting_lba; // 起始LBA
+//     uint32_t n_blocks;     // 块数量
+//     bool write;            // 读/写标志
+//     uint32_t count;        // 访问计数
 
-    // 状态与时间
-    std::atomic<uint32_t> state; // IO状态
-    uint64_t submit_time;        // 提交时间戳
-    uint64_t complete_time;      // 完成时间戳
+//     // 状态与时间
+//     std::atomic<uint32_t> state; // IO状态
+//     uint64_t submit_time;        // 提交时间戳
+//     uint64_t complete_time;      // 完成时间戳
 
-    // 队列关联
-    QueuePairAsync *qp; // 关联的队列对
-    uint32_t cq_pos;    // 完成队列位置
-};
+//     // 队列关联
+//     QueuePairAsync *qp; // 关联的队列对
+//     uint32_t cq_pos;    // 完成队列位置
+// };
 
-struct QueuePairAsync
-{
-    // 现有成员保持不变...
-    uint32_t pageSize;
-    uint32_t block_size;
-    uint32_t block_size_log;
-    uint32_t block_size_minus_1;
-    uint32_t nvmNamespace;
+// struct QueuePairAsync
+// {
+//     // 现有成员保持不变...
+//     uint32_t pageSize;
+//     uint32_t block_size;
+//     uint32_t block_size_log;
+//     uint32_t block_size_minus_1;
+//     uint32_t nvmNamespace;
 
-    nvm_queue_t sq;
-    nvm_queue_t cq;
-    uint16_t qp_id;
-    DmaPtr sq_mem;
-    DmaPtr cq_mem;
-    DmaPtr prp_mem;
-    BufferPtr sq_tickets;
-    BufferPtr sq_tail_mark;
-    BufferPtr sq_cid;
-    BufferPtr cq_head_mark;
-    BufferPtr cq_pos_locks;
+//     nvm_queue_t sq;
+//     nvm_queue_t cq;
+//     uint16_t qp_id;
+//     DmaPtr sq_mem;
+//     DmaPtr cq_mem;
+//     DmaPtr prp_mem;
+//     BufferPtr sq_tickets;
+//     BufferPtr sq_tail_mark;
+//     BufferPtr sq_cid;
+//     BufferPtr cq_head_mark;
+//     BufferPtr cq_pos_locks;
 
-#define MAX_SQ_ENTRIES_64K (64 * 1024 / 64)
-#define MAX_CQ_ENTRIES_64K (64 * 1024 / 16)
+// #define MAX_SQ_ENTRIES_64K (64 * 1024 / 64)
+// #define MAX_CQ_ENTRIES_64K (64 * 1024 / 16)
 
-    // ============ 只添加这4个核心成员 ============
-    BufferPtr async_requests;             // 异步请求数组（简化版）
-    std::atomic<uint32_t> *next_req_id;   // 下一个请求ID
-    std::atomic<uint32_t> *pending_count; // 待处理请求数
-    volatile uint32_t *doorbell_reg;      // 门铃寄存器指针（重用现有的sq.db）
+//     // ============ 只添加这4个核心成员 ============
+//     BufferPtr async_requests;             // 异步请求数组（简化版）
+//     std::atomic<uint32_t> *next_req_id;   // 下一个请求ID
+//     std::atomic<uint32_t> *pending_count; // 待处理请求数
+//     volatile uint32_t *doorbell_reg;      // 门铃寄存器指针（重用现有的sq.db）
 
-    // 构造函数中初始化异步支持
-    inline QueuePairAsync(const nvm_ctrl_t *ctrl, const uint32_t cudaDevice,
-                          const struct nvm_ns_info ns, const struct nvm_ctrl_info info,
-                          nvm_aq_ref &aq_ref, const uint16_t qp_id, const uint64_t queueDepth)
-    {
-        // 现有初始化代码...
+//     // 构造函数中初始化异步支持
+//     inline QueuePairAsync(const nvm_ctrl_t *ctrl, const uint32_t cudaDevice,
+//                           const struct nvm_ns_info ns, const struct nvm_ctrl_info info,
+//                           nvm_aq_ref &aq_ref, const uint16_t qp_id, const uint64_t queueDepth)
+//     {
+//         // 现有初始化代码...
 
-        // ============ 初始化异步支持（简单版本）============
-        init_async_support(cudaDevice, queueDepth);
+//         // ============ 初始化异步支持（简单版本）============
+//         init_async_support(cudaDevice, queueDepth);
 
-        // 现有代码继续...
-    }
+//         // 现有代码继续...
+//     }
 
-    // 简单的异步支持初始化
-    inline void init_async_support(const uint32_t cudaDevice, const uint64_t queueDepth)
-    {
-        // 1. 分配异步请求数组（每个请求只有3个字段）
-        size_t max_requests = min((uint32_t)queueDepth * 2, 1024U);
-        this->async_requests = createBuffer(max_requests * sizeof(IORequest), cudaDevice);
+//     // 简单的异步支持初始化
+//     inline void init_async_support(const uint32_t cudaDevice, const uint64_t queueDepth)
+//     {
+//         // 1. 分配异步请求数组（每个请求只有3个字段）
+//         size_t max_requests = min((uint32_t)queueDepth * 2, 1024U);
+//         this->async_requests = createBuffer(max_requests * sizeof(IORequest), cudaDevice);
 
-        // 2. 分配原子变量
-        this->next_req_id = (std::atomic<uint32_t> *)createBuffer(sizeof(std::atomic<uint32_t>), cudaDevice).get();
-        this->pending_count = (std::atomic<uint32_t> *)createBuffer(sizeof(std::atomic<uint32_t>), cudaDevice).get();
+//         // 2. 分配原子变量
+//         this->next_req_id = (std::atomic<uint32_t> *)createBuffer(sizeof(std::atomic<uint32_t>), cudaDevice).get();
+//         this->pending_count = (std::atomic<uint32_t> *)createBuffer(sizeof(std::atomic<uint32_t>), cudaDevice).get();
 
-        // 3. 初始化原子变量
-        if (this->next_req_id)
-        {
-            this->next_req_id->store(0);
-        }
-        if (this->pending_count)
-        {
-            this->pending_count->store(0);
-        }
+//         // 3. 初始化原子变量
+//         if (this->next_req_id)
+//         {
+//             this->next_req_id->store(0);
+//         }
+//         if (this->pending_count)
+//         {
+//             this->pending_count->store(0);
+//         }
 
-        // 4. 重用现有的sq.db作为门铃寄存器
-        this->doorbell_reg = this->sq.db;
-    }
+//         // 4. 重用现有的sq.db作为门铃寄存器
+//         this->doorbell_reg = this->sq.db;
+//     }
 
-    // 设备端获取请求的简单函数
-    __device__ IORequest *get_request(uint32_t req_id) const
-    {
-        if (!this->async_requests.get())
-            return nullptr;
-        IORequest *reqs = (IORequest *)this->async_requests.get();
-        return &reqs[req_id % (this->async_requests.size / sizeof(IORequest))];
-    }
-};
+//     // 设备端获取请求的简单函数
+//     __device__ IORequest *get_request(uint32_t req_id) const
+//     {
+//         if (!this->async_requests.get())
+//             return nullptr;
+//         IORequest *reqs = (IORequest *)this->async_requests.get();
+//         return &reqs[req_id % (this->async_requests.size / sizeof(IORequest))];
+//     }
+// };
 
 struct QueuePair
 {

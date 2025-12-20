@@ -33,6 +33,7 @@ __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, ra
                                                             int64_t num_idx, int cache_dim, GIDS_CPU_buffer<T> CPU_buffer, bool cpu_seq, unsigned int *d_cpu_access, uint64_t key_off)
 {
   // out_tensor_ptr:[index_num[i], feature_dim]二维数组指针
+  // printf("read_feature_kernel_with_cpu_backing_memory\n");
   uint64_t bid = blockIdx.x;
 
   int num_warps = blockDim.x / 32;
@@ -93,7 +94,10 @@ __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, ra
         for (; tid < dim; tid += 32)
         {
           // T temp = ptr[(row_index) * cache_dim + tid];
-          T temp = ptr.read((row_index)*cache_dim + tid);
+          // printf("基于位图的read\n");
+          // T temp = ptr.read((row_index)*cache_dim + tid);
+          T temp = ptr.read_async((row_index)*cache_dim + tid); // √
+
           // printf("temp:%f\n", temp);
           // 输出:temp:0.032106
           // 使用 32 个线程协作读取一个特征向量(每个线程处理 dim/32 个元素)
