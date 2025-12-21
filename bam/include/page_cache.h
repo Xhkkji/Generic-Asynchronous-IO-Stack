@@ -882,7 +882,8 @@ struct page_cache_d_t
 __device__ void read_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry);
 __device__ void write_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry);
 // 异步版本
-__device__ void read_data_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry);
+__device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry, uint16_t *cid_return, nvm_cmd_t *cmd_return);
+__device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry, uint16_t cid, nvm_cmd_t cmd);
 
 // 修改后的异步版本 read_data
 // __device__ void read_data_submit(
@@ -1914,7 +1915,11 @@ __forceinline__
                 // uint32_t queue = ((sm_id * 64) + warp_id()) % (c->n_qps);
                 // read_io_cnt.fetch_add(1, simt::memory_order_relaxed);
 
-                read_data_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans);
+                uint16_t cid;
+                nvm_cmd_t cmd;
+                read_data_submit_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans, &cid, &cmd);
+                read_data_wait_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans, cid, cmd);
+
                 // page_addresses[index].store(page_trans, simt::memory_order_release);
                 pages[index].offset = page_trans;
                 // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
@@ -4037,9 +4042,9 @@ inline __device__ void read_data(page_cache_d_t *pc, QueuePair *qp, const uint64
     put_cid(&qp->sq, cid);
 }
 
-inline __device__ void read_data_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry)
+inline __device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry, uint16_t *cid_return, nvm_cmd_t *cmd_return)
 {
-    // printf("read_data_async!\n"); //√
+    printf("read_data_submit_async!\n"); // √
 
     // uint64_t starting_lba = starting_byte >> qp->block_size_log;
     // uint64_t rem_bytes = starting_byte & qp->block_size_minus_1;
@@ -4058,9 +4063,18 @@ inline __device__ void read_data_async(page_cache_d_t *pc, QueuePair *qp, const 
     if (pc->prps)
         prp2 = pc->prp2[pc_entry];
     ////printf("tid: %llu\tstart_lba: %llu\tn_blocks: %llu\tprp1: %p\n", (unsigned long long) (threadIdx.x+blockIdx.x*blockDim.x), (unsigned long long) starting_lba, (unsigned long long) n_blocks, (void*) prp1);
-    nvm_cmd_data_ptr(&cmd, prp1, prp2);
-    nvm_cmd_rw_blks(&cmd, starting_lba, n_blocks);
-    uint16_t sq_pos = sq_enqueue(&qp->sq, &cmd);
+    nvm_cmd_data_ptr(&cmd, prp1, prp2);            // 设置数据缓冲区地址
+    nvm_cmd_rw_blks(&cmd, starting_lba, n_blocks); // 设置读取的起始 LBA 和块数
+    // sq_enqueue中已实现门铃机制，已将请求提交到SSD
+    uint16_t sq_pos = sq_enqueue(&qp->sq, &cmd); // 将命令放入提交队列 (Submission Queue),sq_pos：命令在 SQ 中的位置
+
+    *cid_return = cid;
+    *cmd_return = cmd;
+}
+
+inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry, uint16_t cid, nvm_cmd_t cmd)
+{
+    printf("read_data_wait_async!\n"); // √
     uint32_t head, head_;
     uint64_t pc_pos;
     uint64_t pc_prev_head;
@@ -4071,7 +4085,7 @@ inline __device__ void read_data_async(page_cache_d_t *pc, QueuePair *qp, const 
     pc_prev_head = pc->q_head->load(simt::memory_order_relaxed);
     pc_pos = pc->q_tail->fetch_add(1, simt::memory_order_acq_rel);
 
-    cq_dequeue(&qp->cq, cq_pos, &qp->sq, head, head_);
+    cq_dequeue(&qp->cq, cq_pos, &qp->sq, head, head_); // 从 CQ 中取出完成项
     // sq_dequeue(&qp->sq, sq_pos);
 
     // enqueue_second(page_cache_d_t* pc, QueuePair* qp, const uint64_t starting_lba, nvm_cmd_t* cmd, const uint16_t cid, const uint64_t pc_pos, const uint64_t pc_prev_head)
