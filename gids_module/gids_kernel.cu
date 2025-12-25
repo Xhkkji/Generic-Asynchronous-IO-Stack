@@ -96,7 +96,11 @@ __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, ra
           // T temp = ptr[(row_index) * cache_dim + tid];
           // printf("基于位图的read\n");
           // T temp = ptr.read((row_index)*cache_dim + tid);
-          T temp = ptr.read_async((row_index)*cache_dim + tid); // √
+          // printf("before..start:%d, end:%d\n", ptr.start, ptr.end);
+          ptr.read_submit_async((row_index)*cache_dim + tid); // √
+          // printf("read_submit_async执行完成\n");
+          // printf("after..start:%d, end:%d\n\n", ptr.start, ptr.end);
+          T temp = ptr.read_wait_async((row_index)*cache_dim + tid); // √
 
           // printf("temp:%f\n", temp);
           // 输出:temp:0.032106
