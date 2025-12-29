@@ -1335,9 +1335,10 @@ struct range_d_t
     page_cache_d_t cache;
     // range_d_t(range_t<T>* rt);
 
-    // 修改：自加
+    // 修改：自加， 用于异步
     uint16_t cid;
     nvm_cmd_t cmd;
+    uint32_t page_trans;
 
     __forceinline__
         __device__
@@ -1809,7 +1810,7 @@ __forceinline__
             st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
             if ((st_new & BUSY) == 0)
             {
-
+                // 分配缓存槽位
                 uint32_t page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
 
                 // fill in
@@ -1818,21 +1819,40 @@ __forceinline__
                 // uint32_t ctrl = (tid/32) % (cache.n_ctrls);
                 // uint32_t ctrl = sm_id % (cache.n_ctrls);
                 // uint32_t ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
+                // 选择后端控制器
                 uint64_t ctrl = get_backing_ctrl(index);
                 if (ctrl == ALL_CTRLS)
                     ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
                 // ctrl = ctrl_;
+                // 确定页面在SSD上的位置
                 uint64_t b_page = get_backing_page(index);
 
+                // 获取控制器：从控制器数组中获取指针
                 Controller *c = cache.d_ctrls[ctrl];
+                // 统计访问：原子增加该控制器的访问计数（负载均衡参考
                 c->access_counter.fetch_add(1, simt::memory_order_relaxed);
                 // uint32_t queue = (tid/32) % (c->n_qps);
                 // uint32_t queue = c->queue_counter.fetch_add(1, simt::memory_order_relaxed) % (c->n_qps);
                 // uint32_t queue = ((sm_id * 64) + warp_id()) % (c->n_qps);
                 // read_io_cnt.fetch_add(1, simt::memory_order_relaxed);
 
+                /*
+                函数：read_data（同步阻塞版本）
+                    参数：
+                    &cache：缓存对象
+                    (c->d_qps) + queue：指定控制器的指定队列
+                    ((b_page)*cache.n_blocks_per_page)：SSD上的起始LBA
+                    cache.n_blocks_per_page：要读取的块数（一页大小）
+                    page_trans：缓存目标位置
+                    效果：阻塞直到数据从SSD读到缓存
+                */
                 read_data(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans);
                 // page_addresses[index].store(page_trans, simt::memory_order_release);
+
+                /*
+                    目的：建立虚拟页面→缓存位置的映射
+                    存储：在页面元数据的 offset 字段中
+                */
                 pages[index].offset = page_trans;
                 // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
                 //     __nanosleep(100);
@@ -1930,11 +1950,12 @@ __forceinline__
         {
             // invalid
         case NV_NB:
+            // printf("submit:NV_NB\n");
             st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
             if ((st_new & BUSY) == 0)
             {
 
-                uint32_t page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
+                page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
                 // fill in
                 // uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
                 // uint32_t sm_id = get_smid();
@@ -1983,18 +2004,19 @@ __forceinline__
             break;
             // valid
         case V_NB:
-            if (write && ((read_state & DIRTY) == 0))
-                pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
-            // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
-            uint64_t page_trans = pages[index].offset;
-            // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
-            //     __nanosleep(100);
+            printf("submit:V_NB\n");
+            // if (write && ((read_state & DIRTY) == 0))
+            //     pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+            // // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
+            // uint64_t page_trans = pages[index].offset;
+            // // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
+            // //     __nanosleep(100);
+            // // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
             // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-            hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-            return page_trans;
+            // return page_trans;
 
-            // pages[index].fetch_sub(1, simt::memory_order_release);
-            fail = false;
+            // // pages[index].fetch_sub(1, simt::memory_order_release);
+            // fail = false;
 
             break;
         case NV_B:
@@ -2057,6 +2079,7 @@ __forceinline__
     // read_state = pages[index].state.load(simt::memory_order_acquire);
     // 修复方案1：使用fetch_add(0)
     read_state = pages[index].state.fetch_add(0, simt::memory_order_acquire);
+
     // 现在read_state和st是基于相同时间点的"一致视图"
     do
     {
@@ -2066,6 +2089,8 @@ __forceinline__
         {
             // invalid
         case NV_NB:
+            printf("wait:NV_NB\n");
+
             // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
             // if ((st_new & BUSY) == 0)
             // {
@@ -2117,24 +2142,28 @@ __forceinline__
             break;
             // valid
         case V_NB:
-            // if (write && ((read_state & DIRTY) == 0))
-            //     pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
-            // // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
-            // uint64_t page_trans = pages[index].offset;
-            // // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
-            // //     __nanosleep(100);
-            // // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-            // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-            // return page_trans;
+            printf("wait:V_NB\n");
 
-            // // pages[index].fetch_sub(1, simt::memory_order_release);
-            // fail = false;
+            if (write && ((read_state & DIRTY) == 0))
+                pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+            // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
+            page_trans = pages[index].offset;
+            // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
+            //     __nanosleep(100);
+            // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+            hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+            return page_trans;
+
+            // pages[index].fetch_sub(1, simt::memory_order_release);
+            fail = false;
 
             break;
         case NV_B:
+            // printf("wait:NV_B\n");
             // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
 
-            uint32_t page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
+            // 使用submit中获取到的page_trans
+            // page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
 
             // fill in
             // uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2194,103 +2223,6 @@ __forceinline__
     } while (fail);
     return 0;
 }
-
-// 修改：异步acquire_page
-// template <typename T>
-// __forceinline__
-//     __device__
-//         uint64_t
-//         range_d_t<T>::acquire_page_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl_, const uint32_t queue)
-// {
-//     uint64_t index = pg;
-//     access_cnt.fetch_add(count, simt::memory_order_relaxed);
-
-//     uint8_t prefetch_count = pages[index].prefetch_count.load(simt::memory_order_acquire);
-//     uint32_t p_count = 0;
-//     if (prefetch_count != 0 && (prefetch_count >> 7 == 0))
-//     {
-//         p_count = 1;
-//         pages[index].prefetch_count.store(prefetch_count | 0x80, simt::memory_order_release);
-//     }
-
-//     uint8_t window_count = pages[index].prefetch_counter.load(simt::memory_order_acquire);
-//     if (window_count > 1 && (window_count >> 7 == 0))
-//     {
-//         p_count = 1;
-//         pages[index].prefetch_counter.store(window_count | 0x80, simt::memory_order_release);
-//     }
-
-//     uint64_t read_state = pages[index].state.fetch_add(count + p_count, simt::memory_order_acquire);
-//     uint64_t st = (read_state >> (CNT_SHIFT + 1)) & 0x03;
-
-//     switch (st)
-//     {
-//     case NV_NB: // 无效状态，需要从SSD加载
-//     {
-//         printf("NV_NB, acquire_page_async..\n");
-//         uint64_t st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
-//         if ((st_new & BUSY) != 0)
-//         {
-//             // 其他线程正在处理，等待
-//             pages[index].state.fetch_sub(count + p_count, simt::memory_order_relaxed);
-//             return 0xFFFFFFFFFFFFFFFF; // 返回特殊值表示需要重试
-//         }
-
-//         // 获取缓存槽位
-//         uint32_t page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
-
-//         // 获取控制器
-//         uint64_t ctrl = get_backing_ctrl(index);
-//         if (ctrl == ALL_CTRLS)
-//             ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
-
-//         uint64_t b_page = get_backing_page(index);
-//         Controller *c = cache.d_ctrls[ctrl];
-//         c->access_counter.fetch_add(1, simt::memory_order_relaxed);
-
-//         // 异步提交IO请求
-//         uint32_t req_id = c->next_req_id.fetch_add(1, simt::memory_order_relaxed);
-//         IORequest *req = &c->pending_requests[req_id % MAX_PENDING_REQUESTS];
-
-//         // 初始化请求
-//         req->pc_entry = page_trans;
-//         req->page_idx = index;
-//         req->starting_lba = (b_page * cache.n_blocks_per_page);
-//         req->n_blocks = cache.n_blocks_per_page;
-//         req->state.store(IO_PENDING, simt::memory_order_relaxed);
-//         req->range = this;
-//         req->write = write;
-//         req->count = count;
-
-//         // 提交异步IO（不等待完成）
-//         async_read_data(&cache, c->d_qps[queue], req);
-
-//         // 设置页面信息（状态保持BUSY，直到IO完成）
-//         pages[index].offset = page_trans;
-//         pages[index].pending_req = req_id;
-
-//         // 返回特殊值，调用者需要检查是否完成
-//         return page_trans | 0x8000000000000000; // 高位标记为"进行中"
-//     }
-
-//     case V_NB: // 有效状态，直接返回
-//         if (write && ((read_state & DIRTY) == 0))
-//             pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
-
-//         uint64_t page_trans = pages[index].offset;
-//         hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-//         return page_trans; // 正常返回，高位为0表示已完成
-
-//     case NV_B:
-//     case V_B:
-//     default:
-//         // 繁忙状态，返回特殊值表示需要重试
-//         pages[index].state.fetch_sub(count + p_count, simt::memory_order_relaxed);
-//         return 0xFFFFFFFFFFFFFFFF;
-//     }
-
-//     return 0;
-// }
 
 template <typename T>
 __forceinline__

@@ -39,6 +39,9 @@ __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, ra
   int num_warps = blockDim.x / 32;
   int warp_id = threadIdx.x / 32;
   int idx_idx = bid * num_warps + warp_id;
+
+  // printf("warp_id:%d\n", warp_id);
+  // printf("Thread:%d\n", blockIdx.x * blockDim.x + threadIdx.x);
   if (idx_idx < num_idx)
   {
     bam_ptr<T> ptr(dr);
@@ -47,7 +50,6 @@ __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, ra
     uint64_t tid = threadIdx.x % 32;
 
     uint32_t cpu_off = range->get_cpu_offset(row_index);
-
     if (cpu_seq)
     {
       // CPU内存路径
@@ -97,6 +99,7 @@ __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, ra
           // printf("基于位图的read\n");
           // T temp = ptr.read((row_index)*cache_dim + tid);
           // printf("before..start:%d, end:%d\n", ptr.start, ptr.end);
+
           ptr.read_submit_async((row_index)*cache_dim + tid); // √
           // printf("read_submit_async执行完成\n");
           // printf("after..start:%d, end:%d\n\n", ptr.start, ptr.end);

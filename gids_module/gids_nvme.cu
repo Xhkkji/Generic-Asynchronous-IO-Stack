@@ -265,7 +265,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vector<uint64_t> &i_ptr_list, const std::vector<uint64_t> &i_index_ptr_list,
                                                   const std::vector<uint64_t> &num_index, int dim, int cache_dim = 1024)
 {
-
+  printf("num_iter:%d\n", num_iter);
   cudaStream_t streams[num_iter];
   for (int i = 0; i < num_iter; i++)
   {
@@ -286,6 +286,8 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     uint64_t n_warp = b_size / 32;
     uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
 
+    printf("g_size:%d, b_size:%d", g_size, b_size);
+
     if (cpu_buffer_flag == false)
     {
       read_feature_kernel<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
@@ -296,15 +298,18 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
       read_feature_kernel_with_cpu_backing_memory<<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, d_range, tensor_ptr,
                                                                                      index_ptr, dim, num_index[i], cache_dim, CPU_buffer, seq_flag,
                                                                                      d_cpu_access, 0);
+      // printf("read_feature_complete..\n");
     }
     total_access += num_index[i];
   }
 
   for (int i = 0; i < num_iter; i++)
   {
+    printf("cudaStreamSynchronize:%d\n", i); // ×
     cudaStreamSynchronize(streams[i]);
   }
 
+  printf("cudaStreamSynchronize finished, num_iter:%d\n", num_iter); //
   cuda_err_chk(cudaDeviceSynchronize());
   cuda_err_chk(cudaDeviceSynchronize());
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
