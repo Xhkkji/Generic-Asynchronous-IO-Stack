@@ -309,7 +309,7 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     cudaStreamSynchronize(streams[i]);
   }
 
-  printf("cudaStreamSynchronize finished, num_iter:%d\n", num_iter); //
+  // printf("cudaStreamSynchronize finished, num_iter:%d\n", num_iter); //
   cuda_err_chk(cudaDeviceSynchronize());
   cuda_err_chk(cudaDeviceSynchronize());
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);

@@ -403,6 +403,31 @@ struct bam_ptr_tlb
     }
 };
 
+// 自加
+// 使用共享内存传递上下文
+__shared__ struct s_ctx
+{
+    // page, start, end, range_id是全局变量
+
+    uint32_t eq_mask;
+    int master;
+    uint32_t count;
+    uint64_t base_master;
+    uint32_t ctrl; // 控制器ID（submit选择的）
+    uint32_t queue;
+
+    // 修改：自加， 用于异步
+    uint16_t cid;
+    nvm_cmd_t cmd;
+    uint32_t page_trans;
+
+    // 成员函数acquire_page
+    uint64_t member_acquire_ctrl;
+    uint64_t member_acquire_b_page;
+    Controller *member_acquire_c;
+    bool isHit;
+};
+
 template <typename T>
 struct bam_ptr
 {
@@ -412,6 +437,7 @@ struct bam_ptr
     size_t end = 0;
     int64_t range_id = -1;
     T *addr = nullptr;
+    s_ctx ctx;
 
     __forceinline__
         __host__ __device__
@@ -456,7 +482,8 @@ struct bam_ptr
 
         // 此处调用全局的acquire_page版本
         // addr = (T *)array->acquire_page(i, page, start, end, range_id);
-        addr = (T *)array->acquire_page_submit_async(i, page, start, end, range_id);
+        // 此处需要接收到isHit的情况，存入ctx中
+        addr = (T *)array->acquire_page_submit_async(i, page, start, end, range_id, ctx);
 
         return addr;
     }
@@ -471,7 +498,7 @@ struct bam_ptr
 
         // 此处调用全局的acquire_page版本
         // addr = (T *)array->acquire_page(i, page, start, end, range_id);
-        addr = (T *)array->acquire_page_wait_async(i, page, start, end, range_id);
+        addr = (T *)array->acquire_page_wait_async(i, page, start, end, range_id, ctx);
 
         return addr;
     }
@@ -525,7 +552,14 @@ struct bam_ptr
         {
             update_page_submit_async(i); // no page->state.fetch_or  √
         }
-        // return addr[i - start]; // 此处可能返回的是旧值
+        if (!ctx.isHit)
+        {
+            return 0;
+        }
+        else
+        {
+            return addr[i - start];
+        }
     }
 
     __forceinline__
@@ -534,11 +568,12 @@ struct bam_ptr
             read_wait_async(size_t i)
     {
         // printf("read_wait_asyn!\n");
-        if ((i < start) || (i >= end))
+        if (!ctx.isHit)
         {
             update_page_wait_async(i); // no page->state.fetch_or  √
         }
-        return addr[i - start];
+        // 该函数被执行，说明缓存没有命中
+        return addr[i - start]; // 不是这里的问题
     }
 
     __host__ __device__ T *memref(size_t i)
@@ -912,8 +947,8 @@ struct page_cache_d_t
 __device__ void read_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry);
 __device__ void write_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry);
 // 异步版本
-__device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry, uint16_t *cid_return, nvm_cmd_t *cmd_return);
-__device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry, uint16_t cid, nvm_cmd_t cmd);
+__device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx);
+__device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx);
 
 // 修改后的异步版本 read_data
 // __device__ void read_data_submit(
@@ -1336,9 +1371,9 @@ struct range_d_t
     // range_d_t(range_t<T>* rt);
 
     // 修改：自加， 用于异步
-    uint16_t cid;
-    nvm_cmd_t cmd;
-    uint32_t page_trans;
+    // uint16_t cid;
+    // nvm_cmd_t cmd;
+    // uint32_t page_trans;
 
     __forceinline__
         __device__
@@ -1378,12 +1413,12 @@ struct range_d_t
     __forceinline__
         __device__
             uint64_t
-            acquire_page_submit_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl, const uint32_t queue);
+            acquire_page_submit_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl, const uint32_t queue, s_ctx &ctx);
 
     __forceinline__
         __device__
             uint64_t
-            acquire_page_wait_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl, const uint32_t queue);
+            acquire_page_wait_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl, const uint32_t queue, s_ctx &ctx);
 
     // 修改
     // __forceinline__
@@ -1913,7 +1948,7 @@ template <typename T>
 __forceinline__
     __device__
         uint64_t
-        range_d_t<T>::acquire_page_submit_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl_, const uint32_t queue)
+        range_d_t<T>::acquire_page_submit_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl_, const uint32_t queue, s_ctx &ctx)
 {
     // 低级页分配/获取,在coalesce_page()函数内调用
     // printf("成员函数acquire_page_async\n");  // √
@@ -1954,8 +1989,9 @@ __forceinline__
             st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
             if ((st_new & BUSY) == 0)
             {
+                ctx.isHit = false; // 传回未命中的信息，与V_NB作区分
 
-                page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
+                ctx.page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
                 // fill in
                 // uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
                 // uint32_t sm_id = get_smid();
@@ -1977,10 +2013,9 @@ __forceinline__
 
                 // uint16_t cid;
                 // nvm_cmd_t cmd;// 使用类成员变量
-                read_data_submit_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans, &cid, &cmd);
+                read_data_submit_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, ctx);
                 // printf("cid:%d\n", cid);
                 // read_data_wait_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans, cid, cmd);
-                // add_CidCmd(i, cid, cmd); // 储存传递的参数
 
                 // 以下全部注释，在read_data_wait_async中执行
                 // // page_addresses[index].store(page_trans, simt::memory_order_release);
@@ -1996,7 +2031,8 @@ __forceinline__
                 // // pages[index].state.fetch_or(new_state, simt::memory_order_relaxed);
                 // pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
                 // printf("page_trans:%d\n", page_trans);
-                return page_trans;
+
+                return ctx.page_trans;
 
                 // fail = false;
             }
@@ -2005,18 +2041,19 @@ __forceinline__
             // valid
         case V_NB:
             printf("submit:V_NB\n");
-            // if (write && ((read_state & DIRTY) == 0))
-            //     pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
-            // // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
-            // uint64_t page_trans = pages[index].offset;
-            // // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
-            // //     __nanosleep(100);
-            // // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+            ctx.isHit = true;
+            if (write && ((read_state & DIRTY) == 0))
+                pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+            // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
+            uint64_t page_trans = pages[index].offset;
+            // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
+            //     __nanosleep(100);
             // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-            // return page_trans;
+            hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+            return page_trans;
 
-            // // pages[index].fetch_sub(1, simt::memory_order_release);
-            // fail = false;
+            // pages[index].fetch_sub(1, simt::memory_order_release);
+            fail = false;
 
             break;
         case NV_B:
@@ -2046,7 +2083,7 @@ template <typename T>
 __forceinline__
     __device__
         uint64_t
-        range_d_t<T>::acquire_page_wait_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl_, const uint32_t queue)
+        range_d_t<T>::acquire_page_wait_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl_, const uint32_t queue, s_ctx &ctx)
 {
     // 低级页分配/获取,在coalesce_page()函数内调用
     // printf("成员函数acquire_page_wait_async\n"); // √ √
@@ -2083,7 +2120,15 @@ __forceinline__
     // 现在read_state和st是基于相同时间点的"一致视图"
     do
     {
-        st = (read_state >> (CNT_SHIFT + 1)) & 0x03;
+        if (ctx.isHit)
+        {
+            st = V_NB;
+        }
+        else
+        {
+            st = (read_state >> (CNT_SHIFT + 1)) & 0x03;
+        }
+
         // printf("wait_st:%u\n", st);
         switch (st)
         {
@@ -2144,49 +2189,44 @@ __forceinline__
         case V_NB:
             printf("wait:V_NB\n");
 
-            if (write && ((read_state & DIRTY) == 0))
-                pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
-            // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
-            page_trans = pages[index].offset;
-            // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
-            //     __nanosleep(100);
+            // if (write && ((read_state & DIRTY) == 0))
+            //     pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+            // // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
+            // page_trans = pages[index].offset;
+            // // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
+            // //     __nanosleep(100);
+            // // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
             // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-            hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-            return page_trans;
+            // return page_trans;
 
-            // pages[index].fetch_sub(1, simt::memory_order_release);
-            fail = false;
+            // // pages[index].fetch_sub(1, simt::memory_order_release);
+            // fail = false;
 
             break;
         case NV_B:
-            // printf("wait:NV_B\n");
+            printf("wait:NV_B\n");
             // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
 
             // 使用submit中获取到的page_trans
             // page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
 
-            // fill in
-            // uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-            // uint32_t sm_id = get_smid();
-            // uint32_t ctrl = (tid/32) % (cache.n_ctrls);
-            // uint32_t ctrl = sm_id % (cache.n_ctrls);
-            // uint32_t ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
-            uint64_t ctrl = get_backing_ctrl(index);
-            if (ctrl == ALL_CTRLS)
-                ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
-            // ctrl = ctrl_;
-            uint64_t b_page = get_backing_page(index);
+            // uint64_t ctrl = get_backing_ctrl(index);
+            // if (ctrl == ALL_CTRLS)
+            //     ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
+            // // ctrl = ctrl_;
+            // uint64_t b_page = get_backing_page(index);
 
-            Controller *c = cache.d_ctrls[ctrl];
-            c->access_counter.fetch_add(1, simt::memory_order_relaxed);
-            // uint32_t queue = (tid/32) % (c->n_qps);
-            // uint32_t queue = c->queue_counter.fetch_add(1, simt::memory_order_relaxed) % (c->n_qps);
-            // uint32_t queue = ((sm_id * 64) + warp_id()) % (c->n_qps);
-            // read_io_cnt.fetch_add(1, simt::memory_order_relaxed);
+            // Controller *c = cache.d_ctrls[ctrl];
+            // c->access_counter.fetch_add(1, simt::memory_order_relaxed);
 
-            read_data_wait_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans, cid, cmd);
+            uint64_t ctrl = ctx.member_acquire_ctrl;
+            uint64_t b_page = ctx.member_acquire_b_page;
+            Controller *c = ctx.member_acquire_c;
+
+            // printf("准备执行read_data_wait_async\n");
+            read_data_wait_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, ctx);
             // page_addresses[index].store(page_trans, simt::memory_order_release);
-            pages[index].offset = page_trans;
+            pages[index].offset = ctx.page_trans;
             // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
             //     __nanosleep(100);
             // miss_cnt.fetch_add(count, simt::memory_order_relaxed);
@@ -2197,7 +2237,7 @@ __forceinline__
             // new_state |= DIRTY;
             // pages[index].state.fetch_or(new_state, simt::memory_order_relaxed);
             pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
-            return page_trans;
+            return ctx.page_trans;
 
             fail = false;
 
@@ -2571,12 +2611,13 @@ struct array_d_t
     __forceinline__
         __device__ void
         coalesce_page_submit_async(const uint32_t lane, const uint32_t mask, const int64_t r, const uint64_t page, const uint64_t gaddr, const bool write,
-                                   uint32_t &eq_mask, int &master, uint32_t &count, uint64_t &base_master) const
+                                   uint32_t &eq_mask, int &master, uint32_t &count, uint64_t &base_master, s_ctx &ctx) const
     {
-        // printf("coalesce_page_async\n");  // √
+        // printf("coalesce_page_async\n"); // √
         uint32_t ctrl;
         uint32_t queue;
         uint32_t leader = __ffs(mask) - 1;
+        // printf("submit:mask:%d, leader:%d\n");
         auto r_ = d_ranges + r;
         if (lane == leader)
         {
@@ -2587,6 +2628,10 @@ struct array_d_t
 
         ctrl = 0;                                 //__shfl_sync(mask, ctrl, leader);
         queue = __shfl_sync(mask, queue, leader); // Leader 将 queue 值广播给 warp 内所有活动线程
+
+        // 储存参数
+        ctx.ctrl = ctrl;
+        ctx.queue = queue;
 
         uint32_t active_cnt = __popc(mask);                // 活动线程总数
         eq_mask = __match_any_sync(mask, gaddr);           // __match_any_sync:找到 warp 中具有相同 value 的线程
@@ -2603,50 +2648,51 @@ struct array_d_t
         {
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
-            base = r_->acquire_page_submit_async(page, count, dirty, ctrl, queue); // 异步版本
+            base = r_->acquire_page_submit_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
             base_master = base;
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
         }
         base_master = __shfl_sync(eq_mask, base_master, master);
+        ctx.isHit = __shfl_sync(eq_mask, ctx.isHit, master);
     }
 
     // 修改：异步版本
     __forceinline__
         __device__ void
         coalesce_page_wait_async(const uint32_t lane, const uint32_t mask, const int64_t r, const uint64_t page, const uint64_t gaddr, const bool write,
-                                 uint32_t &eq_mask, int &master, uint32_t &count, uint64_t &base_master) const
+                                 uint32_t eq_mask, int master, uint32_t count, uint64_t &base_master, s_ctx &ctx) const // 最后一个参数: , uint64_t base_master
     {
         // printf("coalesce_page_async\n");  // √
         uint32_t ctrl;
         uint32_t queue;
         uint32_t leader = __ffs(mask) - 1;
+        // printf("wait:mask:%d, leader:%d\n");
         auto r_ = d_ranges + r;
         if (lane == leader)
         {
             page_cache_d_t *pc = &(r_->cache);
             ctrl = 0; // pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
-            queue = get_smid() % (pc->d_ctrls[0]->n_qps);
+            queue = ctx.queue;
         }
 
-        ctrl = 0;                                 //__shfl_sync(mask, ctrl, leader);
+        ctrl = ctx.ctrl;                          //__shfl_sync(mask, ctrl, leader);
         queue = __shfl_sync(mask, queue, leader); // Leader 将 queue 值广播给 warp 内所有活动线程
 
-        uint32_t active_cnt = __popc(mask);                // 活动线程总数
-        eq_mask = __match_any_sync(mask, gaddr);           // __match_any_sync:找到 warp 中具有相同 value 的线程
-        eq_mask &= __match_any_sync(mask, (uint64_t)this); // 访问相同 SSD 地址的线程,且是同一个对象
-        master = __ffs(eq_mask) - 1;                       // Find First Set，找到掩码中最低位的 1 的位置
+        uint32_t active_cnt = __popc(mask); // 活动线程总数
+        // eq_mask = ctx.eq_mask;  // 自注释
+        // master = __ffs(eq_mask) - 1; // Find First Set，找到掩码中最低位的 1 的位置
 
         uint32_t dirty = __any_sync(eq_mask, write);
 
         uint64_t base;
         // bool memcpyflag_master;
         // bool memcpyflag;
-        count = __popc(eq_mask);
+        // count = __popc(eq_mask);  // 自注释
         if (master == lane)
         {
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
-            base = r_->acquire_page_wait_async(page, count, dirty, ctrl, queue); // 异步版本
+            base = r_->acquire_page_wait_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
             base_master = base;
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
         }
@@ -2862,7 +2908,7 @@ struct array_d_t
 
     __forceinline__
         __device__ void *
-        acquire_page_submit_async(const size_t i, data_page_t *&page_, size_t &start, size_t &end, int64_t &r) const
+        acquire_page_submit_async(const size_t i, data_page_t *&page_, size_t &start, size_t &end, int64_t &r, s_ctx &ctx) const
     {
         // 全局高级接口异步版本
         // printf("acquire_page_async:global\n");  // √
@@ -2887,21 +2933,38 @@ struct array_d_t
             uint64_t subindex = r_->get_subindex(i);
             uint64_t gaddr = r_->get_global_address(page);
 
-            coalesce_page_submit_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master);
-            page_ = &r_->pages[base_master];
+            coalesce_page_submit_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, ctx);
+            // printf("isHit?:%d\n", ctx.isHit);
+            ctx.eq_mask = eq_mask;
+            ctx.master = master;
+            ctx.count = count;
+            ctx.base_master = base_master;
 
-            ret = (void *)r_->get_cache_page_addr(base_master);
-            // start = r_->n_elems_per_page * page;  // 自注释，在wait函数中执行
-            // end = start + r_->n_elems_per_page; // * (page+1);
-            // ret.page = page;
-            __syncwarp(mask);
+            if (ctx.isHit)
+            {
+                printf("isHit!\n");
+                page_ = &r_->pages[base_master];
+                ret = (void *)r_->get_cache_page_addr(base_master);
+
+                start = r_->n_elems_per_page * page; // 自注释，在wait函数中执行
+                end = start + r_->n_elems_per_page;  // * (page+1);
+                // ret.page = page;
+            }
+            else
+            {
+                // printf("ret = 0\n");
+                ret = 0;
+            }
+
+            __syncwarp(mask); // 同步
+            // printf("acquire_page_submit_async同步完成\n");
         }
         return ret;
     }
 
     __forceinline__
         __device__ void *
-        acquire_page_wait_async(const size_t i, data_page_t *&page_, size_t &start, size_t &end, int64_t &r) const
+        acquire_page_wait_async(const size_t i, data_page_t *&page_, size_t &start, size_t &end, int64_t &r, s_ctx &ctx) const
     {
         // 全局高级接口异步版本
         // printf("acquire_page_wait_async:global\n"); // √ √
@@ -2925,8 +2988,8 @@ struct array_d_t
             uint64_t page = r_->get_page(i);
             uint64_t subindex = r_->get_subindex(i);
             uint64_t gaddr = r_->get_global_address(page);
-
-            coalesce_page_wait_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master);
+            // printf("执行coalesce_page_wait_async\n");  // 没问题
+            coalesce_page_wait_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, ctx);
             page_ = &r_->pages[base_master];
 
             ret = (void *)r_->get_cache_page_addr(base_master);
@@ -4274,7 +4337,7 @@ inline __device__ void read_data(page_cache_d_t *pc, QueuePair *qp, const uint64
     put_cid(&qp->sq, cid);
 }
 
-inline __device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry, uint16_t *cid_return, nvm_cmd_t *cmd_return)
+inline __device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx)
 {
     // printf("read_data_submit_async!\n"); // √
 
@@ -4290,28 +4353,28 @@ inline __device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp,
     ////printf("cid: %u\n", (unsigned int) cid);
 
     nvm_cmd_header(&cmd, cid, NVM_IO_READ, qp->nvmNamespace);
-    uint64_t prp1 = pc->prp1[pc_entry];
+    uint64_t prp1 = pc->prp1[ctx.page_trans];
     uint64_t prp2 = 0;
     if (pc->prps)
-        prp2 = pc->prp2[pc_entry];
+        prp2 = pc->prp2[ctx.page_trans];
     ////printf("tid: %llu\tstart_lba: %llu\tn_blocks: %llu\tprp1: %p\n", (unsigned long long) (threadIdx.x+blockIdx.x*blockDim.x), (unsigned long long) starting_lba, (unsigned long long) n_blocks, (void*) prp1);
     nvm_cmd_data_ptr(&cmd, prp1, prp2);            // 设置数据缓冲区地址
     nvm_cmd_rw_blks(&cmd, starting_lba, n_blocks); // 设置读取的起始 LBA 和块数
     // sq_enqueue中已实现门铃机制，已将请求提交到SSD
     uint16_t sq_pos = sq_enqueue(&qp->sq, &cmd); // 将命令放入提交队列 (Submission Queue),sq_pos：命令在 SQ 中的位置
 
-    *cid_return = cid;
-    *cmd_return = cmd;
+    ctx.cid = cid;
+    ctx.cmd = cmd;
 }
 
-inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry, uint16_t cid, nvm_cmd_t cmd)
+inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx)
 {
-    // printf("read_data_wait_async!\n"); // √
+    printf("read_data_wait_async!\n"); // √
     uint32_t head, head_;
     uint64_t pc_pos;
     uint64_t pc_prev_head;
-
-    uint32_t cq_pos = cq_poll(&qp->cq, cid, &head, &head_); // 阻塞轮询直到完成
+    printf("准备轮询\n");
+    uint32_t cq_pos = cq_poll(&qp->cq, ctx.cid, &head, &head_); // 阻塞轮询直到完成
 
     qp->cq.tail.fetch_add(1, simt::memory_order_acq_rel);
     pc_prev_head = pc->q_head->load(simt::memory_order_relaxed);
@@ -4321,9 +4384,9 @@ inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, c
     // sq_dequeue(&qp->sq, sq_pos);
 
     // enqueue_second(page_cache_d_t* pc, QueuePair* qp, const uint64_t starting_lba, nvm_cmd_t* cmd, const uint16_t cid, const uint64_t pc_pos, const uint64_t pc_prev_head)
-    enqueue_second(pc, qp, starting_lba, &cmd, cid, pc_pos, pc_prev_head);
+    enqueue_second(pc, qp, starting_lba, &ctx.cmd, ctx.cid, pc_pos, pc_prev_head);
 
-    put_cid(&qp->sq, cid);
+    put_cid(&qp->sq, ctx.cid);
 }
 
 inline __device__ void write_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry)
