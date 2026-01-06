@@ -481,12 +481,13 @@ struct bam_ptr
     {
 
         fini(); // destructor
-        // addr = (T *)array->acquire_page(i, page, start, end, range_id);
+        addr = (T *)array->acquire_page(i, page, start, end, range_id);
 
-        addr = (T *)array->acquire_page_submit_async(i, page, start, end, range_id, ctx);
-        if (!ctx.isHit)
-            addr = (T *)array->acquire_page_wait_async(i, page, start, end, range_id, ctx);
-
+        // addr = (T *)array->acquire_page_submit_async(i, page, start, end, range_id, ctx);
+        // if (!ctx.isHit)
+        // {
+        //     addr = (T *)array->acquire_page_wait_async(i, page, start, end, range_id, ctx);
+        // }
         return addr;
     }
 
@@ -556,6 +557,8 @@ struct bam_ptr
         {
             // printf("start:%d, end:%d\n", start, end);
             update_page(i); // no page->state.fetch_or
+            // update_page_submit_async(i);
+            // update_page_wait_async(i);
         }
         return addr[i - start];
     }
@@ -570,13 +573,14 @@ struct bam_ptr
         {
             update_page_submit_async(i); // no page->state.fetch_or  √
         }
-        if (!ctx.isHit)
+        if (ctx.isHit)
         {
-            return 0;
+            // 此时start和end已经被更新
+            return addr[i - start];
         }
         else
         {
-            return addr[i - start];
+            return 0;
         }
     }
 
@@ -586,12 +590,9 @@ struct bam_ptr
             read_wait_async(size_t i)
     {
         // printf("read_wait_asyn!\n");
-        if (!ctx.isHit)
-        {
-            update_page_wait_async(i); // no page->state.fetch_or  √
-        }
-        // 该函数被执行，说明缓存没有命中
-        return addr[i - start]; // 不是这里的问题
+        update_page_wait_async(i); // no page->state.fetch_or  √
+                                   // 该函数被执行，说明缓存没有命中
+        return addr[i - start];    // 不是这里的问题
     }
 
     __host__ __device__ T *memref(size_t i)
@@ -2275,7 +2276,7 @@ __forceinline__
         default:
             break;
         }
-        printf("fail:%d\n", fail);
+        // printf("fail:%d\n", fail);
         if (fail)
         {
             // if ((++j % 1000000) == 0)
