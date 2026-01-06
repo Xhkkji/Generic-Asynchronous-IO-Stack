@@ -427,7 +427,18 @@ struct s_ctx
     Controller *member_acquire_c;
     QueuePair *member_acquire_cAddq;
 
+    // 全局函数acquire_page
+    uint32_t lane;
+    int64_t r;
+    uint64_t page;
+    uint64_t subindex;
+    uint64_t gaddr;
+
     bool isHit;
+
+    // 添加构造函数确保初始化
+    __device__ s_ctx() : lane(0), r(-1), eq_mask(0), master(-1),
+                         count(0), base_master(0), isHit(false) {}
 };
 
 template <typename T>
@@ -470,7 +481,11 @@ struct bam_ptr
     {
 
         fini(); // destructor
-        addr = (T *)array->acquire_page(i, page, start, end, range_id);
+        // addr = (T *)array->acquire_page(i, page, start, end, range_id);
+
+        addr = (T *)array->acquire_page_submit_async(i, page, start, end, range_id, ctx);
+        if (!ctx.isHit)
+            addr = (T *)array->acquire_page_wait_async(i, page, start, end, range_id, ctx);
 
         return addr;
     }
@@ -2615,14 +2630,14 @@ struct array_d_t
         {
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
-            // base = r_->acquire_page(page, count, dirty, ctrl, queue);
+            base = r_->acquire_page(page, count, dirty, ctrl, queue);
             // printf("read acquire..\n");
-            s_ctx temp_ctx;
-            base = r_->acquire_page_submit_async(page, count, dirty, ctrl, queue, temp_ctx);
-            if (!temp_ctx.isHit)
-            {
-                base = r_->acquire_page_wait_async(page, count, dirty, ctrl, queue, temp_ctx);
-            }
+            // s_ctx temp_ctx;
+            // base = r_->acquire_page_submit_async(page, count, dirty, ctrl, queue, temp_ctx);
+            // if (!temp_ctx.isHit)
+            // {
+            //     base = r_->acquire_page_wait_async(page, count, dirty, ctrl, queue, temp_ctx);
+            // }
 
             base_master = base;
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
@@ -2651,7 +2666,7 @@ struct array_d_t
 
         ctrl = 0;                                 //__shfl_sync(mask, ctrl, leader);
         queue = __shfl_sync(mask, queue, leader); // Leader 将 queue 值广播给 warp 内所有活动线程
-        printf("submit queue:%d\n", queue);
+        // printf("submit queue:%d\n", queue);
         // 储存参数
         ctx.ctrl = ctrl;
         ctx.queue = queue;
@@ -2700,7 +2715,7 @@ struct array_d_t
 
         ctrl = ctx.ctrl;                          //__shfl_sync(mask, ctrl, leader);
         queue = __shfl_sync(mask, queue, leader); // Leader 将 queue 值广播给 warp 内所有活动线程
-        printf("wait queue:%d\n", queue);
+        // printf("wait queue:%d\n", queue);
         uint32_t active_cnt = __popc(mask); // 活动线程总数
         // eq_mask = ctx.eq_mask;  // 自注释
         // master = __ffs(eq_mask) - 1; // Find First Set，找到掩码中最低位的 1 的位置
@@ -2918,6 +2933,12 @@ struct array_d_t
             uint64_t gaddr = r_->get_global_address(page);
 
             coalesce_page(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master);
+
+            // s_ctx temp_ctx;
+            // // printf("coalesce\n");
+            // coalesce_page_submit_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, temp_ctx);
+            // coalesce_page_wait_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, temp_ctx);
+
             page_ = &r_->pages[base_master];
 
             ret = (void *)r_->get_cache_page_addr(base_master);
@@ -2938,6 +2959,9 @@ struct array_d_t
         uint32_t lane = lane_id();
         r = find_range(i);
         auto r_ = d_ranges + r;
+
+        ctx.lane = lane;
+        ctx.r = r;
 
         void *ret = nullptr;
         page_ = nullptr;
@@ -2962,10 +2986,13 @@ struct array_d_t
             ctx.master = master;
             ctx.count = count;
             ctx.base_master = base_master;
+            ctx.page = page;
+            ctx.subindex = subindex;
+            ctx.gaddr = gaddr;
 
             if (ctx.isHit)
             {
-                printf("isHit!\n");
+                // printf("isHit!\n");
                 page_ = &r_->pages[base_master];
                 ret = (void *)r_->get_cache_page_addr(base_master);
 
@@ -2980,7 +3007,7 @@ struct array_d_t
             }
 
             __syncwarp(mask); // 同步
-            // printf("acquire_page_submit_async同步完成\n");
+            // printf("acquire_page_submit_async同步完成\n");  // √
         }
         return ret;
     }
@@ -2991,10 +3018,13 @@ struct array_d_t
     {
         // 全局高级接口异步版本
         // printf("acquire_page_wait_async:global\n"); // √ √
-        uint32_t lane = lane_id();
-        r = find_range(i);
-        auto r_ = d_ranges + r;
+        // uint32_t lane = lane_id();
+        // r = find_range(i);
 
+        uint32_t lane = ctx.lane;
+        r = ctx.r;
+        auto r_ = d_ranges + r;
+        // 可执行到
         void *ret = nullptr;
         page_ = nullptr;
         if (r != -1)
@@ -3004,15 +3034,21 @@ struct array_d_t
 #else
             uint32_t mask = __activemask(); // 线程掩码，表示出一个wrap中哪些线程在执行
 #endif
-            uint32_t eq_mask;
-            int master;
+            uint32_t eq_mask = ctx.eq_mask;
+            int master = ctx.master;
             // uint64_t base_master;
             uint32_t count;
-            uint64_t page = r_->get_page(i);
-            uint64_t subindex = r_->get_subindex(i);
-            uint64_t gaddr = r_->get_global_address(page);
+            // uint64_t page = r_->get_page(i);
+            // uint64_t subindex = r_->get_subindex(i);
+            // uint64_t gaddr = r_->get_global_address(page);
+
+            uint64_t page = ctx.page;
+            uint64_t subindex = ctx.subindex;
+            uint64_t gaddr = ctx.gaddr;
+
             // printf("执行coalesce_page_wait_async\n");  // 没问题
             coalesce_page_wait_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, ctx.base_master, ctx);
+            // printf("执行完成coalesce_page_wait_async\n");
             page_ = &r_->pages[ctx.base_master];
 
             ret = (void *)r_->get_cache_page_addr(ctx.base_master);
