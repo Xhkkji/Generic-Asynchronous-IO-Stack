@@ -265,7 +265,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vector<uint64_t> &i_ptr_list, const std::vector<uint64_t> &i_index_ptr_list,
                                                   const std::vector<uint64_t> &num_index, int dim, int cache_dim = 1024)
 {
-  printf("num_iter:%d\n", num_iter);
+  // printf("num_iter:%d\n", num_iter);
   cudaStream_t streams[num_iter];
   for (int i = 0; i < num_iter; i++)
   {
@@ -286,7 +286,7 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     uint64_t n_warp = b_size / 32;
     uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
 
-    printf("g_size:%d, b_size:%d", g_size, b_size);
+    // printf("g_size:%d, b_size:%d", g_size, b_size);
 
     if (cpu_buffer_flag == false)
     {
@@ -305,7 +305,7 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
 
   for (int i = 0; i < num_iter; i++)
   {
-    printf("cudaStreamSynchronize:%d\n", i); // ×
+    // printf("cudaStreamSynchronize:%d\n", i); // ×
     cudaStreamSynchronize(streams[i]);
   }
 

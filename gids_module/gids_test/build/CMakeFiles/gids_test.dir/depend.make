@@ -1,0 +1,2 @@
+# Empty dependencies file for gids_test.
+# This may be replaced when dependencies are built.

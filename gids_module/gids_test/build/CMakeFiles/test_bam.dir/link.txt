@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/test_bam.dir/test_bam_generated_gids_test.cu.o CMakeFiles/test_bam.dir/test_bam_generated_gids_kernel.cu.o -o test_bam  /usr/local/cuda-12.2/lib64/libcudart_static.a -ldl /usr/lib/x86_64-linux-gnu/librt.so /usr/local/cuda-12.2/lib64/libcudart_static.a -ldl /usr/lib/x86_64-linux-gnu/librt.so -lpthread 

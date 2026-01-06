@@ -1,5 +1,5 @@
-nvcc -std=c++14 -O3 -Xcompiler -fPIC \
-    test_simple.cpp \
-    -I/path/to/your/headers \
-    -L/usr/local/cuda/lib64 -lcudart \
-    -o test_bam
+# compile_test.sh
+echo "编译CPU backing测试..."
+nvcc gids_test.cu gids_kernel.cu -o test_cpu_backing
+echo "运行测试..."
+./test_cpu_backing

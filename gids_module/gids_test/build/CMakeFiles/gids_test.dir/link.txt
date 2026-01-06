@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/gids_test.dir/gids_test_generated_gids_test.cu.o CMakeFiles/gids_test.dir/gids_test_generated_gids_kernel.cu.o -o gids_test  /usr/local/cuda-12.2/lib64/libcudart_static.a -ldl /usr/lib/x86_64-linux-gnu/librt.so /usr/local/cuda-12.2/lib64/libcudart_static.a -ldl /usr/lib/x86_64-linux-gnu/librt.so -lpthread 
