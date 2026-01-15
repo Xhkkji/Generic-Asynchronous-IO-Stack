@@ -287,6 +287,7 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
 
     // printf("g_size:%d, b_size:%d", g_size, b_size);
+    // b_size为每个block中的线程数，假设为128，则warp数量为128/32个，一个warp处理一个特征数据(1024维)
 
     if (cpu_buffer_flag == false)
     {

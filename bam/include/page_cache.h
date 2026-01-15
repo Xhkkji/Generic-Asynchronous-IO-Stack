@@ -408,7 +408,6 @@ struct bam_ptr_tlb
 struct s_ctx
 {
     // page, start, end, range_id是全局变量
-
     uint32_t eq_mask;
     int master;
     uint32_t count;
@@ -4243,116 +4242,6 @@ inline __device__ void enqueue_second(page_cache_d_t *pc, QueuePair *qp, const u
 #endif
     } while (true);
 }
-
-// 修改：read_data_async
-// 异步读取数据函数
-// inline __device__ void async_read_data(page_cache_d_t *pc, QueuePairAsync *qp, IORequest *req)
-// {
-//     nvm_cmd_t cmd;
-//     uint16_t cid = get_cid(&(qp->sq));
-
-//     nvm_cmd_header(&cmd, cid, NVM_IO_READ, qp->nvmNamespace);
-
-//     uint64_t prp1 = pc->prp1[req->pc_entry];
-//     uint64_t prp2 = 0;
-//     if (pc->prps)
-//         prp2 = pc->prp2[req->pc_entry];
-
-//     nvm_cmd_data_ptr(&cmd, prp1, prp2);
-//     nvm_cmd_rw_blks(&cmd, req->starting_lba, req->n_blocks);
-
-//     // 记录命令信息到请求中
-//     req->cid = cid;
-//     req->sq_pos = sq_enqueue(&qp->sq, &cmd);
-//     req->qp = qp;
-//     req->submit_time = clock64();
-
-//     // 门铃机制：通知硬件有新命令
-//     __threadfence();
-//     qp->sq.doorbell.store(qp->sq.tail, simt::memory_order_release);
-// }
-
-// 检查IO是否完成的函数
-// __device__ bool check_io_completion(range_d_t<T> *range, uint64_t page_idx, uint64_t page_trans_result)
-// {
-//     // 如果高位为0，表示已经完成
-//     if ((page_trans_result & 0x8000000000000000) == 0)
-//         return true;
-
-//     // 清除高位，获取实际的page_trans
-//     uint64_t page_trans = page_trans_result & ~0x8000000000000000;
-//     uint64_t index = page_idx;
-
-//     // 检查页面状态
-//     uint64_t state = range->pages[index].state.load(simt::memory_order_acquire);
-//     uint64_t st = (state >> (CNT_SHIFT + 1)) & 0x03;
-
-//     // 如果状态变为VALID，说明IO已完成
-//     if (st == V_NB)
-//     {
-//         // 确保数据已经就绪
-//         __threadfence();
-//         return true;
-//     }
-
-//     // 如果还在BUSY状态，尝试轮询完成队列
-//     if ((state & BUSY) != 0)
-//     {
-//         // 检查对应的请求是否完成
-//         uint32_t req_id = range->pages[index].pending_req;
-//         IORequest *req = &range->cache.d_ctrls[0]->pending_requests[req_id % MAX_PENDING_REQUESTS];
-
-//         if (req->state.load(simt::memory_order_acquire) == IO_COMPLETED)
-//         {
-//             // IO完成，更新页面状态
-//             if (range->pages[index].state.compare_exchange_strong(
-//                     state,
-//                     (state & ~BUSY) | VALID,
-//                     simt::memory_order_release,
-//                     simt::memory_order_relaxed))
-//             {
-//                 __threadfence();
-//                 return true;
-//             }
-//         }
-//         else
-//         {
-//             // 轮询完成队列
-//             poll_completion_queue(req->qp);
-//         }
-//     }
-
-//     return false;
-// }
-
-// // 轮询完成队列的辅助函数
-// __device__ void poll_completion_queue(QueuePair *qp)
-// {
-//     uint32_t head = qp->cq.head.load(simt::memory_order_acquire);
-//     uint32_t tail = qp->cq.tail.load(simt::memory_order_acquire);
-
-//     if (head != tail)
-//     {
-//         // 有完成项，处理它们
-//         for (uint32_t i = head; i != tail; i = (i + 1) % qp->cq.size)
-//         {
-//             uint16_t cid = qp->cq.entries[i].cid;
-//             IORequest *req = find_request_by_cid(qp, cid);
-
-//             if (req)
-//             {
-//                 // 标记请求为完成
-//                 req->state.store(IO_COMPLETED, simt::memory_order_release);
-
-//                 // 释放CID
-//                 put_cid(&qp->sq, cid);
-
-//                 // 更新CQ尾指针
-//                 qp->cq.tail.store((i + 1) % qp->cq.size, simt::memory_order_release);
-//             }
-//         }
-//     }
-// }
 
 inline __device__ void read_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry)
 {

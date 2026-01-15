@@ -22,7 +22,15 @@ __global__ void read_feature_kernel(array_d_t<T> *dr, T *out_tensor_ptr,
       // T temp = ptr[(row_index) * cache_dim + tid];
       const size_t idx = (row_index)*cache_dim + tid;
       // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
-      out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
+      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
+      // printf("read_feature_kernel idx:%llu\n", (unsigned long long)idx);
+      T temp = ptr.read_submit_async((row_index)*cache_dim + tid); // √
+      if (!ptr.ctx.isHit)
+      {
+        temp = ptr.read_wait_async((row_index)*cache_dim + tid); // √
+        ptr.ctx.isHit = true;                                    // 重要
+      }
+      out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
     }
   }
 }
@@ -70,6 +78,14 @@ __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, ra
         {
           // T temp = ptr[(row_index) * cache_dim + tid];
           T temp = ptr.read((row_index)*cache_dim + tid);
+
+          // T temp = ptr.read_submit_async((row_index)*cache_dim + tid); // √
+
+          // if (!ptr.ctx.isHit)
+          // {
+          //   temp = ptr.read_wait_async((row_index)*cache_dim + tid); // √
+          //   ptr.ctx.isHit = true;                                    // 重要
+          // }
           out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
         }
       }
