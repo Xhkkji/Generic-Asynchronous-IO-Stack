@@ -286,13 +286,25 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     uint64_t n_warp = b_size / 32;
     uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
 
-    // printf("g_size:%d, b_size:%d", g_size, b_size);
+    printf("g_size:%d, b_size:%d", g_size, b_size);
     // b_size为每个block中的线程数，假设为128，则warp数量为128/32个，一个warp处理一个特征数据(1024维)
 
     if (cpu_buffer_flag == false)
     {
-      read_feature_kernel<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
-                                                                   index_ptr, dim, num_index[i], cache_dim, 0);
+      s_ctx ctx;
+      ctx.isHit = false;
+      // read_feature_kernel<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
+      //                                                              index_ptr, dim, num_index[i], cache_dim, 0);
+      read_feature_kernel_submit_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
+                                                                   index_ptr, dim, num_index[i], cache_dim, 0, ctx);
+      printf("read_feature_submit_async launched..\n");                                                          
+      // if (!ctx.isHit)
+      // {
+      //   read_feature_kernel_wait_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
+      //                                                              index_ptr, dim, num_index[i], cache_dim, 0, ctx);
+      //   ctx.isHit = true;                                    // 重要
+      // }                                                          
+                                                                   
     }
     else
     {

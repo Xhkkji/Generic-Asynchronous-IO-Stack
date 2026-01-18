@@ -22,14 +22,86 @@ __global__ void read_feature_kernel(array_d_t<T> *dr, T *out_tensor_ptr,
       // T temp = ptr[(row_index) * cache_dim + tid];
       const size_t idx = (row_index)*cache_dim + tid;
       // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
-      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
+      out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
+      
       // printf("read_feature_kernel idx:%llu\n", (unsigned long long)idx);
-      T temp = ptr.read_submit_async((row_index)*cache_dim + tid); // √
-      if (!ptr.ctx.isHit)
+      // T temp = ptr.read_submit_async((row_index)*cache_dim + tid); // √
+      // if (!ptr.ctx.isHit)
+      // {
+      //   temp = ptr.read_wait_async((row_index)*cache_dim + tid); // √
+      //   ptr.ctx.isHit = true;                                    // 重要
+      // }
+      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
+    }
+  }
+}
+
+template <typename T = float>
+__global__ void read_feature_kernel_submit_async(array_d_t<T> *dr, T *out_tensor_ptr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx& ctx)
+{
+
+  uint64_t bid = blockIdx.x;
+  int num_warps = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  int idx_idx = bid * num_warps + warp_id;
+  if (idx_idx < num_idx)
+  {
+    bam_ptr<T> ptr(dr);
+
+    uint64_t row_index = index_ptr[idx_idx] + key_off;
+    uint64_t tid = threadIdx.x % 32;
+
+    for (; tid < dim; tid += 32)
+    {
+      // T temp = ptr[(row_index) * cache_dim + tid];
+      const size_t idx = (row_index)*cache_dim + tid;
+      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
+      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
+      
+      T temp = ptr.read_submit_async((row_index)*cache_dim + tid, ctx); // √
+      // printf("temp:%f\n", temp);  // 没执行到
+      if (ctx.isHit)
       {
-        temp = ptr.read_wait_async((row_index)*cache_dim + tid); // √
-        ptr.ctx.isHit = true;                                    // 重要
+        out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
+        // ctx.isHit = true;                                    // 重要
       }
+      else
+      {
+        out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = T(0); // 占位，后续wait时会覆盖
+      }
+    }
+  }
+}
+
+template <typename T = float>
+__global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_ptr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx& ctx)
+{
+
+  uint64_t bid = blockIdx.x;
+  int num_warps = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  int idx_idx = bid * num_warps + warp_id;
+  if (idx_idx < num_idx)
+  {
+    bam_ptr<T> ptr(dr);
+
+    uint64_t row_index = index_ptr[idx_idx] + key_off;
+    uint64_t tid = threadIdx.x % 32;
+
+    for (; tid < dim; tid += 32)
+    {
+      // T temp = ptr[(row_index) * cache_dim + tid];
+      const size_t idx = (row_index)*cache_dim + tid;
+      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
+      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
+      
+      // printf("read_feature_kernel_wait idx:%llu\n", (unsigned long long)idx);
+
+      T temp = ptr.read_wait_async((row_index)*cache_dim + tid, ctx); // √                                 // 重要
       out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
     }
   }
@@ -113,19 +185,19 @@ __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, ra
         {
           // T temp = ptr[(row_index) * cache_dim + tid];
           // printf("基于位图的read\n");
-          // T temp = ptr.read((row_index)*cache_dim + tid);
+          T temp = ptr.read((row_index)*cache_dim + tid);
           // printf("before..start:%d, end:%d\n", ptr.start, ptr.end);
 
-          T temp = ptr.read_submit_async((row_index)*cache_dim + tid); // √
-          // printf("read_submit_async执行完成\n");
-          // printf("after..start:%d, end:%d\n\n", ptr.start, ptr.end);
-          // printf("ptr.ctx.isHit:%d\n", ptr.ctx.isHit);
-          if (!ptr.ctx.isHit)
-          {
-            temp = ptr.read_wait_async((row_index)*cache_dim + tid); // √
-            ptr.ctx.isHit = true;                                    // 重要
-            // printf("read_wait_async执行完成\n");
-          }
+          // T temp = ptr.read_submit_async((row_index)*cache_dim + tid); // √
+          // // printf("read_submit_async执行完成\n");
+          // // printf("after..start:%d, end:%d\n\n", ptr.start, ptr.end);
+          // // printf("ptr.ctx.isHit:%d\n", ptr.ctx.isHit);
+          // if (!ptr.ctx.isHit)
+          // {
+          //   temp = ptr.read_wait_async((row_index)*cache_dim + tid); // √
+          //   ptr.ctx.isHit = true;                                    // 重要
+          //   // printf("read_wait_async执行完成\n");
+          // }
 
           // printf("temp:%f\n", temp);
           // 输出:temp:0.032106

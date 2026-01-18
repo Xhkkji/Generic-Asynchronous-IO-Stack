@@ -450,7 +450,7 @@ struct bam_ptr
     int64_t range_id = -1;
     T *addr = nullptr;
     // __shared__ s_ctx ctx;
-    s_ctx ctx;
+    // s_ctx ctx;
 
     __forceinline__
         __host__ __device__
@@ -493,7 +493,7 @@ struct bam_ptr
     // update_page有两个版本，update_page_async也需要有两个，一个全局，一个成员
     __forceinline__
         __host__ __device__ T *
-        update_page_submit_async(const size_t i)
+        update_page_submit_async(const size_t i, s_ctx &ctx)
     {
         // printf("update_page_submit_async!\n");  // √
         fini(); // destructor
@@ -501,7 +501,10 @@ struct bam_ptr
         // 此处调用全局的acquire_page版本
         // addr = (T *)array->acquire_page(i, page, start, end, range_id);
         // 此处需要接收到isHit的情况，存入ctx中
+        // printf("before acquire_page_submit_async..start:%d, end:%d\n", start, end);  // 
+        printf("2ct.lane:%d\n", ctx.lane);
         addr = (T *)array->acquire_page_submit_async(i, page, start, end, range_id, ctx);
+        // printf("after acquire_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
 
         return addr;
     }
@@ -509,7 +512,7 @@ struct bam_ptr
     // update_page有两个版本，update_page_async也需要有两个，一个全局，一个成员
     __forceinline__
         __host__ __device__ T *
-        update_page_wait_async(const size_t i)
+        update_page_wait_async(const size_t i, s_ctx &ctx)
     {
         // printf("update_page_wait_async!\n"); // √
         // fini(); // destructor
@@ -565,12 +568,15 @@ struct bam_ptr
     __forceinline__
         __host__ __device__
             T
-            read_submit_async(size_t i)
+            read_submit_async(size_t i, s_ctx &ctx)
     {
         // printf("read_submit_asyn!\n");
         if ((i < start) || (i >= end))
         {
-            update_page_submit_async(i); // no page->state.fetch_or  √
+            // printf("before update_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
+            printf("1ct.lane:%d\n", ctx.lane);
+            update_page_submit_async(i, ctx); // no page->state.fetch_or  √
+            // printf("after update_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
         }
         if (ctx.isHit)
         {
@@ -586,10 +592,10 @@ struct bam_ptr
     __forceinline__
         __host__ __device__
             T
-            read_wait_async(size_t i)
+            read_wait_async(size_t i, s_ctx &ctx)
     {
         // printf("read_wait_asyn!\n");
-        update_page_wait_async(i); // no page->state.fetch_or  √
+        update_page_wait_async(i, ctx); // no page->state.fetch_or  √
                                    // 该函数被执行，说明缓存没有命中
         return addr[i - start];    // 不是这里的问题
     }
@@ -2044,6 +2050,7 @@ __forceinline__
                 // uint16_t cid;
                 // nvm_cmd_t cmd;// 使用类成员变量
                 read_data_submit_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, ctx);
+                printf("read_data_submit_async called\n");// 没执行到
                 // printf("cid:%d\n", cid);
                 // read_data_wait_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans, cid, cmd);
 
@@ -2686,8 +2693,10 @@ struct array_d_t
         {
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
+            printf("before执行到合并线程..\n");  // 
             base = r_->acquire_page_submit_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
             base_master = base;
+            // printf("执行到合并线程..\n");  // 没执行到
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
         }
         base_master = __shfl_sync(eq_mask, base_master, master);
@@ -2959,14 +2968,19 @@ struct array_d_t
         uint32_t lane = lane_id();
         r = find_range(i);
         auto r_ = d_ranges + r;
-
+        printf("acquire_page_async:1\n");  // √
+        printf("lane:%d\n", lane);
+        printf("3ct.lane:%d\n", ctx.lane);
+        
         ctx.lane = lane;
-        ctx.r = r;
-
+        // ctx.r = r;
+        printf("acquire_page_async:2\n");  // √
         void *ret = nullptr;
         page_ = nullptr;
+        printf("acquire_page_async:3\n");  // √
         if (r != -1)
         {
+            
 #ifndef __CUDACC__
             uint32_t mask = 1;
 #else
@@ -2976,12 +2990,18 @@ struct array_d_t
             int master;
             uint64_t base_master;
             uint32_t count;
+            // 可执行到
+            // printf("acquire_page_async:global\n");  // √
             uint64_t page = r_->get_page(i);
+            printf("1\n");
             uint64_t subindex = r_->get_subindex(i);
+            printf("2\n");
             uint64_t gaddr = r_->get_global_address(page);
+            // printf("acquire_page_async:global\n");  // √
 
+            printf("before coalesce_page_submit_async\n");  // 
             coalesce_page_submit_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, ctx);
-            // printf("isHit?:%d\n", ctx.isHit);
+            // printf("isHit?:%d\n", ctx.isHit);  // 没执行到
             ctx.eq_mask = eq_mask;
             ctx.master = master;
             ctx.count = count;
@@ -4305,7 +4325,7 @@ inline __device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp,
     nvm_cmd_rw_blks(&cmd, starting_lba, n_blocks); // 设置读取的起始 LBA 和块数
     // sq_enqueue中已实现门铃机制，已将请求提交到SSD
     uint16_t sq_pos = sq_enqueue(&qp->sq, &cmd); // 将命令放入提交队列 (Submission Queue),sq_pos：命令在 SQ 中的位置
-
+    printf("已将nvme提交命令存入队列");
     ctx.cid = cid;
     ctx.cmd = cmd;
 }
