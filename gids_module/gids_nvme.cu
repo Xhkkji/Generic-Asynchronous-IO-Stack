@@ -266,13 +266,21 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
                                                   const std::vector<uint64_t> &num_index, int dim, int cache_dim = 1024)
 {
   // printf("num_iter:%d\n", num_iter);
+  // 同步流只需要创建一次
   cudaStream_t streams[num_iter];
   for (int i = 0; i < num_iter; i++)
   {
     cudaStreamCreate(&streams[i]);
   }
 
-  cuda_err_chk(cudaDeviceSynchronize());
+  // 在循环外部创建事件
+  // cudaEvent_t events[num_iter];
+  // for (int i = 0; i < num_iter; i++) 
+  // {
+  //     cudaEventCreate(&events[i]);
+  // }
+
+  // cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
   for (uint64_t i = 0; i < num_iter; i++)
@@ -284,27 +292,48 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
 
     uint64_t b_size = blkSize;
     uint64_t n_warp = b_size / 32;
-    uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
+    // uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
+    uint64_t g_size = 128;  // 34,560(10000可运行)
 
-    printf("g_size:%d, b_size:%d", g_size, b_size);
+    // g_size:43337, b_size:128
+    // printf("g_size:%d, b_size:%d\n", g_size, b_size);
     // b_size为每个block中的线程数，假设为128，则warp数量为128/32个，一个warp处理一个特征数据(1024维)
+
 
     if (cpu_buffer_flag == false)
     {
-      s_ctx ctx;
-      ctx.isHit = false;
+      s_ctx* d_warp_ctxs;  // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
+
+      // 计算总warp数
+      uint64_t warps_per_block = b_size / 32;
+      uint64_t total_warps = g_size * warps_per_block;  // 43337 * 4 = 173348
+
+      // 分配设备内存
+      cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
+      cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
+
       // read_feature_kernel<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
       //                                                              index_ptr, dim, num_index[i], cache_dim, 0);
       read_feature_kernel_submit_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
-                                                                   index_ptr, dim, num_index[i], cache_dim, 0, ctx);
-      printf("read_feature_submit_async launched..\n");                                                          
-      // if (!ctx.isHit)
-      // {
-      //   read_feature_kernel_wait_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
-      //                                                              index_ptr, dim, num_index[i], cache_dim, 0, ctx);
-      //   ctx.isHit = true;                                    // 重要
-      // }                                                          
-                                                                   
+                                                                   index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
+
+
+      // printf("read_feature_submit_async before launched..\n"); 
+      cudaStreamSynchronize(streams[i]); // 此处被阻塞
+      // 调试输出
+      printf("Submit finished for iteration %lu\n", i);
+      
+      read_feature_kernel_wait_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
+                                                                   index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
+        
+      cudaStreamSynchronize(streams[i]); 
+      cuda_err_chk(cudaDeviceSynchronize());
+
+      if(d_warp_ctxs!=nullptr)  cudaFree(d_warp_ctxs); 
+      cudaStreamDestroy(streams[i]);
+      // cudaStreamDestroy(streams1[i]);
+      // cudaStreamDestroy(streams2[i]); 
+                                                   
     }
     else
     {
@@ -316,11 +345,11 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     total_access += num_index[i];
   }
 
-  for (int i = 0; i < num_iter; i++)
-  {
-    // printf("cudaStreamSynchronize:%d\n", i); // ×
-    cudaStreamSynchronize(streams[i]);
-  }
+  // for (int i = 0; i < num_iter; i++)
+  // {
+  //   // printf("cudaStreamSynchronize:%d\n", i); // ×
+  //   cudaStreamSynchronize(streams[i]);
+  // }
 
   // printf("cudaStreamSynchronize finished, num_iter:%d\n", num_iter); //
   cuda_err_chk(cudaDeviceSynchronize());
@@ -340,10 +369,10 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
 
   kernel_time += ms_fractional;
 
-  for (int i = 0; i < num_iter; i++)
-  {
-    cudaStreamDestroy(streams[i]);
-  }
+  // for (int i = 0; i < num_iter; i++)
+  // {
+  //   cudaStreamDestroy(streams[i]);
+  // }
   return;
 }
 

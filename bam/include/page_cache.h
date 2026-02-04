@@ -427,16 +427,16 @@ struct s_ctx
     QueuePair *member_acquire_cAddq;
 
     // 全局函数acquire_page
-    uint32_t lane;
     int64_t r;
     uint64_t page;
     uint64_t subindex;
     uint64_t gaddr;
 
-    bool isHit;
+    bool isHit;// 若该ctx对应的warp中32个线程全部命中，则为true，否则为false
+    // bool islaneHit[32] = {false};// 每个线程的命中情况
 
     // 添加构造函数确保初始化
-    __device__ s_ctx() : lane(0), r(-1), eq_mask(0), master(-1),
+    __device__ s_ctx() : r(-1), eq_mask(0), master(-1),
                          count(0), base_master(0), isHit(false) {}
 };
 
@@ -502,10 +502,8 @@ struct bam_ptr
         // addr = (T *)array->acquire_page(i, page, start, end, range_id);
         // 此处需要接收到isHit的情况，存入ctx中
         // printf("before acquire_page_submit_async..start:%d, end:%d\n", start, end);  // 
-        printf("2ct.lane:%d\n", ctx.lane);
         addr = (T *)array->acquire_page_submit_async(i, page, start, end, range_id, ctx);
-        // printf("after acquire_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
-
+        // printf("after acquire_page_submit_async..start:%d, end:%d\n", start, end);  // √
         return addr;
     }
 
@@ -574,7 +572,6 @@ struct bam_ptr
         if ((i < start) || (i >= end))
         {
             // printf("before update_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
-            printf("1ct.lane:%d\n", ctx.lane);
             update_page_submit_async(i, ctx); // no page->state.fetch_or  √
             // printf("after update_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
         }
@@ -585,7 +582,7 @@ struct bam_ptr
         }
         else
         {
-            return 0;
+            return T(0); // 占位，实际不使用
         }
     }
 
@@ -2020,9 +2017,13 @@ __forceinline__
             st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire); // 状态设置为busy
             if ((st_new & BUSY) == 0)
             {
+                // 该线程未命中，整个warp标记为未命中
                 ctx.isHit = false; // 传回未命中的信息，与V_NB作区分
-
-                ctx.page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
+                // uint32_t laneID = lane_id();
+                // printf("submit:成员acquire laneID:%d\n", laneID);
+                // 分配缓存槽位
+                uint64_t page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
+                ctx.page_trans = page_trans;
                 // fill in
                 // uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
                 // uint32_t sm_id = get_smid();
@@ -2049,10 +2050,12 @@ __forceinline__
 
                 // uint16_t cid;
                 // nvm_cmd_t cmd;// 使用类成员变量
+                // printf("queue in submit:%d\n", queue);
                 read_data_submit_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, ctx);
-                printf("read_data_submit_async called\n");// 没执行到
-                // printf("cid:%d\n", cid);
-                // read_data_wait_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans, cid, cmd);
+                // printf("read_data_submit_async called\n");// √
+                // 此处要解除busy状态
+                // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
+
 
                 // 以下全部注释，在read_data_wait_async中执行
                 // // page_addresses[index].store(page_trans, simt::memory_order_release);
@@ -2069,7 +2072,7 @@ __forceinline__
                 // pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
                 // printf("page_trans:%d\n", page_trans);
 
-                return ctx.page_trans;
+                return page_trans;
 
                 // fail = false;
             }
@@ -2094,7 +2097,42 @@ __forceinline__
 
             break;
         case NV_B:
+            // printf("NV_B in submit\n");  // 问题在这里！一直在NV_B！
+                // 1. 获取其他线程已经设置的page_trans
+            ctx.isHit = false; // 传回未命中的信息，与V_NB作区分
+            page_trans = pages[index].offset;
+            
+            if (page_trans == 0) {
+                // 异常：有BUSY但没有offset，可能刚设置BUSY
+                // 短暂等待后重试
+                // printf("NV_B in submit等待重试\n"); 
+                __nanosleep(128);
+                page_trans = pages[index].offset;
+            }
+            
+            // 2. 设置上下文信息
+            ctx.page_trans = page_trans;
+
+            uint64_t ctrl = get_backing_ctrl(index);
+            if (ctrl == ALL_CTRLS)
+                ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
+            // ctrl = ctrl_;
+            uint64_t b_page = get_backing_page(index);
+
+            Controller *c = cache.d_ctrls[ctrl];
+            c->access_counter.fetch_add(1, simt::memory_order_relaxed);
+
+            ctx.member_acquire_ctrl = ctrl;
+            ctx.member_acquire_b_page = b_page;
+            ctx.member_acquire_c = c;
+            ctx.member_acquire_cAddq = (c->d_qps) + queue;
+            
+            // 3. ⭐ 返回page_trans（不是直接return 0或死循环！）
+            return page_trans;  // ⭐ 关键：返回有效的page_trans
+            break;
         case V_B:
+        printf("V_B in submit\n");
+        break;
         default:
             break;
         }
@@ -2153,7 +2191,7 @@ __forceinline__
     // read_state = pages[index].state.load(simt::memory_order_acquire);
     // 修复方案1：使用fetch_add(0)
     read_state = pages[index].state.fetch_add(0, simt::memory_order_acquire);
-
+    int laneid = lane_id();
     // 现在read_state和st是基于相同时间点的"一致视图"
     if (ctx.isHit)
     {
@@ -2162,6 +2200,10 @@ __forceinline__
     do
     {
         st = (read_state >> (CNT_SHIFT + 1)) & 0x03;
+        if(ctx.isHit==false)
+        {
+            st = NV_B;
+        }
         // printf("wait_st:%u\n", st);
         switch (st)
         {
@@ -2238,6 +2280,7 @@ __forceinline__
             break;
         case NV_B:
             // printf("wait:NV_B\n"); // √
+            ctx.isHit = true;
             // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
 
             // 使用submit中获取到的page_trans
@@ -2279,6 +2322,8 @@ __forceinline__
 
             break;
         case V_B:
+            // printf("wait:V_B\n");
+            // break;
         default:
             break;
         }
@@ -2693,14 +2738,15 @@ struct array_d_t
         {
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
-            printf("before执行到合并线程..\n");  // 
             base = r_->acquire_page_submit_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
             base_master = base;
-            // printf("执行到合并线程..\n");  // 没执行到
+            // printf("合并线程执行完成..\n");  // √
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
         }
         base_master = __shfl_sync(eq_mask, base_master, master);
-        ctx.isHit = __shfl_sync(eq_mask, ctx.isHit, master);
+
+
+        // ctx.isHit = __shfl_sync(eq_mask, ctx.isHit, master);
     }
 
     // 修改：异步版本
@@ -2718,11 +2764,11 @@ struct array_d_t
         if (lane == leader)
         {
             page_cache_d_t *pc = &(r_->cache);
-            ctrl = 0; // pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
+            ctrl = ctx.ctrl; // pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
             queue = ctx.queue;
         }
 
-        ctrl = ctx.ctrl;                          //__shfl_sync(mask, ctrl, leader);
+        // ctrl = ctx.ctrl;                          //__shfl_sync(mask, ctrl, leader);
         queue = __shfl_sync(mask, queue, leader); // Leader 将 queue 值广播给 warp 内所有活动线程
         // printf("wait queue:%d\n", queue);
         uint32_t active_cnt = __popc(mask); // 活动线程总数
@@ -2968,19 +3014,14 @@ struct array_d_t
         uint32_t lane = lane_id();
         r = find_range(i);
         auto r_ = d_ranges + r;
-        printf("acquire_page_async:1\n");  // √
-        printf("lane:%d\n", lane);
-        printf("3ct.lane:%d\n", ctx.lane);
         
-        ctx.lane = lane;
-        // ctx.r = r;
-        printf("acquire_page_async:2\n");  // √
+        // ctx.lane = lane;
+        ctx.r = r;
+
         void *ret = nullptr;
         page_ = nullptr;
-        printf("acquire_page_async:3\n");  // √
         if (r != -1)
         {
-            
 #ifndef __CUDACC__
             uint32_t mask = 1;
 #else
@@ -2993,15 +3034,13 @@ struct array_d_t
             // 可执行到
             // printf("acquire_page_async:global\n");  // √
             uint64_t page = r_->get_page(i);
-            printf("1\n");
             uint64_t subindex = r_->get_subindex(i);
-            printf("2\n");
             uint64_t gaddr = r_->get_global_address(page);
             // printf("acquire_page_async:global\n");  // √
 
-            printf("before coalesce_page_submit_async\n");  // 
+            // printf("before coalesce_page_submit_async\n");  // √
             coalesce_page_submit_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, ctx);
-            // printf("isHit?:%d\n", ctx.isHit);  // 没执行到
+            // printf("isHit?:%d\n", ctx.isHit);  // √
             ctx.eq_mask = eq_mask;
             ctx.master = master;
             ctx.count = count;
@@ -3014,11 +3053,10 @@ struct array_d_t
             {
                 // printf("isHit!\n");
                 page_ = &r_->pages[base_master];
-                ret = (void *)r_->get_cache_page_addr(base_master);
+                ret = (void *)r_->get_cache_page_addr(base_master);  //将缓存槽位号转换为实际的内存地址
 
                 start = r_->n_elems_per_page * page; // 自注释，在wait函数中执行
                 end = start + r_->n_elems_per_page;  // * (page+1);
-                // ret.page = page;
             }
             else
             {
@@ -3041,7 +3079,7 @@ struct array_d_t
         // uint32_t lane = lane_id();
         // r = find_range(i);
 
-        uint32_t lane = ctx.lane;
+        uint32_t lane = lane_id();
         r = ctx.r;
         auto r_ = d_ranges + r;
         // 可执行到
@@ -4287,6 +4325,7 @@ inline __device__ void read_data(page_cache_d_t *pc, QueuePair *qp, const uint64
     nvm_cmd_data_ptr(&cmd, prp1, prp2);
     nvm_cmd_rw_blks(&cmd, starting_lba, n_blocks);
     uint16_t sq_pos = sq_enqueue(&qp->sq, &cmd);
+    // printf("NVMe命令已提交,sq_pos:%d..\n", sq_pos);
 
     uint32_t head, head_;
     uint64_t pc_pos;
@@ -4323,11 +4362,14 @@ inline __device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp,
     ////printf("tid: %llu\tstart_lba: %llu\tn_blocks: %llu\tprp1: %p\n", (unsigned long long) (threadIdx.x+blockIdx.x*blockDim.x), (unsigned long long) starting_lba, (unsigned long long) n_blocks, (void*) prp1);
     nvm_cmd_data_ptr(&cmd, prp1, prp2);            // 设置数据缓冲区地址
     nvm_cmd_rw_blks(&cmd, starting_lba, n_blocks); // 设置读取的起始 LBA 和块数
+    // printf("NVMe命令准备提交..\n"); // 执行到
     // sq_enqueue中已实现门铃机制，已将请求提交到SSD
     uint16_t sq_pos = sq_enqueue(&qp->sq, &cmd); // 将命令放入提交队列 (Submission Queue),sq_pos：命令在 SQ 中的位置
-    printf("已将nvme提交命令存入队列");
+    // printf("NVMe命令已提交,sq_pos:%d..\n", sq_pos); 
     ctx.cid = cid;
     ctx.cmd = cmd;
+    // printf("NVMe命令已提交..\n"); // 执行到
+    
 }
 
 inline __device__ void noread_data(s_ctx &ctx)
@@ -4343,15 +4385,15 @@ inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, c
     uint64_t pc_prev_head;
     // printf("准备轮询\n");
     uint32_t cq_pos = cq_poll(&qp->cq, ctx.cid, &head, &head_); // 阻塞轮询直到完成
-    // printf("轮询完成\n");
+    // printf("轮询完成\n");  // 执行到了
     qp->cq.tail.fetch_add(1, simt::memory_order_acq_rel);
     pc_prev_head = pc->q_head->load(simt::memory_order_relaxed);
     pc_pos = pc->q_tail->fetch_add(1, simt::memory_order_acq_rel);
 
     cq_dequeue(&qp->cq, cq_pos, &qp->sq, head, head_); // 从 CQ 中取出完成项
+    // printf("cq队列弹出成功\n");// 执行到了
     // sq_dequeue(&qp->sq, sq_pos);
-
-    // enqueue_second(page_cache_d_t* pc, QueuePair* qp, const uint64_t starting_lba, nvm_cmd_t* cmd, const uint16_t cid, const uint64_t pc_pos, const uint64_t pc_prev_head)
+    // 该函数中也有cq_dequeue函数
     enqueue_second(pc, qp, starting_lba, &ctx.cmd, ctx.cid, pc_pos, pc_prev_head);
 
     put_cid(&qp->sq, ctx.cid);

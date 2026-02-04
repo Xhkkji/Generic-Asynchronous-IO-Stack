@@ -171,8 +171,54 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
     //uint32_t active_count = __popc(mask);
     //uint32_t leader = __ffs(mask) - 1;
     //uint32_t lane = lane_id();
+
+    // 队列长度1024
+    // if (lane_id() == 0) {
+    //     printf("队列长度 qs=%u, qs_minus_1=%u\n", sq->qs, sq->qs_minus_1);
+    // }
+    // 自加，输出调试信息
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    //     printf("[DEBUG] Entering sq_enqueue\n");
+    //     printf("  Queue: qs=%u, qs_minus_1=%u, qs_log2=%u\n", 
+    //            sq->qs, sq->qs_minus_1, sq->qs_log2);
+    //     printf("  Queue pointers: vaddr=%p, db=%p\n", 
+    //            sq->vaddr, sq->db);
+    //     printf("  Current state: in_ticket=%u, head=%u, tail=%u\n",
+    //            sq->in_ticket.load(simt::memory_order_relaxed),
+    //            sq->head.load(simt::memory_order_relaxed),
+    //            sq->tail.load(simt::memory_order_relaxed));
+    // }
+    // ===== 添加队列状态检查 =====
+    // uint32_t current_head = sq->head.load(simt::memory_order_relaxed);
+    // uint32_t current_tail = sq->tail.load(simt::memory_order_relaxed);
+    // uint32_t queue_size = sq->qs;
+    // uint32_t used_slots = (current_tail - current_head) & (sq->qs_minus_1);
+    // uint32_t free_slots = queue_size - used_slots;
+    
+    // // 打印队列状态（可选择性启用）
+    // if (threadIdx.x == 0) {
+    //     printf("[QUEUE_STATS] SQ状态:\n");
+    //     printf("  队列大小: %u\n", queue_size);
+    //     printf("  Head: %u, Tail: %u\n", current_head & sq->qs_minus_1, 
+    //                                      current_tail & sq->qs_minus_1);
+    //     printf("  已用槽位: %u, 空闲槽位: %u\n", used_slots, free_slots);
+    //     printf("  使用率: %.1f%%\n", (float)used_slots / queue_size * 100);
+        
+        
+    // }
+    // 检查是否接近满或已满
+    // printf("检查队列状态: 空闲槽位=%u\n", free_slots);
+    // if (free_slots <= 1) {
+    //     printf("  ⚠️ 警告: 队列即将满! 空闲槽位: %u\n", free_slots);
+    // }
+    // if (free_slots == 0) {
+    //     printf("  ❌ 错误: 队列已满!\n");
+    // }
+    // ===== 添加队列状态检查 =====
+
     uint32_t ticket;
     ticket = sq->in_ticket.fetch_add(1, simt::memory_order_relaxed);
+    // printf("sq_enqueue: got ticket %u\n", ticket);// 123循环
     /* if (lane == leader) { */
     /*     ticket = sq->in_ticket.fetch_add(active_count, simt::memory_order_acquire); */
     /* } */
@@ -183,8 +229,23 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
     uint32_t pos = ticket & (sq->qs_minus_1);
     uint64_t id = get_id(ticket, sq->qs_log2);
 
+    // 在这里添加调试信息 - 位置2（在等待循环前）
+    // 有多个NVMe队列，每个队列分别存入NVMe命令
+    // printf("pos=%u, id=%lu, ticket=%u, sq->no=%u\n", pos, id, ticket, sq->no);
+
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    //     printf("[DEBUG] Before first wait loop\n");
+    //     printf("  My ticket=%u, pos=%u, id=%lu\n", ticket, pos, id);
+    //     printf("  tickets[%u].val=%lu\n", 
+    //            pos, sq->tickets[pos].val.load(simt::memory_order_relaxed));
+    // }
+    // 在这里添加调试信息 - 位置2（在等待循环前）
+
     //uint64_t k = 0;
     unsigned int ns = 8;
+    // printf("(sq->tickets[pos].val.load(simt::memory_order_relaxed)=%lu, id=%lu)\n",
+    //        (unsigned long) sq->tickets[pos].val.load(simt::memory_order_relaxed),
+    //        (unsigned long) id);
     while ((sq->tickets[pos].val.load(simt::memory_order_relaxed) != id) ) {
         /*if (k++ % 100 == 0)   {
             printf("tid: %llu\tpos: %llu\tticket: %llu\tid: %llu\ttickets_pos: %llu\tqueue_head: %llu\tqueue_tail: %llu\n",
@@ -193,6 +254,9 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
                    (unsigned long long)(sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(simt::memory_order_acquire) & (sq->qs_minus_1)));
                    }*/
 #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+        // 忙等位置， 没有输出
+        // printf("Waiting1 at pos=%u, ticket=%u, id=%lu, tickets[%u].val=%lu\n", 
+        //        pos, ticket, id, pos, sq->tickets[pos].val.load(simt::memory_order_relaxed));
         __nanosleep(ns);
         if (ns < 256) {
             ns *= 2;
@@ -209,6 +273,9 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
                    (unsigned long long)(sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(simt::memory_order_acquire) & (sq->qs_minus_1)));
                    }*/
 #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+        // 忙等位置(没有输出)
+        // printf("Waiting2 at pos=%u, ticket=%u, id=%lu, tickets[%u].val=%lu\n", 
+        //        pos, ticket, id, pos, sq->tickets[pos].val.load(simt::memory_order_relaxed));
         __nanosleep(ns);
         if (ns < 256) {
             ns *= 2;
@@ -234,7 +301,7 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
     copy_type* cmd_ = ((copy_type*)(cmd->dword));
     //printf("+++tid: %llu\tcid: %llu\tsq_loc: %llx\tpos: %llu\n", (unsigned long long) (threadIdx.x+blockIdx.x*blockDim.x), (unsigned long long) (cmd->dword[0] >> 16), (unsigned long long) queue_loc, (unsigned long long) pos);
 
-    //printf("sq->loc: %p\n", queue_loc);
+    // printf("sq->loc: %p\n", queue_loc);  // √
     //queue_loc[0] =   *((ulonglong4*) (cmd->dword+0));
     //queue_loc[1] =   *((ulonglong4*) (cmd->dword+8));
     //queue_loc->dword[0] = cmd->dword[0];
@@ -285,12 +352,21 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
     ns = 8;
     cont = sq->tail_mark[pos].val.load(simt::memory_order_relaxed) == LOCKED;
     while(cont) {
+        // printf("大循环。。\n");
         bool new_cont = sq->tail_lock.load(simt::memory_order_relaxed) == LOCKED;
         if (!new_cont) {
             new_cont = sq->tail_lock.fetch_or(LOCKED, simt::memory_order_acquire) == LOCKED;
             if(!new_cont) {
                 uint32_t cur_tail = sq->tail.load(simt::memory_order_relaxed);
-
+                // 自加=============================================
+                // uint32_t cur_head = sq->head.load(simt::memory_order_relaxed);
+                // uint32_t used_slots = (cur_tail - cur_head) & (sq->qs_minus_1);
+                // uint32_t free_slots = 1024 - used_slots;
+                // 重要输出===========================================
+                // printf("队列编号sq->no:%u, cur_tail: %llu\n", sq->no, (unsigned long long) cur_tail);
+                // printf("cur_tail: %llu\n", (unsigned long long) cur_tail);
+                // printf("检查队列状态: 空闲槽位=%u\n", free_slots);
+                // 自加=============================================
                 uint32_t tail_move_count = move_tail(sq, cur_tail);
 
                 if (tail_move_count) {
@@ -319,12 +395,13 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
             }
 #endif
         }
-
+        // printf("不执行cont\n");  // 到此处阻塞，并非等待循环
     }
 
 
 
     sq->tickets[pos].val.fetch_add(1, simt::memory_order_acq_rel);
+    // printf("enqueue命令执行完毕..\n");// √
     return pos;
 
 }
