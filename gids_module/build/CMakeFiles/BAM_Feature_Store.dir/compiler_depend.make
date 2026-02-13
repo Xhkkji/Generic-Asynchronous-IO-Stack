@@ -599,7 +599,8 @@ CMakeFiles/BAM_Feature_Store.dir/gids_nvme.cu.o: /home/xhk/hyperion/GIDS/gids_mo
   /usr/include/c++/11/bits/gslice_array.h \
   /usr/include/c++/11/bits/mask_array.h \
   /usr/include/c++/11/bits/indirect_array.h \
-  /home/xhk/hyperion/GIDS/gids_module/gids_kernel.cu
+  /home/xhk/hyperion/GIDS/gids_module/gids_kernel.cu \
+  /home/xhk/hyperion/GIDS/gids_module/agile_host.cuh
 
 
 /usr/include/c++/11/bits/gslice.h:
@@ -1215,6 +1216,8 @@ CMakeFiles/BAM_Feature_Store.dir/gids_nvme.cu.o: /home/xhk/hyperion/GIDS/gids_mo
 /usr/include/errno.h:
 
 /usr/include/x86_64-linux-gnu/bits/types/timer_t.h:
+
+/home/xhk/hyperion/GIDS/gids_module/agile_host.cuh:
 
 /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h:
 

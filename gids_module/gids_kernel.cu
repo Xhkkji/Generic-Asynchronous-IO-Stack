@@ -66,11 +66,11 @@ __global__ void read_feature_kernel_submit_async(array_d_t<T> *dr, T *out_tensor
   int warp_id = threadIdx.x / 32;  // 由于一个block有128个线程拆成4个warp，计算当前线程所在的warp在block内的ID（0-3）
   int idx_idx = bid * num_warps + warp_id;  // 当前warp处理的全局特征索引
   int lane_id = threadIdx.x % 32;
-  // if(lane_id == 0)
-  // {
-  //   // printf("warp idx_idx:%d\n", idx_idx);
-  //   printf("submit_async launched, idx_idx=%d\n", idx_idx);
-  // }
+  if(lane_id == 0)
+  {
+    // printf("warp idx_idx:%d\n", idx_idx);
+    // printf("submit_async launched, idx_idx=%d\n", idx_idx);
+  }
   
   if (idx_idx < num_idx)
   {
@@ -126,7 +126,8 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
   // if(lane_id == 0)
   // {
   //   // printf("d_warp:%p\n", d_warp_ctxs);
-  //   printf("read_feature_kernel_wait_async launched..\n");
+  //   printf("idx_idx:%d\n", idx_idx);
+  //   // printf("read_feature_kernel_wait_async launched..\n");
   // }
   if (idx_idx < num_idx)
   {
@@ -150,6 +151,11 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
       // 若submit中储存的ctx.isHit未命中，则wait函数需要轮询获取
       if(!ctx.isHit)  
       {
+        // if(lane_id == 0)
+        // {
+        //   printf("wait not hit, idx_idx:%d\n", idx_idx);
+        // }
+        
         T temp = ptr.read_wait_async((row_index)*cache_dim + tid, ctx); 
         out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
         // ctx.isHit = true;                                    // 重要

@@ -77,6 +77,7 @@ struct BAM_Feature_Store {
   uint32_t n_ctrls = 1;
   size_t blkSize = 128;
   size_t queueDepth = 1024;
+  // size_t queueDepth = 4096;
   size_t numQueues = 128;
   uint32_t pageSize = 4096 ;
   uint64_t numElems = 300LL*1000*1000*1024;

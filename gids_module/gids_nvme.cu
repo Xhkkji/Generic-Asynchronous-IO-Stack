@@ -15,6 +15,7 @@
 #include <bam_nvme.h>
 #include <pybind11/stl.h>
 #include "gids_kernel.cu"
+#include "agile_host.cuh"
 // #include <bafs_ptr.h>
 
 typedef std::chrono::high_resolution_clock Clock;
@@ -22,10 +23,11 @@ typedef std::chrono::high_resolution_clock Clock;
 void GIDS_Controllers::init_GIDS_controllers(uint32_t num_ctrls, uint64_t q_depth, uint64_t num_q,
                                              const std::vector<int> &ssd_list)
 {
-
   n_ctrls = num_ctrls;
   queueDepth = q_depth;
   numQueues = num_q;
+  printf("queueDepth: %llu, num_q: %llu\n", (unsigned long long)queueDepth, (unsigned long long)numQueues);
+  
 
   for (size_t i = 0; i < n_ctrls; i++)
   {
@@ -292,11 +294,11 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
 
     uint64_t b_size = blkSize;
     uint64_t n_warp = b_size / 32;
-    // uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
-    uint64_t g_size = 128;  // 34,560(10000可运行)
+    uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
+    // uint64_t g_size = 128;  // 34,560(10000可运行)
 
     // g_size:43337, b_size:128
-    // printf("g_size:%d, b_size:%d\n", g_size, b_size);
+    printf("g_size:%d, b_size:%d\n", g_size, b_size);
     // b_size为每个block中的线程数，假设为128，则warp数量为128/32个，一个warp处理一个特征数据(1024维)
 
 

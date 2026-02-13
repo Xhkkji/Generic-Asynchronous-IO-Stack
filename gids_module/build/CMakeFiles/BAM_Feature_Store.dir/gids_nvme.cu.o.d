@@ -596,4 +596,5 @@ CMakeFiles/BAM_Feature_Store.dir/gids_nvme.cu.o : /home/xhk/hyperion/GIDS/gids_m
     /usr/include/c++/11/bits/gslice_array.h \
     /usr/include/c++/11/bits/mask_array.h \
     /usr/include/c++/11/bits/indirect_array.h \
-    /home/xhk/hyperion/GIDS/gids_module/gids_kernel.cu
+    /home/xhk/hyperion/GIDS/gids_module/gids_kernel.cu \
+    /home/xhk/hyperion/GIDS/gids_module/agile_host.cuh

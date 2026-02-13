@@ -2126,7 +2126,7 @@ __forceinline__
             ctx.member_acquire_b_page = b_page;
             ctx.member_acquire_c = c;
             ctx.member_acquire_cAddq = (c->d_qps) + queue;
-            
+
             // 3. ⭐ 返回page_trans（不是直接return 0或死循环！）
             return page_trans;  // ⭐ 关键：返回有效的page_trans
             break;
@@ -2262,20 +2262,20 @@ __forceinline__
             break;
             // valid
         case V_NB:
-            // printf("wait:V_NB\n");
+            printf("wait:V_NB\n");
 
-            // if (write && ((read_state & DIRTY) == 0))
-            //     pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
-            // // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
-            // page_trans = pages[index].offset;
-            // // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
-            // //     __nanosleep(100);
-            // // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+            if (write && ((read_state & DIRTY) == 0))
+                pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+            // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
+            uint32_t page_trans = pages[index].offset;
+            // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
+            //     __nanosleep(100);
             // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
-            // return page_trans;
+            hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+            return page_trans;
 
-            // // pages[index].fetch_sub(1, simt::memory_order_release);
-            // fail = false;
+            // pages[index].fetch_sub(1, simt::memory_order_release);
+            fail = false;
 
             break;
         case NV_B:
@@ -2774,6 +2774,10 @@ struct array_d_t
         uint32_t active_cnt = __popc(mask); // 活动线程总数
         // eq_mask = ctx.eq_mask;  // 自注释
         // master = __ffs(eq_mask) - 1; // Find First Set，找到掩码中最低位的 1 的位置
+
+        eq_mask = __match_any_sync(mask, gaddr);           // __match_any_sync:找到 warp 中具有相同 value 的线程
+        eq_mask &= __match_any_sync(mask, (uint64_t)this); // 访问相同 SSD 地址的线程,且是同一个对象
+        master = __ffs(eq_mask) - 1;                       // Find First Set，找到掩码中最低位的 1 的位置
 
         uint32_t dirty = __any_sync(eq_mask, write);
 

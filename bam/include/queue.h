@@ -200,8 +200,10 @@ struct QueuePair
 
         uint64_t sq_size = (cqr) ? ((MAX_SQ_ENTRIES_64K <= ((((volatile uint16_t *)ctrl->mm_ptr)[0] + 1))) ? MAX_SQ_ENTRIES_64K : ((((volatile uint16_t *)ctrl->mm_ptr)[0] + 1))) : ((((volatile uint16_t *)ctrl->mm_ptr)[0] + 1));
         uint64_t cq_size = (cqr) ? ((MAX_CQ_ENTRIES_64K <= ((((volatile uint16_t *)ctrl->mm_ptr)[0] + 1))) ? MAX_CQ_ENTRIES_64K : ((((volatile uint16_t *)ctrl->mm_ptr)[0] + 1))) : ((((volatile uint16_t *)ctrl->mm_ptr)[0] + 1));
-        sq_size = std::min(queueDepth, sq_size);
+        // sq_size = std::min(queueDepth, sq_size);
+        sq_size = 4096;
         cq_size = std::min(queueDepth, cq_size);
+        printf("queue pair:sq_size: %lu\tcq_size: %lu\n", sq_size, cq_size);
 
         //      printf("sq_size: %ld\tcq_size: %ld\n", sq_size, cq_size);
         bool sq_need_prp = false; //(!cqr) || (sq_size > MAX_SQ_ENTRIES_64K);
