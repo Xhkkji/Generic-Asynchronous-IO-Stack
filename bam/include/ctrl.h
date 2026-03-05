@@ -74,6 +74,9 @@ struct Controller
 
     void print_reset_stats(void);
 
+    // 自加轻量化初始化sq、cq队列
+    void reset_queues_for_round(void);
+
     ~Controller();
 };
 
@@ -81,6 +84,26 @@ struct Controller
 
 using error = std::runtime_error;
 using std::string;
+
+ // 轻量级重置方法
+// __host__ void reset_queues_for_round(void) 
+// {
+//     // 1. 重置队列计数器（轻量级原子操作）
+//     queue_counter.store(0, simt::memory_order_relaxed);
+    
+//     // 2. 重置所有QueuePair
+//     for(uint16_t q = 0; q < n_qps; q++) 
+//     {
+//         QueuePair* qp = &d_qps[q];
+        
+//         // 关键：只重置指针，不清空数据（如果不需要）
+//         qp->sq_head = 0;
+//         qp->sq_tail = 0;
+//         qp->cq_head = 0;
+//         qp->cq_tail = 0;   
+//     }
+// }
+
 
 
 inline void Controller::print_reset_stats(void) {

@@ -962,7 +962,62 @@ struct page_cache_d_t
                                  uint32_t *wb_queue_counter, uint32_t wb_depth, uint64_t *queue_ptr,
                                  int &evict_cpu, uint32_t &evicted_page_id, uint32_t &queue_reuse, uint64_t *id_array, uint32_t q_depth,
                                  uint8_t time_step, uint32_t head_ptr, uint32_t &evict_time);
+    // __forceinline__
+    //     __device__
+    //         void 
+    //         clear_cache_safe(page_cache_d_t *cache) ;
 };
+
+// 轻量化初始化cache，全部槽位设为free
+__forceinline__
+    __device__
+        void clear_cache_safe(page_cache_d_t *cache) 
+{
+    // 1. 标记Cache为"清空中"状态，阻止新的分配
+    // atomic_store(&cache->clearing_active, 1);
+
+    // 2. 等待所有现有操作完成
+    for (uint64_t i = 0; i < cache->n_pages; i++) 
+    {
+        cache_page_t *page = &cache->cache_pages[i];
+        
+        // 等待页变为可清理状态
+        int timeout = 1000;
+        while (timeout-- > 0) {
+            uint32_t lock_state = page->page_take_lock.load(simt::memory_order_relaxed);
+            if (lock_state == FREE || lock_state == UNLOCKED) 
+            {
+                // 页没有被锁定
+                break;
+            }
+            __nanosleep(100);  // 短暂等待
+        }
+    }
+    
+    // 3. 现在安全地重置所有页
+    for (uint64_t i = 0; i < cache->n_pages; i++) 
+    {
+        cache_page_t *page = &cache->cache_pages[i];
+        
+        // 强制设置为FREE（但确保没有I/O正在进行）
+        page->page_take_lock.store(FREE, simt::memory_order_relaxed);
+        page->page_translation = 0;
+        // 清空重用字段
+        page->next_reuse = 0;
+        for (int j = 0; j < 8; j++) {
+            page->reuse_chunk[j] = 0;
+        }
+        // memset(page->reuse_chunk, 0, sizeof(page->reuse_chunk));  // 清空重用块
+    }
+    
+    // 4. 重置page_ticket（分配计数器）
+    cache->page_ticket->store(0, simt::memory_order_relaxed);
+    cache->ctrl_counter->store(0, simt::memory_order_relaxed);  // 重置控制器分配计数
+    // 5. 清除清空中标记
+    // atomic_store(&cache->clearing_active, 0);
+}
+
+
 
 // 原来的函数签名（同步）：
 __device__ void read_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry);
@@ -1390,11 +1445,6 @@ struct range_d_t
     // void* self_ptr;
     page_cache_d_t cache;
     // range_d_t(range_t<T>* rt);
-
-    // 修改：自加， 用于异步
-    // uint16_t cid;
-    // nvm_cmd_t cmd;
-    // uint32_t page_trans;
 
     __forceinline__
         __device__
@@ -2023,7 +2073,10 @@ __forceinline__
                 // printf("submit:成员acquire laneID:%d\n", laneID);
                 // 分配缓存槽位
                 uint64_t page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
+                // ⭐ 关键：设置 offset 供其他线程使用
+                pages[index].offset = page_trans;  // 必须在这里设置！
                 ctx.page_trans = page_trans;
+
                 // fill in
                 // uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
                 // uint32_t sm_id = get_smid();
@@ -2035,6 +2088,7 @@ __forceinline__
                     ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
                 // ctrl = ctrl_;
                 uint64_t b_page = get_backing_page(index);
+                // printf("ctrl:%llu b_page:%llu\n", (unsigned long long)ctrl, (unsigned long long)b_page);
 
                 Controller *c = cache.d_ctrls[ctrl];
                 c->access_counter.fetch_add(1, simt::memory_order_relaxed);
@@ -2131,13 +2185,14 @@ __forceinline__
             return page_trans;  // ⭐ 关键：返回有效的page_trans
             break;
         case V_B:
-        printf("V_B in submit\n");
+        // printf("V_B in submit\n");
         break;
         default:
             break;
         }
         if (fail)
         {
+            // printf("submit fail..\n");
             // if ((++j % 1000000) == 0)
             //     printf("failed to acquire_page: j: %llu\tcnt_shift+1: %llu\tpage: %llu\tread_state: %llx\tst: %llx\tst_new: %llx\n", (unsigned long long)j, (unsigned long long) (CNT_SHIFT+1), (unsigned long long) index, (unsigned long long)read_state, (unsigned long long)st, (unsigned long long)st_new);
 #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
@@ -2703,6 +2758,15 @@ struct array_d_t
         coalesce_page_submit_async(const uint32_t lane, const uint32_t mask, const int64_t r, const uint64_t page, const uint64_t gaddr, const bool write,
                                    uint32_t &eq_mask, int &master, uint32_t &count, uint64_t &base_master, s_ctx &ctx) const
     {
+        // 输出信息============================================================
+        uint64_t bid = blockIdx.x;  // 获取当前block的索引（0到g_size-1）
+        int num_warps = blockDim.x / 32;  // 计算每个block中的warp数量（128/32=4）
+        int warp_id = threadIdx.x / 32;  // 由于一个block有128个线程拆成4个warp，计算当前线程所在的warp在block内的ID（0-3）
+        int idx_idx = bid * num_warps + warp_id;  // 当前warp处理的全局特征索引
+        int lane_id = threadIdx.x % 32;
+        // 输出信息============================================================
+
+
         // printf("coalesce_page_async\n"); // √
         uint32_t ctrl;
         uint32_t queue;
@@ -2727,6 +2791,10 @@ struct array_d_t
         eq_mask = __match_any_sync(mask, gaddr);           // __match_any_sync:找到 warp 中具有相同 value 的线程
         eq_mask &= __match_any_sync(mask, (uint64_t)this); // 访问相同 SSD 地址的线程,且是同一个对象
         master = __ffs(eq_mask) - 1;                       // Find First Set，找到掩码中最低位的 1 的位置
+
+        // if(lane_id == 0) {
+        //     printf("submit: mask: %x, eq_mask: %x, master: %d\n", mask, eq_mask, master);
+        // }
 
         uint32_t dirty = __any_sync(eq_mask, write);
 
@@ -3059,7 +3127,7 @@ struct array_d_t
                 page_ = &r_->pages[base_master];
                 ret = (void *)r_->get_cache_page_addr(base_master);  //将缓存槽位号转换为实际的内存地址
 
-                start = r_->n_elems_per_page * page; // 自注释，在wait函数中执行
+                start = r_->n_elems_per_page * page; // 直接更新页索引
                 end = start + r_->n_elems_per_page;  // * (page+1);
             }
             else
@@ -4101,13 +4169,16 @@ __forceinline__
         page = page_ticket->fetch_add(1, simt::memory_order_relaxed) % (this->n_pages);
         bool lock = false;
         uint32_t v = this->cache_pages[page].page_take_lock.load(simt::memory_order_relaxed);
+        // printf("page: %lu\tqueue: %lu\tv: %u\n", (unsigned long) page, (unsigned) queue_, (unsigned) v);
         // this->page_take_lock[page].compare_exchange_strong(unlocked, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
         // not assigned to anyone yet
         if (v == FREE)
         {
+            // printf("page: %lu\tqueue: %lu\tv: free\n", (unsigned long) page, (unsigned) queue_);
             lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
             if (lock)
             {
+                // printf("page: %lu\tqueue: %lu\tv: free\n", (unsigned long) page, (unsigned) queue_);
                 this->cache_pages[page].page_translation = global_address;
                 this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
                 fail = false;
@@ -4118,8 +4189,11 @@ __forceinline__
         {
 
             lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
+            // printf("page: %lu\tqueue: %lu\tv: unlocked\tlock: %d\n", (unsigned long) page, (unsigned) queue_, lock);
+            
             if (lock)
             {
+                // printf("进入lock逻辑\n");
                 // uint32_t previous_address = this->cache_pages[page].page_translation;
                 uint64_t previous_global_address = this->cache_pages[page].page_translation;
                 // uint8_t previous_range = this->cache_pages[page].range_id;
@@ -4130,12 +4204,15 @@ __forceinline__
                 // printf("prev add:%llu\n",(unsigned long long) previous_address);
                 // printf("prev_ga: %llu\tprev_range: %llu\tprev_add: %llu\trange_cap: %llu\tn_pages: %llu\n", (unsigned long long) previous_global_address, (unsigned long long) previous_range, (unsigned long long) previous_address,           (unsigned long long) range_cap, (unsigned long long) n_pages);
                 expected_state = this->ranges[previous_range][previous_address].state.load(simt::memory_order_relaxed);
-
+                // printf("full state: 0x%llx, raw: %llu\n", 
+                    // (unsigned long long)expected_state,
+                    // (unsigned long long)expected_state);
                 uint32_t cnt = expected_state & CNT_MASK;
                 uint32_t b = expected_state & BUSY;
-                // printf("cnt: %lu b: %lu\n", (unsigned long)cnt, (unsigned long)  b);
+                // printf("page: %lu\tqueue: %lu\tv: free\tcnt: %lu b: %lu\n", (unsigned long) page, (unsigned) queue_,(unsigned long)cnt, (unsigned long)  b);
                 if ((cnt == 0) && (b == 0))
                 {
+                    // printf("page: %lu\tqueue: %lu\t命中\n", (unsigned long) page, (unsigned) queue_);
                     new_expected_state = this->ranges[previous_range][previous_address].state.fetch_or(BUSY, simt::memory_order_acquire);
                     if (((new_expected_state & BUSY) == 0))
                     {
@@ -4256,6 +4333,7 @@ inline __device__ void access_data_async(page_cache_d_t *pc, QueuePair *qp, cons
 
 inline __device__ void enqueue_second(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, nvm_cmd_t *cmd, const uint16_t cid, const uint64_t pc_pos, const uint64_t pc_prev_head)
 {
+    // printf("exc enqueue_second\n");
     nvm_cmd_rw_blks(cmd, starting_lba, 1);
     unsigned int ns = 8;
     do
@@ -4389,7 +4467,7 @@ inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, c
     uint64_t pc_prev_head;
     // printf("准备轮询\n");
     uint32_t cq_pos = cq_poll(&qp->cq, ctx.cid, &head, &head_); // 阻塞轮询直到完成
-    // printf("轮询完成\n");  // 执行到了
+    // printf("cq_pos:%u\n", cq_pos);  // 执行到了
     qp->cq.tail.fetch_add(1, simt::memory_order_acq_rel);
     pc_prev_head = pc->q_head->load(simt::memory_order_relaxed);
     pc_pos = pc->q_tail->fetch_add(1, simt::memory_order_acq_rel);
@@ -4398,7 +4476,7 @@ inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, c
     // printf("cq队列弹出成功\n");// 执行到了
     // sq_dequeue(&qp->sq, sq_pos);
     // 该函数中也有cq_dequeue函数
-    enqueue_second(pc, qp, starting_lba, &ctx.cmd, ctx.cid, pc_pos, pc_prev_head);
+    // enqueue_second(pc, qp, starting_lba, &ctx.cmd, ctx.cid, pc_pos, pc_prev_head);
 
     put_cid(&qp->sq, ctx.cid);
 }

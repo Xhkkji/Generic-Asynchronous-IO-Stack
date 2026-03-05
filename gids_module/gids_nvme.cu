@@ -27,7 +27,6 @@ void GIDS_Controllers::init_GIDS_controllers(uint32_t num_ctrls, uint64_t q_dept
   queueDepth = q_depth;
   numQueues = num_q;
   printf("queueDepth: %llu, num_q: %llu\n", (unsigned long long)queueDepth, (unsigned long long)numQueues);
-  
 
   for (size_t i = 0; i < n_ctrls; i++)
   {
@@ -145,7 +144,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
-
+  // printf("read_feature..\n");
   TYPE *tensor_ptr = (TYPE *)i_ptr;
   int64_t *index_ptr = (int64_t *)i_index_ptr;
 
@@ -157,8 +156,42 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
   auto t1 = Clock::now();
   if (cpu_buffer_flag == false)
   {
-    read_feature_kernel<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-                                                  index_ptr, dim, num_index, cache_dim, key_off);
+    // read_feature_kernel<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+    //                                               index_ptr, dim, num_index, cache_dim, key_off);
+
+    cudaStream_t streams;
+    cudaStreamCreate(&streams);
+
+    s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
+
+    // 计算总warp数
+    uint64_t warps_per_block = b_size / 32;
+    uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
+
+    // 分配设备内存
+    cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
+    cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
+    // ========== 第1步：重置SQ/CQ队列（添加在这里！）==========
+    // 在submit之前重置队列，确保这一轮从干净状态开始
+    // reset_queues_for_round<<<1, 1, 0, streams[i]>>>(h_pc, i);  // 使用当前stream
+    // cudaStreamSynchronize(streams[i]);  // 确保重置完成
+
+    read_feature_kernel_submit_async<TYPE><<<g_size, b_size, 0, streams>>>(a->d_array_ptr, tensor_ptr,
+                                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+    cudaStreamSynchronize(streams); // 此处被阻塞
+    // 调试输出
+    // printf("Submit finished for iteration\n");
+    read_feature_kernel_wait_async<TYPE><<<g_size, b_size, 0, streams>>>(a->d_array_ptr, tensor_ptr,
+                                                                         index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+    cudaStreamSynchronize(streams);
+    cuda_err_chk(cudaDeviceSynchronize());
+
+    clear_cache_kernel<TYPE><<<1, 1, 1, streams>>>(h_pc->d_pc_ptr);
+    cudaStreamSynchronize(streams);
+
+    if (d_warp_ctxs != nullptr)
+      cudaFree(d_warp_ctxs);
+    cudaStreamDestroy(streams);
   }
   else
   {
@@ -186,7 +219,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_hetero(int num_iter, const std::vector<uint64_t> &i_ptr_list, const std::vector<uint64_t> &i_index_ptr_list,
                                                   const std::vector<uint64_t> &num_index, int dim, int cache_dim, const std::vector<uint64_t> &key_off)
 {
-
+  // printf("read_feature..\n");
   cudaStream_t streams[num_iter];
   for (int i = 0; i < num_iter; i++)
   {
@@ -277,7 +310,7 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
 
   // 在循环外部创建事件
   // cudaEvent_t events[num_iter];
-  // for (int i = 0; i < num_iter; i++) 
+  // for (int i = 0; i < num_iter; i++)
   // {
   //     cudaEventCreate(&events[i]);
   // }
@@ -301,41 +334,44 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     printf("g_size:%d, b_size:%d\n", g_size, b_size);
     // b_size为每个block中的线程数，假设为128，则warp数量为128/32个，一个warp处理一个特征数据(1024维)
 
-
     if (cpu_buffer_flag == false)
     {
-      s_ctx* d_warp_ctxs;  // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
+      s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
 
       // 计算总warp数
       uint64_t warps_per_block = b_size / 32;
-      uint64_t total_warps = g_size * warps_per_block;  // 43337 * 4 = 173348
+      uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
 
       // 分配设备内存
       cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
       cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
 
+      // ========== 第1步：重置SQ/CQ队列（添加在这里！）==========
+      // 在submit之前重置队列，确保这一轮从干净状态开始
+      // reset_queues_for_round<<<1, 1, 0, streams[i]>>>(h_pc, i);  // 使用当前stream
+      // cudaStreamSynchronize(streams[i]);  // 确保重置完成
+
       // read_feature_kernel<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
       //                                                              index_ptr, dim, num_index[i], cache_dim, 0);
       read_feature_kernel_submit_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
-                                                                   index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
+                                                                                index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
 
-
-      // printf("read_feature_submit_async before launched..\n"); 
+      // printf("read_feature_submit_async before launched..\n");
       cudaStreamSynchronize(streams[i]); // 此处被阻塞
       // 调试输出
       printf("Submit finished for iteration %lu\n", i);
-      
+
       read_feature_kernel_wait_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
-                                                                   index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
-        
-      cudaStreamSynchronize(streams[i]); 
+                                                                              index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
+
+      cudaStreamSynchronize(streams[i]);
       cuda_err_chk(cudaDeviceSynchronize());
 
-      if(d_warp_ctxs!=nullptr)  cudaFree(d_warp_ctxs); 
+      if (d_warp_ctxs != nullptr)
+        cudaFree(d_warp_ctxs);
       cudaStreamDestroy(streams[i]);
       // cudaStreamDestroy(streams1[i]);
-      // cudaStreamDestroy(streams2[i]); 
-                                                   
+      // cudaStreamDestroy(streams2[i]);
     }
     else
     {

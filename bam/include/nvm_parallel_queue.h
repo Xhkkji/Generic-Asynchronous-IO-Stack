@@ -711,7 +711,7 @@ void sq_dequeue(nvm_queue_t* sq, uint16_t pos) {
 }
 
 inline __device__
-uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, uint32_t* cq_head = NULL) {
+uint32_t cq_poll_async(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, uint32_t* cq_head = NULL) {
     uint64_t j = 0;
     unsigned int ns = 8;
     //uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -772,7 +772,87 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
 }
 
 inline __device__
-void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 0, uint32_t cur_head_ = 0) {
+uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, uint32_t* cq_head = NULL) {
+    uint64_t j = 0;
+    unsigned int ns = 8;
+    //uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    //printf("---tid: %llu\tcid: %llu\tcq_start: %llx\n", (unsigned long long) (threadIdx.x+blockIdx.x*blockDim.x), (unsigned long long) (search_cid), (uint64_t) cq->vaddr);
+    while (true) {
+        uint32_t head = cq->head.load(simt::memory_order_relaxed);
+        // printf("cq_poll: head=%u\n", head);
+        for (size_t i = 0; i < cq->qs_minus_1; i++) {
+            uint32_t cur_head = head + i;
+            // printf("cq_poll: head=%u, i=%u, cur_head=%u\n", head, i, cur_head);
+            // printf("cq->qs_minus_1: %u\n", cq->qs_minus_1);  // 4095
+            // printf("cq->qs_log2: %u\n", cq->qs_log2);  // 12
+            bool search_phase = ((~(cur_head >> cq->qs_log2)) & 0x01);
+            // printf("cq_poll: head=%u, i=%u, cur_head=%u, search_phase=%u\n", head, i, cur_head, search_phase);
+            uint32_t loc = cur_head & (cq->qs_minus_1);
+            uint32_t cpl_entry = ((nvm_cpl_t*)cq->vaddr)[loc].dword[3];
+            uint32_t cid = (cpl_entry & 0x0000ffff);
+            bool phase = (cpl_entry & 0x00010000) >> 16;
+//             if (j % 10000000 == 0)
+
+/*                 printf("qs_log2: %llu\thead: %llu\tcur_head: %llu\tsearch_cid: %llu\tsearch_phase: %llu\tcq->loc: %p\tcq->qs: %llu\ti: %llu\tj: %llu\tcid: %llu\tphase:%llu\tmark: %llu\n",
+                        (unsigned long long) cq->qs_log2,
+                        (unsigned long long)head, (unsigned long long) cur_head, (unsigned long long) search_cid, (unsigned long long) search_phase, ((volatile nvm_cpl_t*)cq->vaddr)+loc,
+                        (unsigned long long) cq->qs, (unsigned long long) i, (unsigned long long) j, (unsigned long long) cid, (unsigned long long) phase,
+                        (unsigned long long) cq->head_mark[loc].val.load(simt::memory_order_acquire));
+*/
+//            if ((cid == search_cid) && (phase == search_phase) && (cq->head_mark[loc].load(simt::memory_order_acquire) == UNLOCKED)){
+            if ((cid == search_cid) && (phase == search_phase)){
+                // printf("cq_poll命中, cq_poll: head=%u, i=%u, cur_head=%u\n", head, i, cur_head);
+                 //if ((cpl_entry >> 17) != 0)
+                 //     printf("NVM Error: %llx\tcid: %llu\n", (unsigned long long) (cpl_entry >> 17), (unsigned long long) search_cid);
+                
+                 // 自加======================================================================
+                 // 1. 先标记head_mark，防止重复处理
+                // cq->head_mark[loc].val.store(LOCKED, simt::memory_order_release);
+
+                //  // 2. ⚠️⚠️⚠️ 核心修复：更新head！⚠️⚠️⚠️
+                // uint32_t new_head = cur_head + 1;  // head = 已处理位置 + 1
+                // cq->head.store(new_head, simt::memory_order_release);
+
+                // // 3. 写CQ门铃，通知硬件槽位已释放
+                // uint32_t new_db = new_head & (cq->qs_minus_1);
+                // asm volatile ("st.mmio.relaxed.sys.global.u32 [%0], %1;" 
+                //               :: "l"(cq->db), "r"(new_db) : "memory");
+                // 以上为自加==================================================================
+                 *cq_head = head;
+                *loc_ = cur_head;
+                return loc;
+            }
+            if (phase != search_phase)
+            {
+                // printf("break\n");
+                break;
+            }
+            //__nanosleep(1000);
+        }
+        j++;
+#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+         __nanosleep(ns);
+         if (ns < 256) {
+             ns *= 2;
+         }
+#endif
+    }
+}
+
+inline __device__
+void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 0, uint32_t cur_head_ = 0) { 
+    // 自加=============================================
+    // uint32_t cur_tail = sq->tail.load(simt::memory_order_relaxed);
+    // uint32_t cur_head = sq->head.load(simt::memory_order_relaxed);
+    // // uint32_t used_slots = (cur_tail - cur_head) & (sq->qs_minus_1);
+    // // uint32_t free_slots = 1024 - used_slots;
+    // // 重要输出===========================================
+    // printf("cq_dequeue:队列编号sq->no:%u, cur_head: %llu, cur_tail: %llu\n", sq->no, (unsigned long long) cur_head, (unsigned long long) cur_tail);
+    uint32_t cq_head = cq->head.load(simt::memory_order_relaxed);
+    uint32_t cq_tail = cq->tail.load(simt::memory_order_relaxed);
+    // printf("CQ: no=%u head=%u tail=%u\n", cq->no, cq_head, cq_tail);
+    // 自加=============================================
+    
     cq->tail.fetch_add(1, simt::memory_order_acq_rel);
 
     unsigned int ns = 8;
