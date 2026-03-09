@@ -156,42 +156,44 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
   auto t1 = Clock::now();
   if (cpu_buffer_flag == false)
   {
-    // read_feature_kernel<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-    //                                               index_ptr, dim, num_index, cache_dim, key_off);
+    read_feature_kernel<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                  index_ptr, dim, num_index, cache_dim, key_off);
 
-    cudaStream_t streams;
-    cudaStreamCreate(&streams);
-
+    // cudaStream_t streams;
+    // cudaStreamCreate(&streams);
     s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
 
     // 计算总warp数
     uint64_t warps_per_block = b_size / 32;
     uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
-
+    printf("total warps: %llu\n", (unsigned long long)total_warps);
     // 分配设备内存
     cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
     cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
-    // ========== 第1步：重置SQ/CQ队列（添加在这里！）==========
-    // 在submit之前重置队列，确保这一轮从干净状态开始
-    // reset_queues_for_round<<<1, 1, 0, streams[i]>>>(h_pc, i);  // 使用当前stream
-    // cudaStreamSynchronize(streams[i]);  // 确保重置完成
 
-    read_feature_kernel_submit_async<TYPE><<<g_size, b_size, 0, streams>>>(a->d_array_ptr, tensor_ptr,
+    read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
                                                                            index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
-    cudaStreamSynchronize(streams); // 此处被阻塞
-    // 调试输出
-    // printf("Submit finished for iteration\n");
-    read_feature_kernel_wait_async<TYPE><<<g_size, b_size, 0, streams>>>(a->d_array_ptr, tensor_ptr,
+    // 等待submit完成
+    cudaDeviceSynchronize();
+    // cudaStreamSynchronize(streams); 
+    // s_ctx *h_warp_ctxs = new s_ctx[total_warps];
+    // cudaMemcpy(h_warp_ctxs, d_warp_ctxs, total_warps * sizeof(s_ctx), cudaMemcpyDeviceToHost);
+    // for(int i=0;i<10;i++)
+    // {
+    //   printf("idx_idx:%d, row_index:%llu, page_trans:%llu, isHit:%d\n", h_warp_ctxs[i].idx_idx, (unsigned long long)h_warp_ctxs[i].row_index, (unsigned long long)h_warp_ctxs[i].page_trans, h_warp_ctxs[i].isHit);
+    // }
+    // delete[] h_warp_ctxs;
+    read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
                                                                          index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
-    cudaStreamSynchronize(streams);
+    // cudaStreamSynchronize(streams);
     cuda_err_chk(cudaDeviceSynchronize());
 
-    clear_cache_kernel<TYPE><<<1, 1, 1, streams>>>(h_pc->d_pc_ptr);
-    cudaStreamSynchronize(streams);
+    clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
+    // cudaStreamSynchronize(streams);
 
     if (d_warp_ctxs != nullptr)
       cudaFree(d_warp_ctxs);
-    cudaStreamDestroy(streams);
+    // cudaStreamDestroy(streams);
   }
   else
   {
