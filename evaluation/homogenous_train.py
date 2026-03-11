@@ -230,7 +230,7 @@ def track_acc_GIDS(g, args, device, label_array=None):
                 train_time = 0
                 e2e_time = 0
             
-            if step >= 0: 
+            if step >= 20: 
                 break
             #     Just testing 100 iterations remove the next line if you do not want to halt
             #     return None

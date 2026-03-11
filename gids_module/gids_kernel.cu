@@ -147,29 +147,22 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
     uint64_t row_index = ctx.row_index;  // 重要，确保submit和wait使用同一个row_index
     uint64_t tid = threadIdx.x % 32;
 
-    for (; tid < dim; tid += 32)
+    // `ctx.isHit` flips to true after the first successful wait. If we gate each
+    // loop iteration on the shared ctx flag, the rest of the feature row stays zero.
+    if (!ctx.isHit)
     {
-      // T temp = ptr[(row_index) * cache_dim + tid];
-      const size_t idx = (row_index)*cache_dim + tid;
-      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
-      // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
-      
-      // printf("read_feature_kernel_wait idx:%llu\n", (unsigned long long)idx);
-  
-      // 若submit中储存的ctx.isHit未命中，则wait函数需要轮询获取
-      if(!ctx.isHit)  
+      for (; tid < dim; tid += 32)
       {
-        // if(lane_id == 0)
-        // {
-        //   printf("wait not hit, idx_idx:%d\n", idx_idx);
-        // }
+        // T temp = ptr[(row_index) * cache_dim + tid];
+        const size_t idx = (row_index)*cache_dim + tid;
+        // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
+        // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
         
+        // printf("read_feature_kernel_wait idx:%llu\n", (unsigned long long)idx);
+    
         T temp = ptr.read_wait_async((row_index)*cache_dim + tid, ctx); 
         out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
-        // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = T(0);
-        // ctx.isHit = true;                                    // 重要
-      }                            
-      
+      }
     }
   }
 }

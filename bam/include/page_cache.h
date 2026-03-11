@@ -565,7 +565,7 @@ struct bam_ptr
             // update_page_wait_async(i);
         }
         int lane_id = threadIdx.x % 32;
-        if(lane_id == 0)
+        if (lane_id == 0 && blockIdx.x == 0 && (threadIdx.x / 32) < 2)
             printf("normal: i:%zu, addr:%p\n", i, (void *)addr);
         return addr[i - start];
     }
@@ -584,7 +584,7 @@ struct bam_ptr
             // printf("after update_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
         }
         int lane_id = threadIdx.x % 32;
-        if(lane_id == 0)
+        if (lane_id == 0 && ctx.idx_idx >= 0 && ctx.idx_idx < 8)
             printf("submit: i:%zu, idx_idx:%d, addr:%p\n", i, ctx.idx_idx, (void *)addr);
         if (ctx.isHit)
         {
@@ -606,7 +606,7 @@ struct bam_ptr
         update_page_wait_async(i, ctx); // no page->state.fetch_or  √
                                    // 该函数被执行，说明缓存没有命中
         int lane_id = threadIdx.x % 32;
-        if(lane_id == 0)
+        if (lane_id == 0 && ctx.idx_idx >= 0 && ctx.idx_idx < 8)
             printf("wait: i:%zu, idx_idx:%d, addr:%p\n", i, ctx.idx_idx, (void *)addr);
         return addr[i - start];    // 不是这里的问题
     }
@@ -2034,7 +2034,7 @@ __forceinline__
     return 0;
 }
 
-#define ASYNC_IN_PROGRESS 0xFFFFFFFFFFFFFFFFULL
+#define ASYNC_PAGE_TRANS_PENDING 0xFFFFFFFFU
 
 template <typename T>
 __forceinline__
@@ -2083,13 +2083,18 @@ __forceinline__
             st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire); // 状态设置为busy
             if ((st_new & BUSY) == 0)
             {
+                // Prevent other warps from consuming a stale slot id while this miss is being assigned.
+                pages[index].offset = ASYNC_PAGE_TRANS_PENDING;
+                __threadfence();
+
                 // uint32_t laneID = lane_id();
                 // printf("submit:成员acquire laneID:%d\n", laneID);
                 // 分配缓存槽位
-                uint64_t page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
+                uint32_t page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
                 // ⭐ 关键：设置 offset 供其他线程使用
-                pages[index].offset = page_trans;  // 必须在这里设置！
                 ctx.page_trans = page_trans;
+                pages[index].offset = page_trans;
+                __threadfence();
 
                 // fill in
                 // uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2154,7 +2159,8 @@ __forceinline__
             if (write && ((read_state & DIRTY) == 0))
                 pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
             // uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
-            uint64_t page_trans = pages[index].offset;
+            uint32_t page_trans = pages[index].offset;
+            ctx.page_trans = page_trans;
             // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
             //     __nanosleep(100);
             // hit_cnt.fetch_add(count, simt::memory_order_relaxed);
@@ -2167,20 +2173,18 @@ __forceinline__
             break;
         case NV_B:
             // printf("NV_B in submit\n");  // 问题在这里！一直在NV_B！
-                // 1. 获取其他线程已经设置的page_trans
             ctx.isHit = false; // 已经有线程提交IO指令，只需等待，wait内无需再次提交
-            page_trans = pages[index].offset;
-            
-            if (page_trans == 0) {
-                // 异常：有BUSY但没有offset，可能刚设置BUSY
-                // 短暂等待后重试
-                // printf("NV_B in submit等待重试\n"); 
-                __nanosleep(128);
-                page_trans = pages[index].offset;
+            {
+                const uint64_t expected_global_address = get_global_address(index);
+                uint32_t page_trans = pages[index].offset;
+                while (page_trans == ASYNC_PAGE_TRANS_PENDING ||
+                       cache.cache_pages[page_trans].page_translation != expected_global_address)
+                {
+                    __nanosleep(128);
+                    page_trans = pages[index].offset;
+                }
+                ctx.page_trans = page_trans;
             }
-            
-            // 2. 设置上下文信息
-            ctx.page_trans = page_trans;
 
             uint64_t ctrl = get_backing_ctrl(index);
             if (ctrl == ALL_CTRLS)
@@ -2198,7 +2202,7 @@ __forceinline__
             // ctx.member_acquire_cAddq = (c->d_qps) + queue;
 
             // 3. ⭐ 返回page_trans（不是直接return 0或死循环！）
-            return page_trans;  // ⭐ 关键：返回有效的page_trans
+            return ctx.page_trans;  // ⭐ 关键：返回有效的page_trans
             break;
         case V_B:
         // printf("V_B in submit\n");
@@ -2868,13 +2872,13 @@ struct array_d_t
         uint64_t base;
         // bool memcpyflag_master;
         // bool memcpyflag;
-        // count = __popc(eq_mask);  // 自注释
+        count = __popc(eq_mask);
         if (master == lane)
         {
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
             base = r_->acquire_page_wait_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
-            // base_master = base;   //需要使用submit中储存的page_trans！ 
+            base_master = base;
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
         }
         base_master = __shfl_sync(eq_mask, base_master, master);
@@ -3094,7 +3098,7 @@ struct array_d_t
         int num_warps = blockDim.x / 32;  // 计算每个block中的warp数量（128/32=4）
         int warp_id = threadIdx.x / 32;  // 由于一个block有128个线程拆成4个warp，计算当前线程所在的warp在block内的ID（0-3）
         int idx_idx = bid * num_warps + warp_id;
-        if(lane == 0 && idx_idx % 1000 <= 10)
+        if (lane == 0 && idx_idx >= 0 && idx_idx < 8)
         {
             printf("normal: i:%zu, ret:%p, idx_idx:%d\n", i, (void *)ret, idx_idx);
         }
@@ -3138,10 +3142,10 @@ struct array_d_t
             // printf("before coalesce_page_submit_async\n");  // √
             coalesce_page_submit_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, ctx);
             // printf("isHit?:%d\n", ctx.isHit);  // √
-            // ctx.eq_mask = eq_mask;
-            // ctx.master = master;
-            // ctx.count = count;
-            // ctx.base_master = base_master;
+            ctx.eq_mask = eq_mask;
+            ctx.master = master;
+            ctx.count = count;
+            ctx.base_master = base_master;
             // ctx.page = page;
             // ctx.subindex = subindex;
             // ctx.gaddr = gaddr;
@@ -3197,9 +3201,9 @@ struct array_d_t
             uint32_t mask = __activemask(); // 线程掩码，表示出一个wrap中哪些线程在执行
 #endif
             uint32_t eq_mask = ctx.eq_mask;
-            uint64_t master = ctx.master;
-            uint64_t base_master;
-            uint32_t count;
+            int master = ctx.master;
+            uint64_t base_master = ctx.base_master;
+            uint32_t count = ctx.count;
 
             uint64_t page = r_->get_page(i);
             uint64_t subindex = r_->get_subindex(i);
@@ -3209,11 +3213,12 @@ struct array_d_t
             // uint64_t gaddr = ctx.gaddr;
 
             // printf("执行coalesce_page_wait_async\n");  // 没问题
-            coalesce_page_wait_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, ctx.base_master, ctx);
+            coalesce_page_wait_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, ctx);
             // printf("执行完成coalesce_page_wait_async\n");
-            page_ = &r_->pages[ctx.base_master];
+            ctx.base_master = base_master;
+            page_ = &r_->pages[base_master];
 
-            ret = (void *)r_->get_cache_page_addr(ctx.base_master);
+            ret = (void *)r_->get_cache_page_addr(base_master);
             start = r_->n_elems_per_page * page;
             end = start + r_->n_elems_per_page; // * (page+1);
             // ret.page = page;
