@@ -8,3 +8,12 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+*.log
+*.txt
+*.out
+# conda
+.conda/
+conda-env/
+AGENTS.md     
+build_local/
+build/

@@ -1,0 +1,3 @@
+[submodule "bam/include/freestanding"]
+	path = bam/include/freestanding
+	url = https://github.com/ogiroux/freestanding
