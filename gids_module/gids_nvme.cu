@@ -23,8 +23,8 @@ typedef std::chrono::high_resolution_clock Clock;
 
 namespace
 {
-constexpr uint64_t kWarpCtxDebugSampleCount = 8;
-constexpr int64_t kAsyncDebugRows = 2;
+constexpr uint64_t kWarpCtxDebugSampleCount = 0;
+constexpr int64_t kAsyncDebugRows = 0;
 constexpr int kAsyncDebugDims = 8;
 
 bool env_flag_enabled(const char *name)
@@ -38,6 +38,24 @@ bool env_flag_enabled(const char *name)
   return value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+uint64_t env_u64(const char *name, uint64_t fallback)
+{
+  const char *value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0')
+  {
+    return fallback;
+  }
+
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value || (end != nullptr && *end != '\0'))
+  {
+    return fallback;
+  }
+
+  return static_cast<uint64_t>(parsed);
+}
+
 void dump_warp_ctxs(const char *stage, s_ctx *d_warp_ctxs, uint64_t total_warps)
 {
   if (d_warp_ctxs == nullptr || total_warps == 0)
@@ -45,7 +63,12 @@ void dump_warp_ctxs(const char *stage, s_ctx *d_warp_ctxs, uint64_t total_warps)
     return;
   }
 
-  const uint64_t sample_count = total_warps < kWarpCtxDebugSampleCount ? total_warps : kWarpCtxDebugSampleCount;
+  const uint64_t requested_sample_count = env_u64("GIDS_WARP_CTX_DEBUG_SAMPLE", kWarpCtxDebugSampleCount);
+  const uint64_t sample_count = total_warps < requested_sample_count ? total_warps : requested_sample_count;
+  if (sample_count == 0)
+  {
+    return;
+  }
   std::vector<unsigned char> raw(sample_count * sizeof(s_ctx));
   cuda_err_chk(cudaMemcpy(raw.data(), d_warp_ctxs, raw.size(), cudaMemcpyDeviceToHost));
 
@@ -56,12 +79,15 @@ void dump_warp_ctxs(const char *stage, s_ctx *d_warp_ctxs, uint64_t total_warps)
          (unsigned long long)total_warps);
   for (uint64_t i = 0; i < sample_count; ++i)
   {
-    printf("  ctx[%llu]: idx_idx=%d row_index=%llu isHit=%d page_trans=%u cid=%u ctrl=%u queue=%u base_master=%llu\n",
+    printf("  ctx[%llu]: idx_idx=%d row_index=%llu isHit=%d page=%llu gaddr=%llu page_trans=%u observed=%llu cid=%u ctrl=%u queue=%u base_master=%llu\n",
            (unsigned long long)i,
            ctxs[i].idx_idx,
            (unsigned long long)ctxs[i].row_index,
            ctxs[i].isHit,
+           (unsigned long long)ctxs[i].page,
+           (unsigned long long)ctxs[i].gaddr,
            ctxs[i].page_trans,
+           (unsigned long long)ctxs[i].observed_page_translation,
            static_cast<unsigned int>(ctxs[i].cid),
            ctxs[i].ctrl,
            ctxs[i].queue,
@@ -262,7 +288,6 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
       // 计算总warp数
       uint64_t warps_per_block = b_size / 32;
       uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
-      printf("total warps: %llu\n", (unsigned long long)total_warps);
       // 分配设备内存
       cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
       cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
@@ -278,8 +303,10 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
       cuda_err_chk(cudaDeviceSynchronize());
       dump_warp_ctxs("wait", d_warp_ctxs, total_warps);
 
-      const int64_t debug_rows = num_index < kAsyncDebugRows ? num_index : kAsyncDebugRows;
-      const int debug_dims = dim < kAsyncDebugDims ? dim : kAsyncDebugDims;
+      const int64_t requested_debug_rows = static_cast<int64_t>(env_u64("GIDS_ASYNC_DEBUG_ROWS", kAsyncDebugRows));
+      const int requested_debug_dims = static_cast<int>(env_u64("GIDS_ASYNC_DEBUG_DIMS", kAsyncDebugDims));
+      const int64_t debug_rows = num_index < requested_debug_rows ? num_index : requested_debug_rows;
+      const int debug_dims = dim < requested_debug_dims ? dim : requested_debug_dims;
       if (debug_rows > 0 && debug_dims > 0)
       {
         TYPE *ref_tensor_ptr = nullptr;
@@ -297,42 +324,73 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
         cuda_err_chk(cudaMemcpy(h_ref.data(), ref_tensor_ptr, sizeof(TYPE) * debug_elems, cudaMemcpyDeviceToHost));
 
         int mismatch_count = 0;
+        std::vector<int> row_mismatch_counts(static_cast<size_t>(debug_rows), 0);
         for (size_t idx = 0; idx < debug_elems; ++idx)
         {
           if (!debug_values_equal(h_async[idx], h_ref[idx]))
           {
             ++mismatch_count;
+            const size_t row = idx / static_cast<size_t>(dim);
+            ++row_mismatch_counts[row];
           }
         }
 
-        printf("async debug: rows=%lld dims=%d mismatches=%d/%zu\n",
+        int mismatch_rows = 0;
+        for (int row_mismatch_count : row_mismatch_counts)
+        {
+          if (row_mismatch_count != 0)
+          {
+            ++mismatch_rows;
+          }
+        }
+
+        printf("async debug: rows=%lld dims=%d mismatches=%d/%zu mismatch_rows=%d\n",
                (long long)debug_rows,
                debug_dims,
                mismatch_count,
-               debug_elems);
-        for (int64_t row = 0; row < debug_rows; ++row)
+               debug_elems,
+               mismatch_rows);
+        if (mismatch_count != 0)
         {
-          printf("  row %lld async:", (long long)row);
-          for (int col = 0; col < debug_dims; ++col)
+          for (int64_t row = 0; row < debug_rows; ++row)
           {
-            const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col);
-            debug_print_value(h_async[offset]);
-          }
-          printf("\n");
+            const int row_mismatches = row_mismatch_counts[static_cast<size_t>(row)];
+            if (row_mismatches == 0)
+            {
+              continue;
+            }
 
-          printf("  row %lld  ref:", (long long)row);
-          for (int col = 0; col < debug_dims; ++col)
-          {
-            const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col);
-            debug_print_value(h_ref[offset]);
+            printf("  row %lld async (mismatches=%d):",
+                   (long long)row,
+                   row_mismatches);
+            for (int col = 0; col < debug_dims; ++col)
+            {
+              const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col);
+              debug_print_value(h_async[offset]);
+            }
+            printf("\n");
+
+            printf("  row %lld  ref:", (long long)row);
+            for (int col = 0; col < debug_dims; ++col)
+            {
+              const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col);
+              debug_print_value(h_ref[offset]);
+            }
+            printf("\n");
           }
-          printf("\n");
         }
 
         cudaFree(ref_tensor_ptr);
       }
 
       clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
+      {
+        constexpr uint64_t clear_pages_block_size = 256;
+        const uint64_t clear_pages_count = h_range->rdt.page_count;
+        const uint64_t clear_pages_grid_size =
+            (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
+        clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+      }
 
       if (d_warp_ctxs != nullptr)
         cudaFree(d_warp_ctxs);

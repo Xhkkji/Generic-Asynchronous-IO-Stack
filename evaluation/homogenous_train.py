@@ -26,6 +26,65 @@ torch.manual_seed(0)
 dgl.seed(0)
 warnings.filterwarnings("ignore")
 
+
+def env_int(name, fallback):
+    value = os.getenv(name)
+    if value is None or value == "":
+        return fallback
+    try:
+        return int(value)
+    except ValueError:
+        return fallback
+
+
+def parse_step_list(raw_value):
+    if raw_value is None:
+        return []
+
+    steps = []
+    for part in raw_value.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        steps.append(int(part))
+    return sorted(set(steps))
+
+
+def configure_async_debug_env(args, step, last_signature):
+    is_target_step = step in args.async_debug_step_set
+    debug_rows = args.async_debug_rows if is_target_step else args.async_debug_default_rows
+    debug_rows = max(debug_rows, 0)
+    warp_ctx_sample = max(args.async_debug_warp_ctx_sample, 0)
+    debug_dims = max(args.async_debug_dims, 0)
+
+    os.environ["GIDS_ASYNC_DEBUG_ROWS"] = str(debug_rows)
+    os.environ["GIDS_ASYNC_DEBUG_DIMS"] = str(debug_dims)
+    os.environ["GIDS_WARP_CTX_DEBUG_SAMPLE"] = str(warp_ctx_sample)
+
+    signature = (
+        debug_rows,
+        debug_dims,
+        warp_ctx_sample,
+        is_target_step,
+    )
+    current_enabled = (debug_rows > 0) or (warp_ctx_sample > 0)
+    previous_enabled = False
+    if last_signature is not None:
+        previous_enabled = (last_signature[0] > 0) or (last_signature[2] > 0)
+
+    if signature != last_signature and (current_enabled or previous_enabled):
+        print(
+            "[async-debug] next step {}: rows={} dims={} ctx_sample={} target={}".format(
+                step,
+                debug_rows,
+                debug_dims,
+                warp_ctx_sample,
+                int(is_target_step),
+            )
+        )
+
+    return signature
+
 # 设置数据的根目录、DGL 数据集目录和 PyTorch Geometric 数据集目录
 data_root = os.path.join(os.path.dirname(__file__), '..', 'data')
 dgl_root = os.path.join(data_root, 'dgl_datasets')
@@ -182,7 +241,22 @@ def track_acc_GIDS(g, args, device, label_array=None):
         transfer_time = 0
         e2e_time = 0
         e2e_time_start = time.time()
-        for step, (input_nodes, seeds, blocks, ret) in tqdm.tqdm(enumerate(train_dataloader)):
+        train_iter = iter(train_dataloader)
+        progress_total = None
+        if args.stop_after_step >= 0:
+            progress_total = args.stop_after_step + 1
+
+        progress = tqdm.tqdm(total=progress_total)
+        step = 0
+        debug_signature = None
+        while True:
+            debug_signature = configure_async_debug_env(args, step, debug_signature)
+            try:
+                input_nodes, seeds, blocks, ret = next(train_iter)
+            except StopIteration:
+                break
+
+            progress.update(1)
             # print("step: ", step)
             
             if(step == warm_up_iter):
@@ -230,10 +304,14 @@ def track_acc_GIDS(g, args, device, label_array=None):
                 train_time = 0
                 e2e_time = 0
             
-            if step >= 20: 
+            if args.stop_after_step >= 0 and step >= args.stop_after_step:
                 break
             #     Just testing 100 iterations remove the next line if you do not want to halt
             #     return None
+
+            step += 1
+
+        progress.close()
 
 
        
@@ -372,13 +450,36 @@ if __name__ == '__main__':
     parser.add_argument('--num_ele', type=int, default=100, help='Number of elements in the dataset (Total Size / sizeof(Type)') 
     parser.add_argument('--cache_dim', type=int, default=1024) #CHECK
 
+    parser.add_argument('--stop_after_step', type=int, default=20,
+        help='Inclusive training step limit for quick debug runs; set to -1 to disable')
+    parser.add_argument('--async_debug_steps', type=str, default='',
+        help='Comma-separated training steps that should use elevated async debug rows')
+    parser.add_argument('--async_debug_rows', type=int, default=32,
+        help='Async debug rows to use for the steps listed in --async_debug_steps')
+    parser.add_argument('--async_debug_default_rows', type=int,
+        default=env_int('GIDS_ASYNC_DEBUG_ROWS', 0),
+        help='Async debug rows for non-target steps')
+    parser.add_argument('--async_debug_dims', type=int,
+        default=env_int('GIDS_ASYNC_DEBUG_DIMS', 8),
+        help='Number of feature dimensions printed by async debug')
+    parser.add_argument('--async_debug_warp_ctx_sample', type=int,
+        default=env_int('GIDS_WARP_CTX_DEBUG_SAMPLE', 0),
+        help='Warp ctx sample count for submit/wait debug dumps')
+
 
     args = parser.parse_args()
+    args.async_debug_step_set = set(parse_step_list(args.async_debug_steps))
     print("GIDS DataLoader Setting")
     print("GIDS: ", args.GIDS)
     print("CPU Feature Buffer: ", args.cpu_buffer)
     print("Window Buffering: ", args.window_buffer)
     print("Storage Access Accumulator: ", args.accumulator)
+    print("Stop After Step: ", args.stop_after_step)
+    print("Async Debug Steps: ", sorted(args.async_debug_step_set))
+    print("Async Debug Target Rows: ", args.async_debug_rows)
+    print("Async Debug Default Rows: ", args.async_debug_default_rows)
+    print("Async Debug Dims: ", args.async_debug_dims)
+    print("Async Debug Warp Ctx Sample: ", args.async_debug_warp_ctx_sample)
 
     labels = None
     device = f'cuda:' + str(args.device) if torch.cuda.is_available() else 'cpu'

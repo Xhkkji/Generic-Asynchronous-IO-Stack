@@ -147,22 +147,13 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
     uint64_t row_index = ctx.row_index;  // 重要，确保submit和wait使用同一个row_index
     uint64_t tid = threadIdx.x % 32;
 
-    // `ctx.isHit` flips to true after the first successful wait. If we gate each
-    // loop iteration on the shared ctx flag, the rest of the feature row stays zero.
-    if (!ctx.isHit)
+    // Materialize all rows in the wait stage. Miss rows complete the pending IO,
+    // while hit rows rebuild the cache pointer from the submit-time context and
+    // overwrite any speculative submit-stage values.
+    for (; tid < dim; tid += 32)
     {
-      for (; tid < dim; tid += 32)
-      {
-        // T temp = ptr[(row_index) * cache_dim + tid];
-        const size_t idx = (row_index)*cache_dim + tid;
-        // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
-        // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
-        
-        // printf("read_feature_kernel_wait idx:%llu\n", (unsigned long long)idx);
-    
-        T temp = ptr.read_wait_async((row_index)*cache_dim + tid, ctx); 
-        out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
-      }
+      T temp = ptr.read_wait_async((row_index)*cache_dim + tid, ctx);
+      out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
     }
   }
 }
@@ -280,6 +271,20 @@ __global__ void clear_cache_kernel(page_cache_d_t *cache)
     clear_cache_safe(cache);
   }
     
+}
+
+template <typename T = float>
+__global__ void clear_range_pages_kernel(range_d_t<T> *d_range)
+{
+  const uint64_t idx = threadIdx.x + static_cast<uint64_t>(blockIdx.x) * blockDim.x;
+  if (idx < d_range->page_count)
+  {
+    d_range->pages[idx].state.store(INVALID, simt::memory_order_relaxed);
+    d_range->pages[idx].offset = 0;
+    d_range->pages[idx].prefetch_count.store(0, simt::memory_order_relaxed);
+    d_range->pages[idx].prefetch_counter.store(0, simt::memory_order_relaxed);
+    d_range->pages[idx].cpu_feature_offset = 0;
+  }
 }
 
 template <typename T = float>
