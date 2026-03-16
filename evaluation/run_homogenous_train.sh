@@ -1,24 +1,29 @@
-# igb-full
-# CUDA_VISIBLE_DEVICES=0  sudo /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py --path /data/igb/ --dataset_size full --epochs 1 --num_heads 8 --log_every 1000 --uva_graph 1 --GIDS --batch_size 8000 --num_classes 19 --data IGB --emb_size 1024 --model_type sage --num_layers 3 --fan_out '25,10' --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_1full.pt --cache_size $((4*1024)) --num_ssd 1   --num_ele $((550*1000*1000*1024)) --page_size 4096 --window_buffer --wb_size 8   --cpu_buffer --cpu_buffer_percent 0.2   --accumulator
+#!/usr/bin/env bash
 
-# igb-small
-# CUDA_VISIBLE_DEVICES=0  sudo /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py --path /data/igb/ --dataset_size small --data IGB --emb_size 1024 --model_type sage --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_small_full.pt --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_small.pt --fan_out '10,5,5' --epochs 1 --num_classes 19 --num_layers 3 --num_heads 8 --log_every 1000 --GIDS --batch_size 1024 --cache_size $((4096)) --num_ssd 1 --page_size 4096 --num_ele $((550*1000*1000*1024)) --window_buffer --wb_size 8   --cpu_buffer --cpu_buffer_percent 0.2   --accumulator
-# CUDA_VISIBLE_DEVICES=0  sudo /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py --path /data/igb/ --dataset_size small --data IGB --emb_size 1024 --model_type sage --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_small_full.pt --fan_out '10,5,5' --epochs 1 --num_classes 19 --num_layers 3 --num_heads 8 --log_every 1000 --GIDS --batch_size 1024 --cache_size $((4096)) --num_ssd 1 --page_size 4096 --num_ele $((550*1000*1000*1024)) 
+set -euo pipefail
 
-# igb-small
-# CUDA_VISIBLE_DEVICES=0  sudo /home/xhk/miniconda3/envs/pytorch/bin/python3  /home/xhk/hyperion/GIDS/evaluation/homogenous_train.py --dataset_size small --path /data/igb/ --epochs 1 --log_every 1000 --uva_graph 1 --GIDS --batch_size 1024  --data IGB --model_type sage --num_layers 3 --num_heads 8 --fan_out '10,5,5' --cache_size $((1024)) --num_ssd 1   --num_ele $((550*1000*1000*1024)) --page_size 4096 --emb_size 1024  --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_small_full.pt --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_small.pt --synthetic 0 --window_buffer --wb_size 8 --cpu_buffer --cpu_buffer_percent 0.2 --GIDS --accumulator
-
-# igb-medium
-# CUDA_VISIBLE_DEVICES=0  sudo /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py --path /data/igb/ --dataset_size medium --epochs 1 --num_heads 8 --log_every 1000 --uva_graph 1 --GIDS --batch_size 1024 --num_classes 19 --data IGB --emb_size 1024 --model_type sage --num_layers 3 --fan_out '10,5,5' --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_medium_full.pt --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_medium.pt --cache_size $((1024)) --num_ssd 1   --num_ele $((550*1000*1000*1024)) --page_size 4096 --window_buffer --wb_size 8   --cpu_buffer --cpu_buffer_percent 0.2   --accumulator
-# 不用CPU buffer的版本
-# CUDA_VISIBLE_DEVICES=0  sudo /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py --path /data/igb/ --dataset_size medium --epochs 1 --num_heads 8 --log_every 1000 --uva_graph 1 --GIDS --batch_size 1024 --num_classes 19 --data IGB --emb_size 1024 --model_type sage --num_layers 3 --fan_out '10,5,5' --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_medium_full.pt --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_medium.pt --cache_size $((4*1024)) --num_ssd 1   --num_ele $((550*1000*1000*1024)) --page_size 4096 --window_buffer --wb_size 8 --accumulator
-# 裸奔版本
-sudo env CUDA_VISIBLE_DEVICES=0 GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-0}" /home/wzq/miniconda3/envs/gids/bin/python3 homogenous_train.py --path /data/igb/ --dataset_size medium --epochs 1 --num_heads 8 --log_every 1000 --uva_graph 1 --GIDS --batch_size 1024 --num_classes 19 --data IGB --emb_size 1024 --model_type sage --num_layers 3 --fan_out '10,5,5' --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_medium_full.pt --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_medium.pt --cache_size $((1024)) --num_ssd 1   --num_ele $((550*1000*1000*1024)) --page_size 4096
-
-# igb-full
-# CUDA_VISIBLE_DEVICES=0  sudo /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py --path /data/igb/ --dataset_size full --epochs 1 --num_heads 8 --log_every 1000 --uva_graph 0 --GIDS --batch_size 1024 --num_classes 19 --data IGB --emb_size 1024 --model_type sage --num_layers 3 --fan_out '10,5,5' --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_full.pt --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_full.pt --cache_size $((4*1024)) --num_ssd 1   --num_ele $((550*1000*1000*1024)) --page_size 4096 --window_buffer --wb_size 8   --cpu_buffer --cpu_buffer_percent 0.2   --accumulator
-
-# CUDA_VISIBLE_DEVICES=0  sudo nohup /home/xhk/miniconda3/envs/pytorch/bin/python3  /home/xhk/hyperion/GIDS/evaluation/homogenous_train.py --dataset_size medium --path /data/igb/ --epochs 1 --log_every 1000 --uva_graph 1 --GIDS --batch_size 1024  --data IGB --model_type sage --num_layers 3 --fan_out '10,5,5' --cache_size $((1024)) --num_ssd 1   --num_ele $((40*1000*1000*1024)) --page_size 4096 --emb_size 1024  --pin_file pr_medium.pt --synthetic 0
-
-# paper100m
-# CUDA_VISIBLE_DEVICES=0  sudo /home/xhk/miniconda3/envs/pytorch/bin/python3 homogenous_train.py --path /data/OGB/ogbn_papers100M/ --dataset_size full --epochs 1 --num_heads 8 --log_every 1000 --uva_graph 1 --GIDS --batch_size 1024 --num_classes 172 --data OGB --emb_size 128 --model_type sage --num_layers 3 --fan_out '25,10' --modelpath /home/xhk/hyperion/GIDS/dataset/paper100m/pr_full.pt --cache_size $((4*1024)) --num_ssd 1   --num_ele $((550*1000*1000*1024)) --page_size 4096 --window_buffer --wb_size 8   --cpu_buffer --cpu_buffer_percent 0.2   --accumulator
+sudo env \
+  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
+  GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-0}" \
+  /home/wzq/miniconda3/envs/gids/bin/python3 homogenous_train.py \
+  --path /data/igb/ \
+  --dataset_size medium \
+  --epochs 1 \
+  --num_heads 8 \
+  --log_every 1000 \
+  --uva_graph 1 \
+  --GIDS \
+  --batch_size 1024 \
+  --num_classes 19 \
+  --data IGB \
+  --emb_size 1024 \
+  --model_type sage \
+  --num_layers 3 \
+  --fan_out '10,5,5' \
+  --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_medium_full.pt \
+  --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_medium.pt \
+  --cache_size $((1024)) \
+  --num_ssd 1 \
+  --num_ele $((550*1000*1000*1024)) \
+  --page_size 4096 \
+  "$@"

@@ -8,7 +8,7 @@ sudo env \
   GIDS_ASYNC_DEBUG_ROWS="${GIDS_ASYNC_DEBUG_ROWS:-0}" \
   GIDS_ASYNC_DEBUG_DIMS="${GIDS_ASYNC_DEBUG_DIMS:-8}" \
   GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
-  /home/wzq/miniconda3/envs/gids/bin/python3 homogenous_train.py \
+  /home/wzq/miniconda3/envs/gids/bin/python3 homogenous_train_debug.py \
   --path /data/igb/ \
   --dataset_size medium \
   --epochs 1 \
