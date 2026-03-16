@@ -1,6 +1,8 @@
 #include <pybind11/pybind11.h>
 
+#include <cstdlib>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -19,13 +21,124 @@
 
 typedef std::chrono::high_resolution_clock Clock;
 
+namespace
+{
+constexpr uint64_t kWarpCtxDebugSampleCount = 0;
+constexpr int64_t kAsyncDebugRows = 0;
+constexpr int kAsyncDebugDims = 8;
+
+bool env_flag_enabled(const char *name)
+{
+  const char *value = std::getenv(name);
+  if (value == nullptr)
+  {
+    return false;
+  }
+
+  return value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+uint64_t env_u64(const char *name, uint64_t fallback)
+{
+  const char *value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0')
+  {
+    return fallback;
+  }
+
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value || (end != nullptr && *end != '\0'))
+  {
+    return fallback;
+  }
+
+  return static_cast<uint64_t>(parsed);
+}
+
+void dump_warp_ctxs(const char *stage, s_ctx *d_warp_ctxs, uint64_t total_warps)
+{
+  if (d_warp_ctxs == nullptr || total_warps == 0)
+  {
+    return;
+  }
+
+  const uint64_t requested_sample_count = env_u64("GIDS_WARP_CTX_DEBUG_SAMPLE", kWarpCtxDebugSampleCount);
+  const uint64_t sample_count = total_warps < requested_sample_count ? total_warps : requested_sample_count;
+  if (sample_count == 0)
+  {
+    return;
+  }
+  std::vector<unsigned char> raw(sample_count * sizeof(s_ctx));
+  cuda_err_chk(cudaMemcpy(raw.data(), d_warp_ctxs, raw.size(), cudaMemcpyDeviceToHost));
+
+  const s_ctx *ctxs = reinterpret_cast<const s_ctx *>(raw.data());
+  printf("%s ctx sample (%llu / %llu warps)\n",
+         stage,
+         (unsigned long long)sample_count,
+         (unsigned long long)total_warps);
+  for (uint64_t i = 0; i < sample_count; ++i)
+  {
+    printf("  ctx[%llu]: idx_idx=%d row_index=%llu isHit=%d page=%llu gaddr=%llu page_trans=%u observed=%llu cid=%u ctrl=%u queue=%u base_master=%llu\n",
+           (unsigned long long)i,
+           ctxs[i].idx_idx,
+           (unsigned long long)ctxs[i].row_index,
+           ctxs[i].isHit,
+           (unsigned long long)ctxs[i].page,
+           (unsigned long long)ctxs[i].gaddr,
+           ctxs[i].page_trans,
+           (unsigned long long)ctxs[i].observed_page_translation,
+           static_cast<unsigned int>(ctxs[i].cid),
+           ctxs[i].ctrl,
+           ctxs[i].queue,
+           (unsigned long long)ctxs[i].base_master);
+  }
+}
+
+template <typename TYPE>
+bool debug_values_equal(TYPE lhs, TYPE rhs)
+{
+  return lhs == rhs;
+}
+
+template <>
+bool debug_values_equal<float>(float lhs, float rhs)
+{
+  return std::fabs(lhs - rhs) < 1e-5f;
+}
+
+template <>
+bool debug_values_equal<double>(double lhs, double rhs)
+{
+  return std::fabs(lhs - rhs) < 1e-8;
+}
+
+template <typename TYPE>
+void debug_print_value(TYPE value)
+{
+  printf(" %lld", (long long)value);
+}
+
+template <>
+void debug_print_value<float>(float value)
+{
+  printf(" %.6f", static_cast<double>(value));
+}
+
+template <>
+void debug_print_value<double>(double value)
+{
+  printf(" %.6f", value);
+}
+} // namespace
+
 void GIDS_Controllers::init_GIDS_controllers(uint32_t num_ctrls, uint64_t q_depth, uint64_t num_q,
                                              const std::vector<int> &ssd_list)
 {
-
   n_ctrls = num_ctrls;
   queueDepth = q_depth;
   numQueues = num_q;
+  printf("queueDepth: %llu, num_q: %llu\n", (unsigned long long)queueDepth, (unsigned long long)numQueues);
 
   for (size_t i = 0; i < n_ctrls; i++)
   {
@@ -143,7 +256,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
-
+  // printf("read_feature..\n");
   TYPE *tensor_ptr = (TYPE *)i_ptr;
   int64_t *index_ptr = (int64_t *)i_index_ptr;
 
@@ -155,8 +268,133 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
   auto t1 = Clock::now();
   if (cpu_buffer_flag == false)
   {
-    read_feature_kernel<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-                                                  index_ptr, dim, num_index, cache_dim, key_off);
+    static bool logged_sync_mode = false;
+    if (env_flag_enabled("GIDS_FORCE_SYNC_READ"))
+    {
+      if (!logged_sync_mode)
+      {
+        printf("read_feature mode: sync baseline via read_feature_kernel\n");
+        logged_sync_mode = true;
+      }
+
+      read_feature_kernel<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                    index_ptr, dim, num_index, cache_dim, key_off);
+      cuda_err_chk(cudaDeviceSynchronize());
+    }
+    else
+    {
+      s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
+
+      // 计算总warp数
+      uint64_t warps_per_block = b_size / 32;
+      uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
+      // 分配设备内存
+      cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
+      cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
+
+      read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                                 index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+      // 等待submit完成
+      cudaDeviceSynchronize();
+      dump_warp_ctxs("submit", d_warp_ctxs, total_warps);
+
+      read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                               index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+      cuda_err_chk(cudaDeviceSynchronize());
+      dump_warp_ctxs("wait", d_warp_ctxs, total_warps);
+
+      const int64_t requested_debug_rows = static_cast<int64_t>(env_u64("GIDS_ASYNC_DEBUG_ROWS", kAsyncDebugRows));
+      const int requested_debug_dims = static_cast<int>(env_u64("GIDS_ASYNC_DEBUG_DIMS", kAsyncDebugDims));
+      const int64_t debug_rows = num_index < requested_debug_rows ? num_index : requested_debug_rows;
+      const int debug_dims = dim < requested_debug_dims ? dim : requested_debug_dims;
+      if (debug_rows > 0 && debug_dims > 0)
+      {
+        TYPE *ref_tensor_ptr = nullptr;
+        const size_t debug_elems = static_cast<size_t>(debug_rows) * static_cast<size_t>(dim);
+        cuda_err_chk(cudaMalloc(&ref_tensor_ptr, sizeof(TYPE) * debug_elems));
+
+        const uint64_t debug_g_size = (debug_rows + n_warp - 1) / n_warp;
+        read_feature_kernel<TYPE><<<debug_g_size, b_size>>>(a->d_array_ptr, ref_tensor_ptr,
+                                                            index_ptr, dim, debug_rows, cache_dim, key_off);
+        cuda_err_chk(cudaDeviceSynchronize());
+
+        std::vector<TYPE> h_async(debug_elems);
+        std::vector<TYPE> h_ref(debug_elems);
+        cuda_err_chk(cudaMemcpy(h_async.data(), tensor_ptr, sizeof(TYPE) * debug_elems, cudaMemcpyDeviceToHost));
+        cuda_err_chk(cudaMemcpy(h_ref.data(), ref_tensor_ptr, sizeof(TYPE) * debug_elems, cudaMemcpyDeviceToHost));
+
+        int mismatch_count = 0;
+        std::vector<int> row_mismatch_counts(static_cast<size_t>(debug_rows), 0);
+        for (size_t idx = 0; idx < debug_elems; ++idx)
+        {
+          if (!debug_values_equal(h_async[idx], h_ref[idx]))
+          {
+            ++mismatch_count;
+            const size_t row = idx / static_cast<size_t>(dim);
+            ++row_mismatch_counts[row];
+          }
+        }
+
+        int mismatch_rows = 0;
+        for (int row_mismatch_count : row_mismatch_counts)
+        {
+          if (row_mismatch_count != 0)
+          {
+            ++mismatch_rows;
+          }
+        }
+
+        printf("async debug: rows=%lld dims=%d mismatches=%d/%zu mismatch_rows=%d\n",
+               (long long)debug_rows,
+               debug_dims,
+               mismatch_count,
+               debug_elems,
+               mismatch_rows);
+        if (mismatch_count != 0)
+        {
+          for (int64_t row = 0; row < debug_rows; ++row)
+          {
+            const int row_mismatches = row_mismatch_counts[static_cast<size_t>(row)];
+            if (row_mismatches == 0)
+            {
+              continue;
+            }
+
+            printf("  row %lld async (mismatches=%d):",
+                   (long long)row,
+                   row_mismatches);
+            for (int col = 0; col < debug_dims; ++col)
+            {
+              const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col);
+              debug_print_value(h_async[offset]);
+            }
+            printf("\n");
+
+            printf("  row %lld  ref:", (long long)row);
+            for (int col = 0; col < debug_dims; ++col)
+            {
+              const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col);
+              debug_print_value(h_ref[offset]);
+            }
+            printf("\n");
+          }
+        }
+
+        cudaFree(ref_tensor_ptr);
+      }
+
+      clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
+      {
+        constexpr uint64_t clear_pages_block_size = 256;
+        const uint64_t clear_pages_count = h_range->rdt.page_count;
+        const uint64_t clear_pages_grid_size =
+            (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
+        clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+      }
+
+      if (d_warp_ctxs != nullptr)
+        cudaFree(d_warp_ctxs);
+    }
   }
   else
   {
@@ -184,7 +422,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_hetero(int num_iter, const std::vector<uint64_t> &i_ptr_list, const std::vector<uint64_t> &i_index_ptr_list,
                                                   const std::vector<uint64_t> &num_index, int dim, int cache_dim, const std::vector<uint64_t> &key_off)
 {
-
+  // printf("read_feature..\n");
   cudaStream_t streams[num_iter];
   for (int i = 0; i < num_iter; i++)
   {
@@ -266,13 +504,21 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
                                                   const std::vector<uint64_t> &num_index, int dim, int cache_dim = 1024)
 {
   // printf("num_iter:%d\n", num_iter);
+  // 同步流只需要创建一次
   cudaStream_t streams[num_iter];
   for (int i = 0; i < num_iter; i++)
   {
     cudaStreamCreate(&streams[i]);
   }
 
-  cuda_err_chk(cudaDeviceSynchronize());
+  // 在循环外部创建事件
+  // cudaEvent_t events[num_iter];
+  // for (int i = 0; i < num_iter; i++)
+  // {
+  //     cudaEventCreate(&events[i]);
+  // }
+
+  // cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
   for (uint64_t i = 0; i < num_iter; i++)
@@ -285,14 +531,50 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     uint64_t b_size = blkSize;
     uint64_t n_warp = b_size / 32;
     uint64_t g_size = (num_index[i] + n_warp - 1) / n_warp;
+    // uint64_t g_size = 128;  // 34,560(10000可运行)
 
-    // printf("g_size:%d, b_size:%d", g_size, b_size);
+    // g_size:43337, b_size:128
+    printf("g_size:%d, b_size:%d\n", g_size, b_size);
     // b_size为每个block中的线程数，假设为128，则warp数量为128/32个，一个warp处理一个特征数据(1024维)
 
     if (cpu_buffer_flag == false)
     {
-      read_feature_kernel<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
-                                                                   index_ptr, dim, num_index[i], cache_dim, 0);
+      s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
+
+      // 计算总warp数
+      uint64_t warps_per_block = b_size / 32;
+      uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
+
+      // 分配设备内存
+      cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
+      cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
+
+      // ========== 第1步：重置SQ/CQ队列（添加在这里！）==========
+      // 在submit之前重置队列，确保这一轮从干净状态开始
+      // reset_queues_for_round<<<1, 1, 0, streams[i]>>>(h_pc, i);  // 使用当前stream
+      // cudaStreamSynchronize(streams[i]);  // 确保重置完成
+
+      // read_feature_kernel<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
+      //                                                              index_ptr, dim, num_index[i], cache_dim, 0);
+      read_feature_kernel_submit_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
+                                                                                index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
+
+      // printf("read_feature_submit_async before launched..\n");
+      cudaStreamSynchronize(streams[i]); // 此处被阻塞
+      // 调试输出
+      printf("Submit finished for iteration %lu\n", i);
+
+      read_feature_kernel_wait_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
+                                                                              index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
+
+      cudaStreamSynchronize(streams[i]);
+      cuda_err_chk(cudaDeviceSynchronize());
+
+      if (d_warp_ctxs != nullptr)
+        cudaFree(d_warp_ctxs);
+      cudaStreamDestroy(streams[i]);
+      // cudaStreamDestroy(streams1[i]);
+      // cudaStreamDestroy(streams2[i]);
     }
     else
     {
@@ -304,11 +586,11 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
     total_access += num_index[i];
   }
 
-  for (int i = 0; i < num_iter; i++)
-  {
-    // printf("cudaStreamSynchronize:%d\n", i); // ×
-    cudaStreamSynchronize(streams[i]);
-  }
+  // for (int i = 0; i < num_iter; i++)
+  // {
+  //   // printf("cudaStreamSynchronize:%d\n", i); // ×
+  //   cudaStreamSynchronize(streams[i]);
+  // }
 
   // printf("cudaStreamSynchronize finished, num_iter:%d\n", num_iter); //
   cuda_err_chk(cudaDeviceSynchronize());
@@ -328,10 +610,10 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
 
   kernel_time += ms_fractional;
 
-  for (int i = 0; i < num_iter; i++)
-  {
-    cudaStreamDestroy(streams[i]);
-  }
+  // for (int i = 0; i < num_iter; i++)
+  // {
+  //   cudaStreamDestroy(streams[i]);
+  // }
   return;
 }
 

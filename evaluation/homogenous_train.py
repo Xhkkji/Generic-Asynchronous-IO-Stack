@@ -20,8 +20,6 @@ from GIDS import GIDS_DGLDataLoader
 from ogb.graphproppred import DglGraphPropPredDataset
 from ogb.nodeproppred import DglNodePropPredDataset, Evaluator
 
-import sys
-
 torch.manual_seed(0)
 dgl.seed(0)
 warnings.filterwarnings("ignore")
@@ -83,8 +81,6 @@ def print_times(transfer_time, train_time, e2e_time):
     print("e2e time: ", e2e_time)
 
 def track_acc_GIDS(g, args, device, label_array=None):
-
-    print(f"exc track_acc_GIDS..")
     GIDS_Loader = None
     GIDS_Loader = GIDS.GIDS(
         page_size = args.page_size,
@@ -123,9 +119,6 @@ def track_acc_GIDS(g, args, device, label_array=None):
     val_nid = torch.nonzero(g.ndata['val_mask'], as_tuple=True)[0]
     test_nid = torch.nonzero(g.ndata['test_mask'], as_tuple=True)[0]
     in_feats = g.ndata['features'].shape[1]
-
-    print(f'test_nid:{test_nid}')
-    print(f'test_nid shape:{test_nid.shape}')
     
     train_dataloader = GIDS_DGLDataLoader(
         g,
@@ -148,8 +141,7 @@ def track_acc_GIDS(g, args, device, label_array=None):
 
     test_dataloader = dgl.dataloading.DataLoader(
         g, test_nid, sampler,
-        # batch_size=args.batch_size,
-        batch_size=8000,
+        batch_size=args.batch_size,
         shuffle=True, drop_last=False,
         num_workers=args.num_workers)
 
@@ -182,7 +174,7 @@ def track_acc_GIDS(g, args, device, label_array=None):
         transfer_time = 0
         e2e_time = 0
         e2e_time_start = time.time()
-        for step, (input_nodes, seeds, blocks, ret) in tqdm.tqdm(enumerate(train_dataloader)):
+        for step, (input_nodes, seeds, blocks, ret) in enumerate(train_dataloader):
             # print("step: ", step)
             
             if(step == warm_up_iter):
@@ -217,7 +209,7 @@ def track_acc_GIDS(g, args, device, label_array=None):
             optimizer.step()
             epoch_loss += loss.detach()                  
             train_time = train_time + time.time() - train_start
-          
+            
             if(step == warm_up_iter + 100):
                 print("Performance for 100 iteration after 1000 iteration")
                 e2e_time += time.time() - e2e_time_start 
@@ -229,10 +221,6 @@ def track_acc_GIDS(g, args, device, label_array=None):
                 transfer_time = 0
                 train_time = 0
                 e2e_time = 0
-                
-                # break
-            #     Just testing 100 iterations remove the next line if you do not want to halt
-            #     return None
 
 
        
@@ -370,6 +358,18 @@ if __name__ == '__main__':
     parser.add_argument('--offset', type=int, default=0, help='Offset for the feature data stored in the SSD') 
     parser.add_argument('--num_ele', type=int, default=100, help='Number of elements in the dataset (Total Size / sizeof(Type)') 
     parser.add_argument('--cache_dim', type=int, default=1024) #CHECK
+    parser.add_argument('--stop_after_step', type=int, default=-1,
+        help='Deprecated debug option kept for compatibility; ignored')
+    parser.add_argument('--async_debug_steps', type=str, default='',
+        help='Deprecated debug option kept for compatibility; ignored')
+    parser.add_argument('--async_debug_rows', type=int, default=0,
+        help='Deprecated debug option kept for compatibility; ignored')
+    parser.add_argument('--async_debug_default_rows', type=int, default=0,
+        help='Deprecated debug option kept for compatibility; ignored')
+    parser.add_argument('--async_debug_dims', type=int, default=8,
+        help='Deprecated debug option kept for compatibility; ignored')
+    parser.add_argument('--async_debug_warp_ctx_sample', type=int, default=0,
+        help='Deprecated debug option kept for compatibility; ignored')
 
 
     args = parser.parse_args()

@@ -1,1 +1,0 @@
--I/home/xhk/miniconda3/envs/pytorch/include -I/home/xhk/miniconda3/envs/pytorch/include/python3.11 -I/home/xhk/hyperion/GIDS/bam/include -I/home/xhk/hyperion/GIDS/bam/include/freestanding/include -I/home/xhk/hyperion/GIDS/gids_module/./include -I/home/xhk/hyperion/GIDS/gids_module/../bam/include -I/home/xhk/hyperion/GIDS/gids_module/../bam/include/freestanding/include
