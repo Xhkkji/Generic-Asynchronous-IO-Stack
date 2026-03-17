@@ -5,7 +5,7 @@ set -euo pipefail
 sudo env \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
   GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-0}" \
-  /home/wzq/miniconda3/envs/gids/bin/python3 homogenous_train.py \
+  /home/xhk/miniconda3/envs/pytorch/bin/python homogenous_train.py \
   --path /data/igb/ \
   --dataset_size medium \
   --epochs 1 \

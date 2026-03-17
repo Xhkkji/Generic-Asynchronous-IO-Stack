@@ -235,7 +235,7 @@ def track_acc_GIDS(g, args, device, label_array=None):
         e2e_time_start = time.time()
         debug_signature = None
         debug_signature = configure_async_debug_env(args, 0, debug_signature)
-        for step, (input_nodes, seeds, blocks, ret) in enumerate(train_dataloader):
+        for step, (input_nodes, seeds, blocks, ret) in tqdm.tqdm(enumerate(train_dataloader)):
             # print("step: ", step)
             
             if(step == warm_up_iter):

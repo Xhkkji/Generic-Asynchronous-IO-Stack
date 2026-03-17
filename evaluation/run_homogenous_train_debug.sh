@@ -6,9 +6,10 @@ sudo env \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
   GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-0}" \
   GIDS_ASYNC_DEBUG_ROWS="${GIDS_ASYNC_DEBUG_ROWS:-0}" \
-  GIDS_ASYNC_DEBUG_DIMS="${GIDS_ASYNC_DEBUG_DIMS:-8}" \
-  GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
-  /home/wzq/miniconda3/envs/gids/bin/python3 homogenous_train_debug.py \
+  GIDS_ASYNC_DEBUG_DIMS="${GIDS_ASYNC_DEBUG_DIMS:-16}" \
+  GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-8}" \
+  /home/xhk/miniconda3/envs/pytorch/bin/python homogenous_train_debug.py \
+  --stop_after_step 50 \
   --path /data/igb/ \
   --dataset_size medium \
   --epochs 1 \

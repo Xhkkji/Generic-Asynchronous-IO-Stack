@@ -58,7 +58,7 @@ __global__ void read_feature_kernel_submit_async(array_d_t<T> *dr, T *out_tensor
   
   if (idx_idx < num_idx)
   {
-    bam_ptr<T> ptr(dr);
+    bam_ptr<T> ptr(dr, false);
 
     uint64_t row_index = index_ptr[idx_idx] + key_off;
     uint64_t tid = threadIdx.x % 32;
@@ -139,7 +139,7 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
 
   if (idx_idx < num_idx)
   {
-    bam_ptr<T> ptr(dr);
+    bam_ptr<T> ptr(dr, true);
 
     // printf("wait idx_idx:%d\n", idx_idx);
     s_ctx& ctx = d_warp_ctxs[idx_idx];
@@ -267,7 +267,7 @@ __global__ void clear_cache_kernel(page_cache_d_t *cache)
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if(idx == 0)
   {
-    // printf("Clearing cache...\n");
+    printf("Clearing cache...\n");
     clear_cache_safe(cache);
   }
     
@@ -322,6 +322,18 @@ __global__ void set_window_buffering_kernel(array_d_t<T> *dr, uint64_t *index_pt
   {
     uint64_t page_idx = index_ptr[blockIdx.x] + hash_off;
     ptr.set_window_buffer_counter(page_idx * page_size / sizeof(T), 1);
+  }
+}
+
+template <typename T = float>
+__global__ void print_pages_ref_count_kernel(range_d_t<T> *d_range)
+{
+  const uint64_t idx = threadIdx.x + static_cast<uint64_t>(blockIdx.x) * blockDim.x;
+  uint32_t ref_count = d_range->pages[idx].ref_count.load(simt::memory_order_acquire);
+  if (idx < d_range->page_count && ref_count != 0)
+  {
+    // printf("page %llu ref count: %u\n", (unsigned long long)idx, d_range->pages[idx].state.load());
+    printf("page %llu ref count: %u\n", (unsigned long long)idx, ref_count);
   }
 }
 

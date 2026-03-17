@@ -271,6 +271,7 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
     static bool logged_sync_mode = false;
     if (env_flag_enabled("GIDS_FORCE_SYNC_READ"))
     {
+      printf("read_feature..\n");
       if (!logged_sync_mode)
       {
         printf("read_feature mode: sync baseline via read_feature_kernel\n");
@@ -283,6 +284,7 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
     }
     else
     {
+      printf("read_feature async..\n");
       s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
 
       // 计算总warp数
@@ -383,14 +385,27 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
         cudaFree(ref_tensor_ptr);
       }
 
-      clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
+      // clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
       {
         constexpr uint64_t clear_pages_block_size = 256;
         const uint64_t clear_pages_count = h_range->rdt.page_count;
         const uint64_t clear_pages_grid_size =
             (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
-        clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+        
+        print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+        // clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
       }
+      // const uint64_t clear_pages_count = h_range->rdt.page_count;
+
+      // clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
+      // {
+      //   constexpr uint64_t clear_pages_block_size = 256;
+      //   const uint64_t clear_pages_count = h_range->rdt.page_count;
+      //   const uint64_t clear_pages_grid_size =
+      //       (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
+      //   clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+      // }
+      
 
       if (d_warp_ctxs != nullptr)
         cudaFree(d_warp_ctxs);
