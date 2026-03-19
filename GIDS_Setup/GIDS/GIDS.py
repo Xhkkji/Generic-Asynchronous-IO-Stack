@@ -536,7 +536,9 @@ class GIDS():
                 #print(batch[0])
                 index_ptr = index.data_ptr()
                 return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device).contiguous()
-                self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+                # self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+                self.BAM_FS.read_feature_submit_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+                self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
                 self.GIDS_time += time.time() - GIDS_time_start
 
                 if type(batch) is tuple:

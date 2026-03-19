@@ -23,6 +23,8 @@
 #include <page_cache.h>
 #include <queue.h>
 
+#include <bam_iostack.cuh>
+
 //#define TYPE float
 struct GIDS_Controllers {
   const char *const ctrls_paths[6] = {"/dev/libnvm0","/dev/libnvm1","/dev/libnvm2","/dev/libnvm3","/dev/libnvm4","/dev/libnvm5"};
@@ -34,7 +36,6 @@ struct GIDS_Controllers {
   
   uint32_t cudaDevice = 0;
   uint32_t nvmNamespace = 1;
-  
   //member functions
   void init_GIDS_controllers(uint32_t num_ctrls, uint64_t q_depth, uint64_t num_q,  const std::vector<int>& ssd_list);
 
@@ -89,6 +90,9 @@ struct BAM_Feature_Store {
   std::vector<range_t<TYPE> *> vr;
   array_t<TYPE> *a;
   range_d_t<TYPE> *d_range;
+
+  // bam通用异步IO栈
+  BaM_IOStack iostack;
   //wb
 
   
@@ -102,6 +106,9 @@ struct BAM_Feature_Store {
   void read_feature_hetero(int num_iter, const std::vector<uint64_t>&  i_ptr_list, const std::vector<uint64_t>& i_index_ptr_list, const std::vector<uint64_t>&   num_index, int dim, int cache_dim, const std::vector<uint64_t>& key_off);
   void read_feature_merged(int num_iter, const std::vector<uint64_t>&  i_ptr_list, const std::vector<uint64_t>& i_index_ptr_list, const std::vector<uint64_t>&   num_index, int dim, int cache_dim);
   void read_feature_merged_hetero(int num_iter, const std::vector<uint64_t>&  i_ptr_list, const std::vector<uint64_t>& i_index_ptr_list, const std::vector<uint64_t>&   num_index, int dim, int cache_dim, const std::vector<uint64_t>& key_off);
+  void read_feature_submit_async(uint64_t tensor_ptr, uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
+  void read_feature_wait_async(uint64_t tensor_ptr, uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
+
 
   void cpu_backing_buffer(uint64_t dim, uint64_t len);
   void set_cpu_buffer(uint64_t idx_buffer, int num);  

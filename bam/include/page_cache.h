@@ -30,6 +30,7 @@
 #include <cuda_runtime.h> // CUDA运行时
 // #include <cuda_atomic.h>   // CUDA原子操作（如果使用）
 // #include <thrust/device_unordered_map.h>
+#include <bam_iostack.cuh>
 
 #define FREE 2
 
@@ -406,43 +407,44 @@ struct bam_ptr_tlb
 
 // 自加
 // 使用共享内存传递上下文
-struct s_ctx
-{
-    uint64_t row_index;  // 使得wait和submit统一，即令i和idx_idx统一
-    int idx_idx;  // 用于标识warp中线程的上下文，确保同一warp中线程访问同一ctx
-    // page, start, end, range_id是全局变量
-    uint32_t eq_mask;
-    int master;
-    uint32_t count;
-    uint64_t base_master;
-    uint32_t ctrl; // 控制器ID（submit选择的）
-    uint32_t queue;
+// 注释，在iostack中声明
+// struct s_ctx
+// {
+//     uint64_t row_index;  // 使得wait和submit统一，即令i和idx_idx统一
+//     int idx_idx;  // 用于标识warp中线程的上下文，确保同一warp中线程访问同一ctx
+//     // page, start, end, range_id是全局变量
+//     uint32_t eq_mask;
+//     int master;
+//     uint32_t count;
+//     uint64_t base_master;
+//     uint32_t ctrl; // 控制器ID（submit选择的）
+//     uint32_t queue;
 
-    // 修改：自加， 用于异步
-    uint16_t cid;
-    nvm_cmd_t cmd;
-    uint32_t page_trans;
+//     // 修改：自加， 用于异步
+//     uint16_t cid;
+//     nvm_cmd_t cmd;
+//     uint32_t page_trans;
 
-    // 成员函数acquire_page
-    uint64_t member_acquire_ctrl;
-    uint64_t member_acquire_b_page;
-    Controller *member_acquire_c;
-    QueuePair *member_acquire_cAddq;
+//     // 成员函数acquire_page
+//     uint64_t member_acquire_ctrl;
+//     uint64_t member_acquire_b_page;
+//     Controller *member_acquire_c;
+//     QueuePair *member_acquire_cAddq;
 
-    // 全局函数acquire_page
-    int64_t r;
-    uint64_t page;  // 需要，用于给bam指针的成员变量page赋值，用于引用计数的释放
-    uint64_t subindex;
-    uint64_t gaddr;
-    uint64_t observed_page_translation;
+//     // 全局函数acquire_page
+//     int64_t r;
+//     uint64_t page;  // 需要，用于给bam指针的成员变量page赋值，用于引用计数的释放
+//     uint64_t subindex;
+//     uint64_t gaddr;
+//     uint64_t observed_page_translation;
 
-    bool isHit;// 若该ctx对应的warp中32个线程全部命中，则为true，否则为false
-    // bool islaneHit[32] = {false};// 每个线程的命中情况
+//     bool isHit;// 若该ctx对应的warp中32个线程全部命中，则为true，否则为false
+//     // bool islaneHit[32] = {false};// 每个线程的命中情况
 
-    // 添加构造函数确保初始化
-    __device__ s_ctx() : r(-1), eq_mask(0), master(-1),
-                         count(0), base_master(0), observed_page_translation(0), isHit(false) {}
-};
+//     // 添加构造函数确保初始化
+//     __device__ s_ctx() : r(-1), eq_mask(0), master(-1),
+//                          count(0), base_master(0), observed_page_translation(0), isHit(false) {}
+// };
 
 template <typename T>
 struct bam_ptr
@@ -453,16 +455,16 @@ struct bam_ptr
     size_t end = 0;
     int64_t range_id = -1;
     T *addr = nullptr;
-    bool is_subRet = true; // 是否减少引用计数
+    bool is_subRef = true; // 是否减少引用计数
     // __shared__ s_ctx ctx;
     // s_ctx ctx;
 
     __forceinline__
         __host__ __device__
-        bam_ptr(array_d_t<T> *a, bool is_subRet = true) { init(a); this->is_subRet = is_subRet; }
+        bam_ptr(array_d_t<T> *a, bool is_subRef = true) { init(a); this->is_subRef = is_subRef; }
 
     __forceinline__
-        __host__ __device__ ~bam_ptr() { fini(is_subRet); }
+        __host__ __device__ ~bam_ptr() { fini(is_subRef); }
 
     __forceinline__
         __host__ __device__ void
@@ -476,10 +478,6 @@ struct bam_ptr
         // printf("fini page:%p, array:%p, start:%zu, end:%zu, range_id:%d, addr:%p\n", (void*)page, (void*)array, start, end, range_id, (void*)addr);
         if (page)
         {
-            if(threadIdx.x==0)
-            {
-                printf("release idx:%llu page:%p range_id:%d start:%zu\n",(unsigned long long) page, (void*)page, range_id, start);
-            }
             array->release_page(page, range_id, start);
             page = nullptr;
         }
@@ -487,7 +485,7 @@ struct bam_ptr
 
     __forceinline__
         __host__ __device__ void
-        fini(bool is_subRet)  // 是否减少引用计数
+        fini(bool is_subRef)  // 是否减少引用计数
     {
         // 目前page全是nil
 
@@ -497,7 +495,7 @@ struct bam_ptr
             // {
             //     printf("release idx:%llu page:%p range_id:%d start:%zu\n",(unsigned long long) page, (void*)page, range_id, start);
             // }
-            if(is_subRet)
+            if(is_subRef)
             {
                 array->release_page(page, range_id, start);
             }
@@ -603,11 +601,6 @@ struct bam_ptr
     {
         // printf("read_submit_asyn!\n");
         // printf("read: ctx=%p, idx_idx=%d\n", &ctx, ctx.idx_idx);
-        // if((i>=start) && (i<end))
-        // {
-        //     ctx.isHit = true;
-        //     return addr[i - start];
-        // }
         if ((i < start) || (i >= end))
         {
             // printf("before update_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
@@ -1522,7 +1515,7 @@ struct range_d_t
     // 重载，不减少引用计数的版本
     __forceinline__
         __device__ void
-        release_page(const size_t pg, const uint32_t count, const bool is_subRet) const;
+        release_page(const size_t pg, const uint32_t count, const bool is_subRef) const;
     __forceinline__
         __device__
             uint64_t
@@ -3200,26 +3193,22 @@ struct array_d_t
             ctx.master = master;
             ctx.count = count;
             ctx.base_master = base_master;
-            ctx.page = page;
-            ctx.subindex = subindex;
-            ctx.gaddr = gaddr;
+            // ctx.page = page;
+            // ctx.subindex = subindex;
+            // ctx.gaddr = gaddr;
 
+            page_ = &r_->pages[base_master];
+            start = r_->n_elems_per_page * page; // 直接更新页索引
+            end = start + r_->n_elems_per_page;  // * (page+1);
             if (ctx.isHit)
             {
                 // printf("isHit!\n");
-                page_ = &r_->pages[base_master];
                 ret = (void *)r_->get_cache_page_addr(base_master);  //将缓存槽位号转换为实际的内存地址
-
-                start = r_->n_elems_per_page * page; // 直接更新页索引
-                end = start + r_->n_elems_per_page;  // * (page+1);
             }
             else
             {
                 // printf("ret = 0\n");
-                page_ = &r_->pages[base_master];  // 用于引用计数，否则未命中时page_为nullptr，无法正确释放
                 ret = 0;
-                start = r_->n_elems_per_page * page; // 直接更新页索引
-                end = start + r_->n_elems_per_page;  // * (page+1);
             }
 
             __syncwarp(mask); // 同步
@@ -3273,9 +3262,9 @@ struct array_d_t
             coalesce_page_wait_async(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master, ctx);
             // printf("执行完成coalesce_page_wait_async\n");
             ctx.base_master = base_master;
-            ctx.page = page;
-            ctx.subindex = subindex;
-            ctx.gaddr = gaddr;
+            // ctx.page = page;
+            // ctx.subindex = subindex;
+            // ctx.gaddr = gaddr;
             page_ = &r_->pages[base_master];
 
             ret = (void *)r_->get_cache_page_addr(base_master);

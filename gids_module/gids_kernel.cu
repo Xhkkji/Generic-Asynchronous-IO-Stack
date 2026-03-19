@@ -143,8 +143,8 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
 
     // printf("wait idx_idx:%d\n", idx_idx);
     s_ctx& ctx = d_warp_ctxs[idx_idx];
-    // uint64_t row_index = index_ptr[idx_idx] + key_off;
-    uint64_t row_index = ctx.row_index;  // 重要，确保submit和wait使用同一个row_index
+    uint64_t row_index = index_ptr[idx_idx] + key_off;
+    // uint64_t row_index = ctx.row_index;  // (不)重要，确保submit和wait使用同一个row_index
     uint64_t tid = threadIdx.x % 32;
 
     // Materialize all rows in the wait stage. Miss rows complete the pending IO,

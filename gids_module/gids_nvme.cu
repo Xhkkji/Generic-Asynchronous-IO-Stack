@@ -17,6 +17,7 @@
 #include <bam_nvme.h>
 #include <pybind11/stl.h>
 #include "gids_kernel.cu"
+#include <bam_iostack.cuh>
 // #include <bafs_ptr.h>
 
 typedef std::chrono::high_resolution_clock Clock;
@@ -284,7 +285,7 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
     }
     else
     {
-      printf("read_feature async..\n");
+      // printf("read_feature async..\n");
       s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
 
       // 计算总warp数
@@ -386,26 +387,16 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
       }
 
       // clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
-      {
-        constexpr uint64_t clear_pages_block_size = 256;
-        const uint64_t clear_pages_count = h_range->rdt.page_count;
-        const uint64_t clear_pages_grid_size =
-            (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
-        
-        print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
-        // clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
-      }
-      // const uint64_t clear_pages_count = h_range->rdt.page_count;
-
-      // clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
       // {
-      //   constexpr uint64_t clear_pages_block_size = 256;
-      //   const uint64_t clear_pages_count = h_range->rdt.page_count;
-      //   const uint64_t clear_pages_grid_size =
-      //       (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
-      //   clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+        // constexpr uint64_t clear_pages_block_size = 256;
+        // const uint64_t clear_pages_count = h_range->rdt.page_count;
+        // const uint64_t clear_pages_grid_size =
+        //     (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
+        
+        // print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+        // clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
       // }
-      
+      // const uint64_t clear_pages_count = h_range->rdt.page_count;
 
       if (d_warp_ctxs != nullptr)
         cudaFree(d_warp_ctxs);
@@ -417,6 +408,102 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
                                                                     index_ptr, dim, num_index, cache_dim, CPU_buffer, seq_flag,
                                                                     d_cpu_access, key_off);
   }
+  cuda_err_chk(cudaDeviceSynchronize());
+  cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  auto t2 = Clock::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      t2 - t1); // Microsecond (as int)
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      t2 - t1); // Microsecond (as int)
+  const float ms_fractional =
+      static_cast<float>(us.count()) / 1000; // Milliseconds (as float)
+
+  kernel_time += ms_fractional;
+  total_access += num_index;
+
+  return;
+}
+
+template <typename TYPE>
+void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_ptr, uint64_t i_index_ptr,
+                                           int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
+{
+  // printf("read_feature..\n");
+  TYPE *tensor_ptr = (TYPE *)i_ptr;
+  int64_t *index_ptr = (int64_t *)i_index_ptr;
+
+  uint64_t b_size = blkSize;
+  uint64_t n_warp = b_size / 32;
+  uint64_t g_size = (num_index + n_warp - 1) / n_warp;
+
+  cuda_err_chk(cudaDeviceSynchronize());
+  auto t1 = Clock::now();
+
+  printf("BAM_Feature_Store::read_feature_submit_async..\n");
+  s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
+
+  // 计算总warp数
+  uint64_t warps_per_block = b_size / 32;
+  uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
+  // 分配设备内存
+  cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
+  cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
+  this->iostack.d_warp_ctxs = d_warp_ctxs;  // 暂且只处理一个iter的情况
+  // this->iostack.d_warp_ctxs_array_size[0] = static_cast<uint64_t>(total_warps);
+  read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                              index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  // 等待submit完成
+  cudaDeviceSynchronize();
+  dump_warp_ctxs("submit", d_warp_ctxs, total_warps);
+  
+  cuda_err_chk(cudaDeviceSynchronize());
+  cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  auto t2 = Clock::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      t2 - t1); // Microsecond (as int)
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      t2 - t1); // Microsecond (as int)
+  const float ms_fractional =
+      static_cast<float>(us.count()) / 1000; // Milliseconds (as float)
+
+  kernel_time += ms_fractional;
+  total_access += num_index;
+
+  return;
+}
+
+template <typename TYPE>
+void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i_index_ptr,
+                                           int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
+{
+  printf("BAM_Feature_Store::read_feature_wait_async..\n");
+  TYPE *tensor_ptr = (TYPE *)i_ptr;
+  int64_t *index_ptr = (int64_t *)i_index_ptr;
+
+  uint64_t b_size = blkSize;
+  uint64_t n_warp = b_size / 32;
+  uint64_t g_size = (num_index + n_warp - 1) / n_warp;
+
+  cuda_err_chk(cudaDeviceSynchronize());
+  auto t1 = Clock::now();
+
+  // printf("read_feature async..\n");
+  s_ctx *d_warp_ctxs = this->iostack.d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
+
+  // 计算总warp数
+  uint64_t warps_per_block = b_size / 32;
+  uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
+  // 保证对应关系
+  // assert(d_warp_ctxs != nullptr && this->iostack.d_warp_ctxs_array_size[0] == total_warps 
+  //   && "d_warp_ctxs is null or size mismatch");
+
+  read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                            index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  cuda_err_chk(cudaDeviceSynchronize());
+  dump_warp_ctxs("wait", d_warp_ctxs, total_warps);
+  if (d_warp_ctxs != nullptr)
+    cudaFree(d_warp_ctxs);
+    
   cuda_err_chk(cudaDeviceSynchronize());
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
   auto t2 = Clock::now();
@@ -832,8 +919,11 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def(py::init<>())
       .def("init_controllers", &BAM_Feature_Store<float>::init_controllers)
       .def("read_feature", &BAM_Feature_Store<float>::read_feature)
-      .def("read_feature_hetero", &BAM_Feature_Store<float>::read_feature_hetero)
+      // 异步函数绑定
+      .def("read_feature_submit_async", &BAM_Feature_Store<float>::read_feature_submit_async)
+      .def("read_feature_wait_async", &BAM_Feature_Store<float>::read_feature_wait_async)
 
+      .def("read_feature_hetero", &BAM_Feature_Store<float>::read_feature_hetero)
       .def("read_feature_merged_hetero", &BAM_Feature_Store<float>::read_feature_merged_hetero)
       .def("read_feature_merged", &BAM_Feature_Store<float>::read_feature_merged)
       .def("set_window_buffering", &BAM_Feature_Store<float>::set_window_buffering)
@@ -857,6 +947,9 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("init_controllers", &BAM_Feature_Store<int64_t>::init_controllers)
       .def("read_feature", &BAM_Feature_Store<int64_t>::read_feature)
       .def("read_feature_hetero", &BAM_Feature_Store<int64_t>::read_feature_hetero)
+      // 异步函数绑定
+      .def("read_feature_submit_async", &BAM_Feature_Store<int64_t>::read_feature_submit_async)
+      .def("read_feature_wait_async", &BAM_Feature_Store<int64_t>::read_feature_wait_async)
 
       .def("read_feature_merged", &BAM_Feature_Store<int64_t>::read_feature_merged)
       .def("read_feature_merged_hetero", &BAM_Feature_Store<int64_t>::read_feature_merged_hetero)
