@@ -9,7 +9,6 @@ sudo env \
   GIDS_ASYNC_DEBUG_DIMS="${GIDS_ASYNC_DEBUG_DIMS:-16}" \
   GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
   /home/xhk/miniconda3/envs/pytorch/bin/python homogenous_train_debug.py \
-  --stop_after_step 50 \
   --path /data/igb/ \
   --dataset_size medium \
   --epochs 1 \

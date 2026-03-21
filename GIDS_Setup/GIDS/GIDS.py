@@ -50,12 +50,51 @@ class _PrefetchingIter(object):
         self.graph_sampler = self.dataloader.graph_sampler
         self.GIDS_Loader=GIDS_Loader
         
+        # 自加
+        self.prefetch_queue = []
+        self.exhausted = False
+        # cur_it = self.dataloader_it
+        # self.pre_fetch_queue = self.GIDS_Loader.fetch_feature_submit(self.dataloader.dim, cur_it, 1, self.GIDS_Loader.gids_device)
+        self._submit_prefetch()
+        
+    def _submit_prefetch(self):
+        """提交一个预取任务"""
+        if self.exhausted:
+            return
+        
+        try:
+            # 从原始迭代器获取下一个batch信息（并移动指针）
+            next_batch = next(self.dataloader_it)
+            
+            # 提交异步读取
+            self.GIDS_Loader.fetch_feature_submit(
+                self.dataloader.dim, 
+                next_batch,  # 传入具体的batch信息，不是迭代器
+                1, 
+                self.GIDS_Loader.gids_device
+            )
+            self.prefetch_queue.append(next_batch)
+            
+        except StopIteration:
+            self.exhausted = True
+    
     def __iter__(self):
         return self
 
     def __next__(self):
-        cur_it = self.dataloader_it
-        batch = self.GIDS_Loader.fetch_feature(self.dataloader.dim, cur_it, self.GIDS_Loader.gids_device)
+        # 获取迭代器
+        # cur_it = self.dataloader_it
+        # batch = self.GIDS_Loader.fetch_feature(self.dataloader.dim, cur_it, self.GIDS_Loader.gids_device)
+        
+        # 自加
+        if not self.prefetch_queue and self.exhausted:
+            raise StopIteration
+        # 获取最早提交的任务
+        next_batch = self.prefetch_queue.pop(0)
+        batch = self.GIDS_Loader.fetch_feature_wait(self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
+        # self.GIDS_Loader.fetch_feature_submit(self.dataloader.dim, cur_it, 1, self.GIDS_Loader.gids_device)
+        self._submit_prefetch()  # 提交下一个预取任务
+        
         return batch
 
 
@@ -218,7 +257,14 @@ class GIDS():
         self.window_buffer = []
         self.wb_init = False
         self.wb_size = wb_size
-
+        
+        # 异步IO预提交数量
+        self.pre_submit_buffer_flag = True
+        self.pre_submit_buffer = []
+        self.pre_submit_buffer_isInit = False
+        self.pre_submit__buffer_size = 1
+        self.pre_fetch_list = []
+        
         # Cache Parameters
         self.page_size = page_size
         self.off = math.ceil(math.ceil(off / page_size)/num_ssd)
@@ -311,6 +357,11 @@ class GIDS():
             self.window_buffer.append(batch)
             #run window buffering for the current batch
             self.window_buffering(batch)
+    
+    def fill_pre_submit_buffer(self, it, num):
+        for i in range(num):
+            batch = next(it)
+            self.pre_submit_buffer.append(batch)
         
 
     # BW in GB/s, latency in micro seconds
@@ -319,6 +370,61 @@ class GIDS():
         self.required_accesses = accesses
         print("Number of required storage accesses: ", accesses)
 
+    # 异步提交(仅提交一个请求，多请求在prefetch函数中实现)
+    def fetch_feature_submit(self, dim, batch_info, pre_fetch_num, device):
+        GIDS_time_start = time.time()
+        
+        # if self.pre_submit_buffer_flag:
+        #     #Filling up the pre submit buffer
+        #     if(self.pre_submit_buffer_isInit == False):
+        #         self.fill_pre_submit_buffer(it, self.pre_submit__buffer_size)
+        #         self.pre_submit_buffer_isInit = True
+            
+        #print("Sample  start")
+        # batch_info 是具体的batch信息（如节点ID列表）
+        
+        #print("Sample  done")
+        # batch = self.pre_fetch_list[i]
+        #print("batch 0: ", batch.ndata['_ID'])
+        
+        index = batch_info[0].to(self.gids_device)
+        index_size = len(index)
+        #print(batch[0])
+        index_ptr = index.data_ptr()
+        # self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+        self.BAM_FS.read_feature_submit_async(index_ptr, index_size, dim, self.cache_dim, 0)
+        # self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+        self.GIDS_time += time.time() - GIDS_time_start
+        # print(f"Pre-submitted index.len{index_size}, index:{index[:10]}...")
+        return index_size
+    
+    # 异步获取
+    def fetch_feature_wait(self, dim, batch, device):
+        GIDS_time_start = time.time()
+            
+        #print("Sample  done")
+        
+        #print("batch 0: ", batch.ndata['_ID'])
+        index = batch[0].to(self.gids_device)
+        # print(f"GIDS get {index.shape[0]} nodes' features, len:{len(index)}")
+        
+        index_size = len(index)
+        #print(batch[0])
+        index_ptr = index.data_ptr()
+        return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device).contiguous()
+        # self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+        # self.BAM_FS.read_feature_submit_async(index_ptr, index_size, dim, self.cache_dim, 0)
+        self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+        self.GIDS_time += time.time() - GIDS_time_start
+
+        if type(batch) is tuple:
+            batch2 = (*batch, return_torch)
+            return batch2
+        else:
+            batch.append(return_torch)
+            return batch
+
+    
     #Fetching Data from the SSDs
     def fetch_feature(self, dim, it, device):
         GIDS_time_start = time.time()
@@ -537,7 +643,7 @@ class GIDS():
                 index_ptr = index.data_ptr()
                 return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device).contiguous()
                 # self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
-                self.BAM_FS.read_feature_submit_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+                self.BAM_FS.read_feature_submit_async(index_ptr, index_size, dim, self.cache_dim, 0)
                 self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
                 self.GIDS_time += time.time() - GIDS_time_start
 

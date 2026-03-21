@@ -295,7 +295,7 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
       cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
       cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
 
-      read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+      read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr,
                                                                  index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
       // 等待submit完成
       cudaDeviceSynchronize();
@@ -425,11 +425,11 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
 }
 
 template <typename TYPE>
-void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_ptr, uint64_t i_index_ptr,
+void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
   // printf("read_feature..\n");
-  TYPE *tensor_ptr = (TYPE *)i_ptr;
+  // TYPE *tensor_ptr = (TYPE *)i_ptr;
   int64_t *index_ptr = (int64_t *)i_index_ptr;
 
   uint64_t b_size = blkSize;
@@ -439,7 +439,7 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_ptr, uint64_t
   cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
-  printf("BAM_Feature_Store::read_feature_submit_async..\n");
+  // printf("BAM_Feature_Store::read_feature_submit_async..\n");
   s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
 
   // 计算总warp数
@@ -450,7 +450,8 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_ptr, uint64_t
   cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
   this->iostack.d_warp_ctxs = d_warp_ctxs;  // 暂且只处理一个iter的情况
   // this->iostack.d_warp_ctxs_array_size[0] = static_cast<uint64_t>(total_warps);
-  read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+  // 无需接受返回值，只提交IO请求即可
+  read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr,
                                                               index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
   // 等待submit完成
   cudaDeviceSynchronize();
@@ -476,7 +477,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
-  printf("BAM_Feature_Store::read_feature_wait_async..\n");
+  // printf("BAM_Feature_Store::read_feature_wait_async..\n");
   TYPE *tensor_ptr = (TYPE *)i_ptr;
   int64_t *index_ptr = (int64_t *)i_index_ptr;
 
@@ -658,7 +659,7 @@ void BAM_Feature_Store<TYPE>::read_feature_merged(int num_iter, const std::vecto
 
       // read_feature_kernel<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
       //                                                              index_ptr, dim, num_index[i], cache_dim, 0);
-      read_feature_kernel_submit_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr, tensor_ptr,
+      read_feature_kernel_submit_async<TYPE><<<g_size, b_size, 0, streams[i]>>>(a->d_array_ptr,
                                                                                 index_ptr, dim, num_index[i], cache_dim, 0, d_warp_ctxs);
 
       // printf("read_feature_submit_async before launched..\n");

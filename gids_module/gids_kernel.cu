@@ -37,7 +37,7 @@ __global__ void read_feature_kernel(array_d_t<T> *dr, T *out_tensor_ptr,
 }
 
 template <typename T = float>
-__global__ void read_feature_kernel_submit_async(array_d_t<T> *dr, T *out_tensor_ptr,
+__global__ void read_feature_kernel_submit_async(array_d_t<T> *dr,
                                     int64_t *index_ptr, int dim,
                                     int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs)
 {
@@ -88,25 +88,15 @@ __global__ void read_feature_kernel_submit_async(array_d_t<T> *dr, T *out_tensor
       // if(lane_id == 0) printf("temp:%f\n", temp);  // √
       // 是否命中是以warp为单位的，isHIt只在warp的主线程中赋值
       __syncwarp();
-      if (ctx.isHit)  // 若该warp命中，所有线程都命中，则直接写回
-      {
-        out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
-        // if(lane_id == 0) 
-        // {
-          // printf("submit命中,idx_idx:%d, lane_id:%d\n", idx_idx, lane_id);
-        // }
-        
-      }
-      else
-      {
-        out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = T(0); // 占位，后续wait时会覆盖
-        // if(lane_id == 0) 
-        // {
-        //   printf("submit未命中,idx_idx:%d, lane_id:%d\n", idx_idx, lane_id);
-        // }
-        
-        // ctx.isHit = true; // 重要
-      }
+      // 一切数据由wait函数获取，submit函数不进行数据写回，避免数据不一致问题
+      // if (ctx.isHit)  // 若该warp命中，所有线程都命中，则直接写回
+      // {
+      //   out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
+      // }
+      // else
+      // {
+      //   out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = T(0); // 占位，后续wait时会覆盖
+      // }
     }
     // __syncthreads();  // 自加
   }
