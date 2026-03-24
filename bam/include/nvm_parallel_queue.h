@@ -618,7 +618,7 @@ uint16_t sq_enqueue_async(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t
                 // uint32_t used_slots = (cur_tail - cur_head) & (sq->qs_minus_1);
                 // uint32_t free_slots = 1024 - used_slots;
                 // 重要输出===========================================
-                printf("队列编号sq->no:%u, cur_tail: %llu\n", sq->no, (unsigned long long) cur_tail);
+                // printf("队列编号sq->no:%u, cur_tail: %llu\n", sq->no, (unsigned long long) cur_tail);
                 // printf("cur_tail: %llu\n", (unsigned long long) cur_tail);
                 // printf("检查队列状态: 空闲槽位=%u\n", free_slots);
                 // 自加=============================================

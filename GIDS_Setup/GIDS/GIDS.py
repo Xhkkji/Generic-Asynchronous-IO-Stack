@@ -43,7 +43,8 @@ class CollateWrapper(object):
         return recursive_apply(batch, remove_parent_storage_columns, self.g)
 
 
-class _PrefetchingIter(object):
+import torch.profiler
+class _PrefetchingIter_async(object):
     def __init__(self, dataloader, dataloader_it, GIDS_Loader=None):
         self.dataloader_it = dataloader_it
         self.dataloader = dataloader
@@ -53,12 +54,46 @@ class _PrefetchingIter(object):
         # 自加
         self.prefetch_queue = []
         self.exhausted = False
-        # cur_it = self.dataloader_it
-        # self.pre_fetch_queue = self.GIDS_Loader.fetch_feature_submit(self.dataloader.dim, cur_it, 1, self.GIDS_Loader.gids_device)
+        # self.prefetch_depth = 3  # 需要调大cache的大小，保证IO请求能装得下
+        # for _ in range(2):
+        #     print(f"执行_submit_prefetch")
+        #     self._submit_prefetch()
         self._submit_prefetch()
         
+    # 用于记录性能数据的函数
+    def start_profiling(self, output_dir="./profiler_logs"):
+        """启动 profiler"""
+        print("=== start_profiling called ===")  # 添加
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            # schedule=torch.profiler.schedule(
+            #     wait=1,      # 预热1步
+            #     warmup=1,    # 预热1步
+            #     active=3,    # 记录3步
+            #     repeat=1     # 重复1次
+            # ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        self.profiler.__enter__()
+    
+    def stop_profiling(self):
+        """停止 profiler"""
+        print(f"=== stop_profiling called, profiler id: {id(self.profiler) if self.profiler else 'None'} ===")
+        if self.profiler:
+            self.profiler.__exit__(None, None, None)
+            # 打印统计
+            print(self.profiler.key_averages().table(
+                sort_by="cuda_time_total", 
+                row_limit=20
+            ))
+            
     def _submit_prefetch(self):
-        """提交一个预取任务"""
         if self.exhausted:
             return
         
@@ -73,6 +108,7 @@ class _PrefetchingIter(object):
                 1, 
                 self.GIDS_Loader.gids_device
             )
+            # print('submit: ', next_batch[0][:10])  # 打印提交的batch信息（如节点ID列表的前10个）
             self.prefetch_queue.append(next_batch)
             
         except StopIteration:
@@ -85,15 +121,67 @@ class _PrefetchingIter(object):
         # 获取迭代器
         # cur_it = self.dataloader_it
         # batch = self.GIDS_Loader.fetch_feature(self.dataloader.dim, cur_it, self.GIDS_Loader.gids_device)
-        
         # 自加
         if not self.prefetch_queue and self.exhausted:
             raise StopIteration
+        
         # 获取最早提交的任务
+        # print(f"Prefetch queue length: {len(self.prefetch_queue)}")  # 添加
         next_batch = self.prefetch_queue.pop(0)
         batch = self.GIDS_Loader.fetch_feature_wait(self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
         # self.GIDS_Loader.fetch_feature_submit(self.dataloader.dim, cur_it, 1, self.GIDS_Loader.gids_device)
         self._submit_prefetch()  # 提交下一个预取任务
+        
+        return batch
+
+class _PrefetchingIter(object):
+    def __init__(self, dataloader, dataloader_it, GIDS_Loader=None):
+        self.dataloader_it = dataloader_it
+        self.dataloader = dataloader
+        self.graph_sampler = self.dataloader.graph_sampler
+        self.GIDS_Loader=GIDS_Loader
+        
+    # 用于记录性能数据的函数
+    def start_profiling(self, output_dir="./profiler_logs"):
+        """启动 profiler"""
+        print("=== start_profiling called ===")  # 添加
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            # schedule=torch.profiler.schedule(
+            #     wait=1,      # 预热1步
+            #     warmup=1,    # 预热1步
+            #     active=3,    # 记录3步
+            #     repeat=1     # 重复1次
+            # ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        self.profiler.__enter__()
+    
+    def stop_profiling(self):
+        """停止 profiler"""
+        print(f"=== stop_profiling called, profiler id: {id(self.profiler) if self.profiler else 'None'} ===")
+        if self.profiler:
+            self.profiler.__exit__(None, None, None)
+            # 打印统计
+            print(self.profiler.key_averages().table(
+                sort_by="cuda_time_total", 
+                row_limit=20
+            ))
+            
+    
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # 获取迭代器
+        cur_it = self.dataloader_it
+        batch = self.GIDS_Loader.fetch_feature(self.dataloader.dim, cur_it, self.GIDS_Loader.gids_device)
         
         return batch
 
@@ -294,6 +382,8 @@ class GIDS():
         
         self.GIDS_time = 0.0
         self.WB_time = 0.0
+        self.GIDS_submit_time = 0.0
+        self.GIDS_wait_time = 0.0
 
 
 
@@ -394,7 +484,7 @@ class GIDS():
         # self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
         self.BAM_FS.read_feature_submit_async(index_ptr, index_size, dim, self.cache_dim, 0)
         # self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
-        self.GIDS_time += time.time() - GIDS_time_start
+        self.GIDS_submit_time += time.time() - GIDS_time_start
         # print(f"Pre-submitted index.len{index_size}, index:{index[:10]}...")
         return index_size
     
@@ -415,7 +505,7 @@ class GIDS():
         # self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
         # self.BAM_FS.read_feature_submit_async(index_ptr, index_size, dim, self.cache_dim, 0)
         self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
-        self.GIDS_time += time.time() - GIDS_time_start
+        self.GIDS_wait_time += time.time() - GIDS_time_start
 
         if type(batch) is tuple:
             batch2 = (*batch, return_torch)
@@ -642,9 +732,9 @@ class GIDS():
                 #print(batch[0])
                 index_ptr = index.data_ptr()
                 return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device).contiguous()
-                # self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
-                self.BAM_FS.read_feature_submit_async(index_ptr, index_size, dim, self.cache_dim, 0)
-                self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+                self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+                # self.BAM_FS.read_feature_submit_async(index_ptr, index_size, dim, self.cache_dim, 0)
+                # self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
                 self.GIDS_time += time.time() - GIDS_time_start
 
                 if type(batch) is tuple:
@@ -658,10 +748,14 @@ class GIDS():
 
     def print_stats(self):
         print("GIDS time: ", self.GIDS_time)
+        print("GIDS_submit_time: ", self.GIDS_submit_time)
+        print("GIDS_wait_time: ", self.GIDS_wait_time)
         wbtime = self.WB_time 
         print("WB time: ", wbtime)
         self.WB_time = 0.0
         self.GIDS_time = 0.0
+        self.GIDS_submit_time = 0.0
+        self.GIDS_wait_time = 0.0
         self.BAM_FS.print_stats()
         
         if (self.graph_GIDS != None):

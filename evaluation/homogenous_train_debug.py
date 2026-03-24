@@ -220,6 +220,9 @@ def track_acc_GIDS(g, args, device, label_array=None):
         lr=args.learning_rate, weight_decay=args.decay
         )
 
+    train_iter = iter(train_dataloader)
+    train_iter.start_profiling("./gids_profile")
+    print(f"start training...")
     warm_up_iter = 100
     # Setup is Done
     for epoch in tqdm.tqdm(range(args.epochs)):
@@ -235,7 +238,8 @@ def track_acc_GIDS(g, args, device, label_array=None):
         e2e_time_start = time.time()
         debug_signature = None
         debug_signature = configure_async_debug_env(args, 0, debug_signature)
-        for step, (input_nodes, seeds, blocks, ret) in tqdm.tqdm(enumerate(train_dataloader)):
+        # for step, (input_nodes, seeds, blocks, ret) in tqdm.tqdm(enumerate(train_dataloader)):
+        for step, (input_nodes, seeds, blocks, ret) in tqdm.tqdm(enumerate(train_iter)):    
             # print("step: ", step)
             
             if(step == warm_up_iter):
@@ -286,10 +290,11 @@ def track_acc_GIDS(g, args, device, label_array=None):
                 transfer_time = 0
                 train_time = 0
                 e2e_time = 0
+                
+    # 打印性能结果
+    train_iter.stop_profiling()
 
 
-       
-  
     # Evaluation
     print(f'Evaluation:')
     model.eval()

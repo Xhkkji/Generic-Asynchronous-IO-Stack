@@ -61,16 +61,20 @@ __global__ void read_feature_kernel_submit_async(array_d_t<T> *dr,
     bam_ptr<T> ptr(dr, false);
 
     uint64_t row_index = index_ptr[idx_idx] + key_off;
+    // if(lane_id == 0 && idx_idx < 30)
+    // {
+    //   printf("submit_async idx_idx:%d, row_index:%llu\n", idx_idx, (unsigned long long)row_index);
+    // }
     uint64_t tid = threadIdx.x % 32;
     // printf("submit idx_idx:%d\n", idx_idx);
     s_ctx& ctx = d_warp_ctxs[idx_idx];
-    if(lane_id == 0)
-    {
-      ctx.idx_idx = idx_idx;  // 重要，确保submit和wait使用同一个idx_idx
-      ctx.row_index = row_index;  // 重要，确保submit和wait使用同一个row_index
-      // printf("submit_async idx_idx:%d, row_index:%llu\n", ctx.idx_idx, (unsigned long long)ctx.row_index);
-    }
-    __threadfence();  // ⭐ 内存屏障：强制刷新所有内存操作到全局内存，确保其他线程能看到最新的ctx状态
+    // if(lane_id == 0)
+    // {
+    //   ctx.idx_idx = idx_idx;  // 重要，确保submit和wait使用同一个idx_idx
+    //   ctx.row_index = row_index;  // 重要，确保submit和wait使用同一个row_index
+    //   // printf("submit_async idx_idx:%d, row_index:%llu\n", ctx.idx_idx, (unsigned long long)ctx.row_index);
+    // }
+    // __threadfence();  // ⭐ 内存屏障：强制刷新所有内存操作到全局内存，确保其他线程能看到最新的ctx状态
     __syncwarp();
     
     // printf("warp %d 获取ctx地址:%p\n", idx_idx, &ctx);
@@ -83,20 +87,11 @@ __global__ void read_feature_kernel_submit_async(array_d_t<T> *dr,
       // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
       // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr.read(idx);
 
-      T temp = ptr.read_submit_async((row_index)*cache_dim + tid, ctx); // √
-      // T temp = T(0);
-      // if(lane_id == 0) printf("temp:%f\n", temp);  // √
+      ptr.read_submit_async((row_index)*cache_dim + tid, ctx); // √
       // 是否命中是以warp为单位的，isHIt只在warp的主线程中赋值
       __syncwarp();
       // 一切数据由wait函数获取，submit函数不进行数据写回，避免数据不一致问题
-      // if (ctx.isHit)  // 若该warp命中，所有线程都命中，则直接写回
-      // {
-      //   out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
-      // }
-      // else
-      // {
-      //   out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = T(0); // 占位，后续wait时会覆盖
-      // }
+
     }
     // __syncthreads();  // 自加
   }
@@ -136,6 +131,10 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
     uint64_t row_index = index_ptr[idx_idx] + key_off;
     // uint64_t row_index = ctx.row_index;  // (不)重要，确保submit和wait使用同一个row_index
     uint64_t tid = threadIdx.x % 32;
+    // if(lane_id == 0 && idx_idx < 30)
+    // {
+    //   printf("wait_async idx_idx:%d, row_index:%llu\n", idx_idx, (unsigned long long)row_index);
+    // }
 
     // Materialize all rows in the wait stage. Miss rows complete the pending IO,
     // while hit rows rebuild the cache pointer from the submit-time context and
@@ -325,6 +324,27 @@ __global__ void print_pages_ref_count_kernel(range_d_t<T> *d_range)
     // printf("page %llu ref count: %u\n", (unsigned long long)idx, d_range->pages[idx].state.load());
     printf("page %llu ref count: %u\n", (unsigned long long)idx, ref_count);
   }
+}
+
+template <typename T = float>
+__global__ void print_ctx_kernel(s_ctx *d_warp_ctx)
+{
+  int warp_id = (threadIdx.x >> 5) + blockIdx.x * (blockDim.x / 32);
+  // 每个warp的lane 0负责输出
+    if ((threadIdx.x & 31) == 0 && d_warp_ctx[warp_id].addr != 0) 
+    {
+        
+        printf("Warp %d: addr = %lu\n", warp_id, d_warp_ctx[warp_id].addr);
+    }
+}
+
+template <typename T = float>
+__global__ void print_ctx_kernel_for(s_ctx *d_warp_ctxs, int warp_num)
+{
+  // 只有一个线程，直接打印
+    for (uint64_t i = 0; i < warp_num; i++) {
+        printf("Warp %lu: addr = %lu\n", i, d_warp_ctxs[i].addr);
+    }
 }
 
 template <typename T = float>

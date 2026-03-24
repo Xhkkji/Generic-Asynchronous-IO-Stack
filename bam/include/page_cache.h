@@ -607,15 +607,7 @@ struct bam_ptr
             update_page_submit_async(i, ctx); // no page->state.fetch_or  √
             // printf("after update_page_submit_async..start:%d, end:%d\n", start, end);  // 没执行到
         }
-        if (ctx.isHit)
-        {
-            // 此时start和end已经被更新
-            return addr[i - start];
-        }
-        else
-        {
-            return T(0); // 占位，实际不使用
-        }
+        return T(0);  // 占位，实际不使用
     }
 
     __forceinline__
@@ -625,7 +617,12 @@ struct bam_ptr
     {
         // printf("read_wait_asyn!\n");
         update_page_wait_async(i, ctx); // no page->state.fetch_or  √
-                                   // 该函数被执行，说明缓存没有命中
+        // if(threadIdx.x == 0)
+        // {
+        //     ctx.addr = (uint64_t)addr;
+        //     printf("addr:%lu\n", addr);
+        // }
+
         return addr[i - start];    // 不是这里的问题
     }
 
@@ -4677,7 +4674,8 @@ inline __device__ void read_data(page_cache_d_t *pc, QueuePair *qp, const uint64
     // sq_dequeue(&qp->sq, sq_pos);
 
     // enqueue_second(page_cache_d_t* pc, QueuePair* qp, const uint64_t starting_lba, nvm_cmd_t* cmd, const uint16_t cid, const uint64_t pc_pos, const uint64_t pc_prev_head)
-    enqueue_second(pc, qp, starting_lba, &cmd, cid, pc_pos, pc_prev_head);
+    // printf("enqueue\n");
+    // enqueue_second(pc, qp, starting_lba, &cmd, cid, pc_pos, pc_prev_head);
 
     put_cid(&qp->sq, cid);
 }
@@ -4725,7 +4723,7 @@ inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, c
     // printf("cq队列弹出成功\n");// 执行到了
     // sq_dequeue(&qp->sq, sq_pos);
     // Keep async completion behavior aligned with the synchronous read path.
-    enqueue_second(pc, qp, starting_lba, &ctx.cmd, ctx.cid, pc_pos, pc_prev_head);
+    // enqueue_second(pc, qp, starting_lba, &ctx.cmd, ctx.cid, pc_pos, pc_prev_head);  // XXX导致轮询强制变成同步
 
     put_cid(&qp->sq, ctx.cid);
 }

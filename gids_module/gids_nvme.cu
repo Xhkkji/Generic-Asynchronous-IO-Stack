@@ -272,7 +272,7 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
     static bool logged_sync_mode = false;
     if (env_flag_enabled("GIDS_FORCE_SYNC_READ"))
     {
-      printf("read_feature..\n");
+      // printf("read_feature..\n");
       if (!logged_sync_mode)
       {
         printf("read_feature mode: sync baseline via read_feature_kernel\n");
@@ -502,6 +502,9 @@ void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i
                                                             index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
   cuda_err_chk(cudaDeviceSynchronize());
   dump_warp_ctxs("wait", d_warp_ctxs, total_warps);
+
+  // print_ctx_kernel_for<<<1, 1>>>(d_warp_ctxs, total_warps);
+
   if (d_warp_ctxs != nullptr)
     cudaFree(d_warp_ctxs);
     

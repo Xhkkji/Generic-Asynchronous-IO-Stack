@@ -10,7 +10,7 @@ sudo env \
   GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
   /home/xhk/miniconda3/envs/pytorch/bin/python homogenous_train_debug.py \
   --path /data/igb/ \
-  --dataset_size medium \
+  --dataset_size small \
   --epochs 1 \
   --num_heads 8 \
   --log_every 1000 \
@@ -23,8 +23,8 @@ sudo env \
   --model_type sage \
   --num_layers 3 \
   --fan_out '10,5,5' \
-  --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_medium_full.pt \
-  --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_medium.pt \
+  --modelpath /home/xhk/hyperion/GIDS/dataset/igb/pr_small.pt \
+  --pin_file /home/xhk/hyperion/GIDS/dataset/igb/pr_small.pt \
   --cache_size $((1024)) \
   --num_ssd 1 \
   --num_ele $((550*1000*1000*1024)) \

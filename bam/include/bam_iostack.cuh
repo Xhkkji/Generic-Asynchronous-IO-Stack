@@ -35,6 +35,7 @@ struct s_ctx
 {
     int idx_idx;  // warp在核函数中的全局索引
     uint64_t row_index;  // 使得wait和submit统一，即令i和idx_idx统一
+    uint64_t addr;
     
     // page, start, end, range_id是全局变量
     uint32_t eq_mask;

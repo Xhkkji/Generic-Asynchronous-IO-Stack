@@ -18,3 +18,5 @@ conda-env/
 AGENTS.md     
 build_local/
 build/
+gids_profile/
+gids_profile01/
