@@ -58,6 +58,7 @@ class _PrefetchingIter_async(object):
         # for _ in range(2):
         #     print(f"执行_submit_prefetch")
         #     self._submit_prefetch()
+        print("GIDS.py提交..")
         self._submit_prefetch()
         
     # 用于记录性能数据的函数
@@ -302,7 +303,7 @@ class GIDS_DGLDataLoader(torch.utils.data.DataLoader):
         # When using multiprocessing PyTorch sometimes set the number of PyTorch threads to 1
         # when spawning new Python threads.  This drastically slows down pinning features.
         num_threads = torch.get_num_threads() if self.num_workers > 0 else None
-        return _PrefetchingIter(
+        return _PrefetchingIter_async(
             self, super().__iter__(), GIDS_Loader=self.GIDS_Loader)
  
     def print_stats(self):

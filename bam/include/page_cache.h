@@ -549,9 +549,28 @@ struct bam_ptr
 
         // 此处调用全局的acquire_page版本
         // addr = (T *)array->acquire_page(i, page, start, end, range_id);
+        // if(threadIdx.x % 32 == 0)
+        // {
+        //     printf("取特征..ctx.idx_idx:%lu\n", ctx.idx_idx);
+        // }
+        
         addr = (T *)array->acquire_page_wait_async(i, page, start, end, range_id, ctx);
         return addr;
     }
+
+    __forceinline__
+        __host__ __device__ T *
+        update_page_single_thread_poll(const size_t i, s_ctx &ctx)
+    {
+        // printf("update_page_wait_async!\n"); // √
+        // fini(); // destructor
+
+        // 此处调用全局的acquire_page版本
+        // addr = (T *)array->acquire_page(i, page, start, end, range_id);
+        addr = (T *)array->acquire_page_single_thread_poll(i, page, start, end, range_id, ctx);
+        return addr;
+    }
+    
 
     __forceinline__
         __host__ __device__ void
@@ -622,9 +641,47 @@ struct bam_ptr
         //     ctx.addr = (uint64_t)addr;
         //     printf("addr:%lu\n", addr);
         // }
+        // if(threadIdx.x % 32 == 0)
+        // {
+        //     ctx.addr = addr;
+        // }
+        return addr[i - start];    // 不是这里的问题
+    }
+
+    __forceinline__
+        __host__ __device__
+            T
+            read_single_thread_poll(size_t i, s_ctx &ctx)
+    {
+        // printf("read_wait_asyn!\n");
+        update_page_single_thread_poll(i, ctx); // no page->state.fetch_or  √
+
+        // ctx.bam_page = this->page;
+        // ctx.array = this->array;
+        // ctx.start = this->start;
+        // ctx.end = this->end;
+        // ctx.range_id = this->range_id;
+        // ctx.addr = addr;
 
         return addr[i - start];    // 不是这里的问题
     }
+
+    __forceinline__
+        __host__ __device__
+            T
+            read_single_thread_get(size_t i, s_ctx &ctx)
+    {
+        // this->page = (data_page_t*)ctx.bam_page;
+        // this->array = (array_d_t<T>*)ctx.array;
+        // this->start = ctx.start;
+        // this->end = ctx.end;
+        // this->range_id = ctx.range_id;
+        // addr = (T*)ctx.addr;
+        update_page_wait_async(i, ctx); // no page->state.fetch_or  √
+
+        return addr[i - start];    // 不是这里的问题
+    }
+    
 
     __host__ __device__ T *memref(size_t i)
     {
@@ -2317,11 +2374,15 @@ __forceinline__
     do
     {
         st = (read_state >> (CNT_SHIFT + 1)) & 0x03;
-        if(ctx.isHit==false)
+        // if(ctx.isHit==false)
+        // {
+        //     st = NV_B;
+        // }
+        if(st == V_NB)
         {
-            st = NV_B;
+            printf("wait_st:%u\n", st);
         }
-        // printf("wait_st:%u\n", st);
+        
         switch (st)
         {
             // invalid
@@ -2379,7 +2440,7 @@ __forceinline__
             break;
             // valid
         case V_NB:
-            // printf("wait:V_NB\n");
+            printf("wait:V_NB, index:%lu\n", index);
 
             if (write && ((read_state & DIRTY) == 0))
                 pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
@@ -2400,7 +2461,7 @@ __forceinline__
 
             break;
         case NV_B:
-            // printf("wait:NV_B\n"); // √
+            // printf("wait:NV_B, index:%lu\n", index); // √
             ctx.isHit = true;
             // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
 
@@ -2929,11 +2990,39 @@ struct array_d_t
         {
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
+            // printf("wait tid:%lu, page:%lu, queue:%d\n", lane, page, queue);
             base = r_->acquire_page_wait_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
             base_master = base;
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
         }
         base_master = __shfl_sync(eq_mask, base_master, master);
+    }
+
+    // 单线程轮询
+    __forceinline__
+        __device__ void
+    single_thread_wait(const uint32_t lane, const int64_t r, const uint64_t page, const uint64_t gaddr, const bool write,
+                                 int master, uint32_t count, uint64_t &base_master, s_ctx &ctx) const
+    {
+        auto r_ = d_ranges + r;
+
+        page_cache_d_t *pc = &(r_->cache);
+        uint32_t ctrl = ctx.ctrl; // pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
+        uint32_t queue = ctx.queue;  // 重要，需要与submit的队列号统一
+
+        // printf("wait queue:%d\n", queue);
+
+        // uint32_t dirty = __any_sync(eq_mask, write);
+        uint32_t dirty = 0;
+
+        uint64_t base;
+
+        // std::pair<uint64_t, bool> base_memcpyflag;
+        // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
+        // printf("single poll tid:%lu, page:%lu, queue:%d\n", lane, page, queue);
+        base = r_->acquire_page_wait_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
+        base_master = base;
+        //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
     }
 
     __forceinline__
@@ -3275,6 +3364,51 @@ struct array_d_t
         // {
         //     printf("submit: i:%zu, ret:%p, idx_idx:%d, r:%ld, isHit:%d\n", i, (void *)ret, ctx.idx_idx, r, ctx.isHit);
         // }
+        return ret;
+    }
+
+    __forceinline__
+        __device__ void *
+        acquire_page_single_thread_poll(const size_t i, data_page_t *&page_, size_t &start, size_t &end, int64_t &r, s_ctx &ctx) const
+    {
+        // 全局高级接口异步版本
+        // printf("acquire_page_wait_async:global\n"); // √ √
+        // uint32_t lane = lane_id();
+        r = find_range(i);
+        // r = ctx.r;
+
+        uint32_t lane = lane_id();
+        auto r_ = d_ranges + r;
+        // 可执行到
+        void *ret = nullptr;
+        page_ = nullptr;
+        if (r != -1)
+        {
+            int master = ctx.master;
+            uint64_t base_master = ctx.base_master;
+            uint32_t count = ctx.count;
+
+            uint64_t page = r_->get_page(i);
+            uint64_t subindex = r_->get_subindex(i);
+            uint64_t gaddr = r_->get_global_address(page);
+            // uint64_t page = ctx.page;
+            // uint64_t subindex = ctx.subindex;
+            // uint64_t gaddr = ctx.gaddr;
+
+            // printf("执行coalesce_page_wait_async\n");  // 没问题
+            single_thread_wait(lane, r, page, gaddr, false, master, count, base_master, ctx);
+            // printf("执行完成coalesce_page_wait_async\n");
+            ctx.base_master = base_master;
+            // ctx.page = page;
+            // ctx.subindex = subindex;
+            // ctx.gaddr = gaddr;
+            page_ = &r_->pages[base_master];
+
+            ret = (void *)r_->get_cache_page_addr(base_master);
+            start = r_->n_elems_per_page * page;
+            end = start + r_->n_elems_per_page; // * (page+1);
+        }
+
         return ret;
     }
 

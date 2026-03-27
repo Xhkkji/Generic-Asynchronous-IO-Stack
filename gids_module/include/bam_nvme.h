@@ -92,7 +92,7 @@ struct BAM_Feature_Store {
   range_d_t<TYPE> *d_range;
 
   // bam通用异步IO栈
-  BaM_IOStack iostack;
+  BaM_IOStack<TYPE> iostack;
   //wb
 
   

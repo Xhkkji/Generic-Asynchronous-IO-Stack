@@ -141,11 +141,95 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
     // overwrite any speculative submit-stage values.
     for (; tid < dim; tid += 32)
     {
+      // if(tid == 0)
+      // printf("wait (row_index)*cache_dim + tid:%d\n", (row_index)*cache_dim + tid);
       T temp = ptr.read_wait_async((row_index)*cache_dim + tid, ctx);
       out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
     }
   }
 }
+
+template <typename T = float>
+__global__ void read_feature_kernel_single_thread_poll(array_d_t<T> *dr, T *out_tensor_ptr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs)
+{
+  uint64_t bid = blockIdx.x;
+  int num_warps = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  // int idx_idx = bid * num_warps + warp_id;
+
+  // 逐线程调用bam轮询
+  uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (global_tid < num_idx)
+  {
+    // printf("global_tid:%d\n", global_tid);
+    bam_ptr<T> ptr(dr, false);
+
+    // printf("wait idx_idx:%d\n", idx_idx);
+    s_ctx& ctx = d_warp_ctxs[global_tid];
+    uint64_t row_index = index_ptr[global_tid] + key_off;
+    // uint64_t row_index = ctx.row_index;  // (不)重要，确保submit和wait使用同一个row_index
+
+    uint64_t tid = 0;
+    for (; tid < dim; tid++)
+    {
+      // if(tid == 0)
+      // printf("single poll (row_index)*cache_dim + tid:%d\n", (row_index)*cache_dim + tid);
+      if(tid % 32 == 0)
+      {
+        T temp = ptr.read_single_thread_poll((row_index)*cache_dim + tid, ctx);
+      }
+    }
+    
+  }
+}
+
+template <typename T = float>
+__global__ void read_feature_kernel_get_feature(array_d_t<T> *dr, T *out_tensor_ptr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs)
+{
+  uint64_t bid = blockIdx.x;
+  int num_warps = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  int idx_idx = bid * num_warps + warp_id;
+
+  // 自加
+  // uint32_t lane_id = threadIdx.x % 32;
+  int lane_id = threadIdx.x % 32;
+
+  if (idx_idx < num_idx)
+  {
+    bam_ptr<T> ptr(dr, true);
+
+    // printf("wait idx_idx:%d\n", idx_idx);
+    s_ctx& ctx = d_warp_ctxs[idx_idx];
+    uint64_t row_index = index_ptr[idx_idx] + key_off;
+    // uint64_t row_index = ctx.row_index;  // (不)重要，确保submit和wait使用同一个row_index
+    uint64_t tid = threadIdx.x % 32;
+    // if(lane_id == 0 && idx_idx < 30)
+    // {
+    //   printf("wait_async idx_idx:%d, row_index:%llu\n", idx_idx, (unsigned long long)row_index);
+    // }
+
+    // Materialize all rows in the wait stage. Miss rows complete the pending IO,
+    // while hit rows rebuild the cache pointer from the submit-time context and
+    // overwrite any speculative submit-stage values.
+    if(lane_id == 0)
+    {
+      printf("get_feature..");
+    }
+    
+    for (; tid < dim; tid += 32)
+    {
+      T temp = ptr.read_single_thread_get((row_index)*cache_dim + tid, ctx);
+      out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
+    }
+  }
+}
+
+
 
 template <typename T = float>
 __global__ void read_feature_kernel_with_cpu_backing_memory(array_d_t<T> *dr, range_d_t<T> *range, T *out_tensor_ptr,
@@ -320,6 +404,7 @@ __global__ void print_pages_ref_count_kernel(range_d_t<T> *d_range)
   const uint64_t idx = threadIdx.x + static_cast<uint64_t>(blockIdx.x) * blockDim.x;
   uint32_t ref_count = d_range->pages[idx].ref_count.load(simt::memory_order_acquire);
   if (idx < d_range->page_count && ref_count != 0)
+  // if (idx < d_range->page_count)
   {
     // printf("page %llu ref count: %u\n", (unsigned long long)idx, d_range->pages[idx].state.load());
     printf("page %llu ref count: %u\n", (unsigned long long)idx, ref_count);
@@ -338,7 +423,7 @@ __global__ void print_ctx_kernel(s_ctx *d_warp_ctx)
     }
 }
 
-template <typename T = float>
+
 __global__ void print_ctx_kernel_for(s_ctx *d_warp_ctxs, int warp_num)
 {
   // 只有一个线程，直接打印

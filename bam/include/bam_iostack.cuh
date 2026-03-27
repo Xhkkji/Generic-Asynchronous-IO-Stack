@@ -31,11 +31,19 @@
 // #include <cuda_atomic.h>   // CUDA原子操作（如果使用）
 
 // 使用共享内存传递上下文
+
 struct s_ctx
 {
     int idx_idx;  // warp在核函数中的全局索引
     uint64_t row_index;  // 使得wait和submit统一，即令i和idx_idx统一
-    uint64_t addr;
+
+    // 保存bam指针的参数
+    void *bam_page = nullptr;
+    void *array = nullptr;
+    size_t start = 0;
+    size_t end = 0;
+    int64_t range_id = -1;
+    void* addr;
     
     // page, start, end, range_id是全局变量
     uint32_t eq_mask;
@@ -67,10 +75,11 @@ struct s_ctx
     // bool islaneHit[32] = {false};// 每个线程的命中情况
 
     // 添加构造函数确保初始化
-    __device__ s_ctx() : r(-1), eq_mask(0), master(-1),
+    __device__ s_ctx() : addr(0), r(-1), eq_mask(0), master(-1),
                          count(0), base_master(0), observed_page_translation(0), isHit(false) {}
 };
 
+template <typename T>
 struct BaM_IOStack 
 {
     // 预先提交几个iter的请求，决定了d_warp_ctxs_array的元素个数
@@ -92,7 +101,6 @@ struct BaM_IOStack
 
   // void read_feature_submit_async(uint64_t tensor_ptr, uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
   // void read_feature_wait_async(uint64_t tensor_ptr, uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
-
 
 };
 

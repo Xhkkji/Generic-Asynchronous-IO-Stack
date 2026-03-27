@@ -387,7 +387,7 @@ if __name__ == '__main__':
     parser.add_argument('--fan_out', type=str, default='25,10')
     parser.add_argument('--batch_size', type=int, default=1024)
     parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--hidden_channels', type=int, default=256)
+    parser.add_argument('--hidden_channels', type=int, default=256)  # 默认256
     parser.add_argument('--learning_rate', type=float, default=0.03)  # 0.01
     parser.add_argument('--decay', type=float, default=0.001)
     parser.add_argument('--epochs', type=int, default=3)
