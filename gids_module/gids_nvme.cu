@@ -428,7 +428,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
-  printf("BAM_Feature_Store::read_feature_submit_async..\n");
+  // printf("BAM_Feature_Store::read_feature_submit_async..\n");
   // TYPE *tensor_ptr = (TYPE *)i_ptr;
   int64_t *index_ptr = (int64_t *)i_index_ptr;
 
@@ -441,12 +441,13 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
 
   s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
 
-  // 计算总warp数
+  // 每个样本保留 32 份 ctx，供单线程轮询后按 warp 回填特征使用。
   uint64_t warps_per_block = b_size / 32;
-  uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
+  uint64_t total_warps = g_size * warps_per_block;
+  uint64_t total_ctxs = total_warps * 32;
   // 分配设备内存
-  cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
-  cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
+  cudaMalloc(&d_warp_ctxs, total_ctxs * sizeof(s_ctx));
+  cudaMemset(d_warp_ctxs, 0, total_ctxs * sizeof(s_ctx));
   this->iostack.d_warp_ctxs = d_warp_ctxs;  // 暂且只处理一个iter的情况
   // this->iostack.d_warp_ctxs_array_size[0] = static_cast<uint64_t>(total_warps);
   // 无需接受返回值，只提交IO请求即可
@@ -454,7 +455,7 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
                                                               index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
   // 等待submit完成
   cudaDeviceSynchronize();
-  dump_warp_ctxs("submit", d_warp_ctxs, total_warps);
+  dump_warp_ctxs("submit", d_warp_ctxs, total_ctxs);
   
   cuda_err_chk(cudaDeviceSynchronize());
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
@@ -476,7 +477,7 @@ template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
-  printf("BAM_Feature_Store::read_feature_wait_async..\n");
+  // printf("BAM_Feature_Store::read_feature_wait_async..\n");
   TYPE *tensor_ptr = (TYPE *)i_ptr;
   int64_t *index_ptr = (int64_t *)i_index_ptr;
 
@@ -490,35 +491,39 @@ void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i
   // printf("read_feature async..\n");
   s_ctx *d_warp_ctxs = this->iostack.d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
 
-  // 计算总warp数
+  // 每个样本保留 32 份 ctx，供单线程轮询后按 warp 回填特征使用。
   uint64_t warps_per_block = b_size / 32;
-  uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
+  uint64_t total_warps = g_size * warps_per_block;
+  uint64_t total_ctxs = total_warps * 32;
   // 保证对应关系
   // assert(d_warp_ctxs != nullptr && this->iostack.d_warp_ctxs_array_size[0] == total_warps 
   //   && "d_warp_ctxs is null or size mismatch");
-
+  
+  // read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+  //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  // uint64_t poll_g_size = (num_index + n_warp - 1) / n_warp;
+  uint64_t poll_g_size = (num_index + b_size - 1) / b_size;
+  // read_feature_kernel_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+  //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  read_feature_kernel_single_page_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                                                     index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  cudaDeviceSynchronize();
+  // printf("单线程轮询已完成..\n");      
+                                               
+  read_feature_kernel_get_feature_light<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                                  index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  
   // constexpr uint64_t clear_pages_block_size = 256;
   // const uint64_t clear_pages_count = h_range->rdt.page_count;
   // const uint64_t clear_pages_grid_size =
   //     (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
   // print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
-  // print_ctx_kernel_for<<<1, 1>>>(d_warp_ctxs, total_warps);  
+  // print_ctx_kernel_for<<<1, 1>>>(d_warp_ctxs, total_warps);
 
-  // read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-  //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
-  uint64_t poll_g_size = ceil(total_warps / b_size);
-  printf("执行单线程轮询..\n"); 
-  read_feature_kernel_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-                                                            index_ptr, dim, total_warps, cache_dim, 0, d_warp_ctxs);
-  cudaDeviceSynchronize();
-  printf("单线程轮询已完成..\n");      
-                                               
-  read_feature_kernel_get_feature<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-                                                            index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
   
   cuda_err_chk(cudaDeviceSynchronize());
   
-  dump_warp_ctxs("wait", d_warp_ctxs, total_warps);
+  dump_warp_ctxs("wait", d_warp_ctxs, total_ctxs);
 
   if (d_warp_ctxs != nullptr)
     cudaFree(d_warp_ctxs);

@@ -67,7 +67,7 @@ __global__ void read_feature_kernel_submit_async(array_d_t<T> *dr,
     // }
     uint64_t tid = threadIdx.x % 32;
     // printf("submit idx_idx:%d\n", idx_idx);
-    s_ctx& ctx = d_warp_ctxs[idx_idx];
+    // s_ctx& ctx = d_warp_ctxs[idx_idx];
     // if(lane_id == 0)
     // {
     //   ctx.idx_idx = idx_idx;  // 重要，确保submit和wait使用同一个idx_idx
@@ -80,8 +80,10 @@ __global__ void read_feature_kernel_submit_async(array_d_t<T> *dr,
     // printf("warp %d 获取ctx地址:%p\n", idx_idx, &ctx);
     // printf("获取ctx完成..\n");
     // 每个线程内，分别取出自己对应负责的特征
+    int loop_idx = 0;
     for (; tid < dim; tid += 32)
     {
+      s_ctx& ctx = d_warp_ctxs[idx_idx * 32 + loop_idx++];
       // T temp = ptr[(row_index) * cache_dim + tid];
       const size_t idx = (row_index)*cache_dim + tid;
       // out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = ptr[idx];
@@ -107,10 +109,6 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
   int warp_id = threadIdx.x / 32;
   int idx_idx = bid * num_warps + warp_id;
 
-  // 自加
-  // uint32_t lane_id = threadIdx.x % 32;
-  int lane_id = threadIdx.x % 32;
-
   // if(lane_id == 0)
   // {
   //   // printf("d_warp:%p\n", d_warp_ctxs);
@@ -122,19 +120,13 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
   //   printf("d_warp_ctxs:%p\n", d_warp_ctxs);
   // }
 
+  int loop_idx = 0;
   if (idx_idx < num_idx)
   {
     bam_ptr<T> ptr(dr, true);
 
-    // printf("wait idx_idx:%d\n", idx_idx);
-    s_ctx& ctx = d_warp_ctxs[idx_idx];
     uint64_t row_index = index_ptr[idx_idx] + key_off;
-    // uint64_t row_index = ctx.row_index;  // (不)重要，确保submit和wait使用同一个row_index
     uint64_t tid = threadIdx.x % 32;
-    // if(lane_id == 0 && idx_idx < 30)
-    // {
-    //   printf("wait_async idx_idx:%d, row_index:%llu\n", idx_idx, (unsigned long long)row_index);
-    // }
 
     // Materialize all rows in the wait stage. Miss rows complete the pending IO,
     // while hit rows rebuild the cache pointer from the submit-time context and
@@ -143,6 +135,7 @@ __global__ void read_feature_kernel_wait_async(array_d_t<T> *dr, T *out_tensor_p
     {
       // if(tid == 0)
       // printf("wait (row_index)*cache_dim + tid:%d\n", (row_index)*cache_dim + tid);
+      s_ctx& ctx = d_warp_ctxs[idx_idx * 32 + loop_idx++];
       T temp = ptr.read_wait_async((row_index)*cache_dim + tid, ctx);
       out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
     }
@@ -157,34 +150,72 @@ __global__ void read_feature_kernel_single_thread_poll(array_d_t<T> *dr, T *out_
   uint64_t bid = blockIdx.x;
   int num_warps = blockDim.x / 32;
   int warp_id = threadIdx.x / 32;
-  // int idx_idx = bid * num_warps + warp_id;
+  int idx_idx = bid * num_warps + warp_id;
+  int lane_id = threadIdx.x % 32;
 
-  // 逐线程调用bam轮询
-  uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (global_tid < num_idx)
+  // 以 warp 为粒度处理一个结点，warp 内每个线程负责一个 32 维 chunk 的轮询。
+  if (idx_idx < num_idx)
   {
-    // printf("global_tid:%d\n", global_tid);
     bam_ptr<T> ptr(dr, false);
+    uint64_t row_index = index_ptr[idx_idx] + key_off;
+    int num_chunks = (dim + 31) / 32;
+    int chunk_idx = lane_id;
 
-    // printf("wait idx_idx:%d\n", idx_idx);
-    s_ctx& ctx = d_warp_ctxs[global_tid];
-    uint64_t row_index = index_ptr[global_tid] + key_off;
-    // uint64_t row_index = ctx.row_index;  // (不)重要，确保submit和wait使用同一个row_index
-
-    uint64_t tid = 0;
-    for (; tid < dim; tid++)
+    for (; chunk_idx < num_chunks; chunk_idx += 32)
     {
-      // if(tid == 0)
-      // printf("single poll (row_index)*cache_dim + tid:%d\n", (row_index)*cache_dim + tid);
-      if(tid % 32 == 0)
+      const uint64_t submit_idx = (row_index)*cache_dim + static_cast<uint64_t>(chunk_idx) * 32;
+      s_ctx& ctx = d_warp_ctxs[idx_idx * 32 + chunk_idx];
+      int64_t range_idx = dr->find_range(submit_idx);
+      if (range_idx == -1)
       {
-        T temp = ptr.read_single_thread_poll((row_index)*cache_dim + tid, ctx);
+        continue;
+      }
+
+      auto range = dr->d_ranges + range_idx;
+      const uint64_t page = range->get_page(submit_idx);
+      bool is_page_owner = (chunk_idx == 0);
+      if (!is_page_owner)
+      {
+        const uint64_t prev_submit_idx = submit_idx - 32;
+        const int64_t prev_range_idx = dr->find_range(prev_submit_idx);
+        if (prev_range_idx == -1)
+        {
+          is_page_owner = true;
+        }
+        else
+        {
+          auto prev_range = dr->d_ranges + prev_range_idx;
+          const uint64_t prev_page = prev_range->get_page(prev_submit_idx);
+          is_page_owner = (prev_range_idx != range_idx) || (prev_page != page);
+        }
+      }
+
+      if (is_page_owner)
+      {
+        ptr.read_single_thread_poll(submit_idx, ctx);
       }
     }
-    
   }
 }
+// 假设一个结点的所有特征都在同一页上
+template <typename T = float>
+__global__ void read_feature_kernel_single_page_single_thread_poll(array_d_t<T> *dr, T *out_tensor_ptr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs)
+{
+  uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
 
+  // 单页假设版：一个线程处理一个结点的一次轮询，不再占用同一个 warp 的其他线程。
+  if (global_tid < num_idx)
+  {
+    bam_ptr<T> ptr(dr, false);
+    uint64_t row_index = index_ptr[global_tid] + key_off;
+    const uint64_t submit_idx = (row_index) * cache_dim;
+    s_ctx& ctx = d_warp_ctxs[global_tid * 32];
+    ptr.read_single_thread_poll(submit_idx, ctx);
+  }
+}
+// 单独获取，走状态机
 template <typename T = float>
 __global__ void read_feature_kernel_get_feature(array_d_t<T> *dr, T *out_tensor_ptr,
                                     int64_t *index_ptr, int dim,
@@ -195,35 +226,50 @@ __global__ void read_feature_kernel_get_feature(array_d_t<T> *dr, T *out_tensor_
   int warp_id = threadIdx.x / 32;
   int idx_idx = bid * num_warps + warp_id;
 
-  // 自加
-  // uint32_t lane_id = threadIdx.x % 32;
-  int lane_id = threadIdx.x % 32;
+  int loop_idx = 0;
 
   if (idx_idx < num_idx)
   {
     bam_ptr<T> ptr(dr, true);
 
-    // printf("wait idx_idx:%d\n", idx_idx);
-    s_ctx& ctx = d_warp_ctxs[idx_idx];
     uint64_t row_index = index_ptr[idx_idx] + key_off;
-    // uint64_t row_index = ctx.row_index;  // (不)重要，确保submit和wait使用同一个row_index
     uint64_t tid = threadIdx.x % 32;
-    // if(lane_id == 0 && idx_idx < 30)
-    // {
-    //   printf("wait_async idx_idx:%d, row_index:%llu\n", idx_idx, (unsigned long long)row_index);
-    // }
 
     // Materialize all rows in the wait stage. Miss rows complete the pending IO,
     // while hit rows rebuild the cache pointer from the submit-time context and
     // overwrite any speculative submit-stage values.
-    if(lane_id == 0)
-    {
-      printf("get_feature..");
-    }
-    
     for (; tid < dim; tid += 32)
     {
+      s_ctx& ctx = d_warp_ctxs[idx_idx * 32 + loop_idx++];
       T temp = ptr.read_single_thread_get((row_index)*cache_dim + tid, ctx);
+      out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
+    }
+  }
+}
+// 轻量化单独获取，直接从cache槽位返回数据，不走状态机，不区分命中和未命中，适用于已经轮询完成的行
+template <typename T = float>
+__global__ void read_feature_kernel_get_feature_light(array_d_t<T> *dr, T *out_tensor_ptr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs)
+{
+  uint64_t bid = blockIdx.x;
+  int num_warps = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  int idx_idx = bid * num_warps + warp_id;
+
+  int loop_idx = 0;
+
+  if (idx_idx < num_idx)
+  {
+    bam_ptr<T> ptr(dr, true);
+
+    uint64_t row_index = index_ptr[idx_idx] + key_off;
+    uint64_t tid = threadIdx.x % 32;
+
+    for (; tid < dim; tid += 32)
+    {
+      s_ctx& ctx = d_warp_ctxs[idx_idx * 32 + loop_idx++];
+      T temp = ptr.read_post_poll_light((row_index)*cache_dim + tid, ctx);
       out_tensor_ptr[(bid * num_warps + warp_id) * dim + tid] = temp;
     }
   }
@@ -428,7 +474,7 @@ __global__ void print_ctx_kernel_for(s_ctx *d_warp_ctxs, int warp_num)
 {
   // 只有一个线程，直接打印
     for (uint64_t i = 0; i < warp_num; i++) {
-        printf("Warp %lu: addr = %lu\n", i, d_warp_ctxs[i].addr);
+        printf("Warp %lu: addr = %lu, page:%lu\n", i / 32, d_warp_ctxs[i].addr, d_warp_ctxs[i].page);
     }
 }
 

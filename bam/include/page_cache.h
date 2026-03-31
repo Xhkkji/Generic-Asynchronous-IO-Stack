@@ -82,6 +82,7 @@ typedef struct __align__(32)
 {
     simt::atomic<uint32_t, simt::thread_scope_device> state; //
     simt::atomic<uint32_t, simt::thread_scope_device> ref_count;  // 专门用于统计引用计数
+    simt::atomic<uint32_t, simt::thread_scope_device> polling_flag;
     uint32_t offset;
 
     simt::atomic<uint8_t, simt::thread_scope_device> prefetch_count;
@@ -570,6 +571,14 @@ struct bam_ptr
         addr = (T *)array->acquire_page_single_thread_poll(i, page, start, end, range_id, ctx);
         return addr;
     }
+
+    __forceinline__
+        __host__ __device__ T *
+        update_page_post_poll_light(const size_t i, s_ctx &ctx)
+    {
+        addr = (T *)array->acquire_page_post_poll_light(i, page, start, end, range_id, ctx);
+        return addr;
+    }
     
 
     __forceinline__
@@ -680,6 +689,18 @@ struct bam_ptr
         update_page_wait_async(i, ctx); // no page->state.fetch_or  √
 
         return addr[i - start];    // 不是这里的问题
+    }
+
+    __forceinline__
+        __host__ __device__
+            T
+            read_post_poll_light(size_t i, s_ctx &ctx)
+    {
+        if ((i < start) || (i >= end))
+        {
+            update_page_post_poll_light(i, ctx);
+        }
+        return addr[i - start];
     }
     
 
@@ -2169,10 +2190,13 @@ __forceinline__
         case NV_NB:
             // 该线程未命中，整个warp标记为未命中
             ctx.isHit = false; // 传回未命中的信息，与V_NB作区分
-            // printf("submit:NV_NB\n");
+            // printf("submit:NV_NB, pageindex:%lu\n", index);
             st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire); // 状态设置为busy
             if ((st_new & BUSY) == 0)
             {
+                // A fresh miss starts a new submit/poll cycle for this page.
+                pages[index].polling_flag.store(0, simt::memory_order_release);
+
                 // Prevent other warps from consuming a stale slot id while this miss is being assigned.
                 pages[index].offset = ASYNC_PAGE_TRANS_PENDING;
                 __threadfence();
@@ -2247,7 +2271,7 @@ __forceinline__
             break;
             // valid
         case V_NB:
-            // printf("submit:V_NB\n");
+            // printf("submit:V_NB, pageindrx:%lu\n", index);
             ctx.isHit = true;
             if (write && ((read_state & DIRTY) == 0))
                 pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
@@ -2268,7 +2292,7 @@ __forceinline__
 
             break;
         case NV_B:
-            // printf("NV_B in submit\n");  // 问题在这里！一直在NV_B！
+            // printf("submit:NV_B, pageindrx:%lu\n", index);  // 问题在这里！一直在NV_B！
             ctx.isHit = false; // 已经有线程提交IO指令，只需等待，wait内无需再次提交
             {
                 const uint64_t expected_global_address = get_global_address(index);
@@ -2378,16 +2402,16 @@ __forceinline__
         // {
         //     st = NV_B;
         // }
-        if(st == V_NB)
-        {
-            printf("wait_st:%u\n", st);
-        }
+        // if(st == V_NB)
+        // {
+        //     printf("wait_st:%u\n", st);
+        // }
         
         switch (st)
         {
             // invalid
         case NV_NB:
-            // printf("wait:NV_NB\n");
+            printf("wait:NV_NB\n");
 
             // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
             // if ((st_new & BUSY) == 0)
@@ -2440,7 +2464,8 @@ __forceinline__
             break;
             // valid
         case V_NB:
-            printf("wait:V_NB, index:%lu\n", index);
+            // printf("wait:V_NB, index:%lu\n", index);
+            pages[index].polling_flag.store(0, simt::memory_order_release);
 
             if (write && ((read_state & DIRTY) == 0))
                 pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
@@ -2462,11 +2487,15 @@ __forceinline__
             break;
         case NV_B:
             // printf("wait:NV_B, index:%lu\n", index); // √
-            ctx.isHit = true;
-            // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
+            ctx.isHit = false;
 
-            // 使用submit中获取到的page_trans
-            // page_trans = cache.find_slot(index, range_id, queue, read_io_cnt, evicted_p_array);
+            uint32_t expected = 0;
+            uint32_t desired = 1;
+            // 进入此处的第一个线程
+            if(pages[index].polling_flag.compare_exchange_strong(expected, desired, 
+        simt::memory_order_acquire, simt::memory_order_relaxed))
+            {
+            // st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
 
             // uint64_t ctrl = get_backing_ctrl(index);
             // if (ctrl == ALL_CTRLS)
@@ -2483,11 +2512,10 @@ __forceinline__
             // Controller *c = ctx.member_acquire_c;
             // QueuePair *cAddq = ctx.member_acquire_cAddq;
 
-            // printf("queue:%d\n", queue); // 可执行
-            // noread_data(ctx);
             read_data_wait_async(&cache, (c->d_qps) + queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, ctx);
             // printf("轮询完成\n");
             // page_addresses[index].store(page_trans, simt::memory_order_release);
+            
             pages[index].offset = ctx.page_trans;
             ctx.observed_page_translation = (ctx.page_trans == ASYNC_PAGE_TRANS_PENDING || ctx.page_trans >= cache.n_pages)
                                                 ? 0
@@ -2502,13 +2530,20 @@ __forceinline__
             // new_state |= DIRTY;
             // pages[index].state.fetch_or(new_state, simt::memory_order_relaxed);
             pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
+            pages[index].polling_flag.store(0, simt::memory_order_release);
+            ctx.isHit = true;
+            
             return ctx.page_trans;
-
-            fail = false;
-
-            break;
+            }
+            else
+            {
+                // printf("wait NV_B no poll\n");
+                fail = true;
+                break;
+            }
+            
+            
         case V_B:
-            // printf("wait:V_B\n");
             // break;
         default:
             break;
@@ -2899,6 +2934,7 @@ struct array_d_t
 
 
         // printf("coalesce_page_async\n"); // √
+        
         uint32_t ctrl;
         uint32_t queue;
         uint32_t leader = __ffs(mask) - 1;
@@ -2936,10 +2972,13 @@ struct array_d_t
         count = __popc(eq_mask);
         if (master == lane)
         {
+            // printf("submit tid:%lu, page:%lu, r:%lu\n", lane_id, page, r);
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
             base = r_->acquire_page_submit_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
             base_master = base;
+            ctx.page = page;
+            // printf("lane:%lu\n", lane);
             // printf("合并线程执行完成..\n");  // √
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
         }
@@ -2991,6 +3030,8 @@ struct array_d_t
             // std::pair<uint64_t, bool> base_memcpyflag;
             // 此处调用成员变量的acquire_page函数,GDS发生在其中的read_data函数中
             // printf("wait tid:%lu, page:%lu, queue:%d\n", lane, page, queue);
+            // printf("wait tid:%lu, page:%lu, r:%lu\n", lane_id, page, r);
+            // printf("wait lane:%lu\n", lane);
             base = r_->acquire_page_wait_async(page, count, dirty, ctrl, queue, ctx); // 异步版本
             base_master = base;
             //                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
@@ -3248,7 +3289,10 @@ struct array_d_t
         r = find_range(i);
         auto r_ = d_ranges + r;
 
-        
+        // if(lane==0)
+        // {
+        //     printf("submit i:%lu, r:%lu\n", i, r);
+        // }
         // ctx.lane = lane;
         // ctx.r = r;
 
@@ -3316,11 +3360,14 @@ struct array_d_t
     {
         // 全局高级接口异步版本
         // printf("acquire_page_wait_async:global\n"); // √ √
-        // uint32_t lane = lane_id();
+        uint32_t lane = lane_id();
         r = find_range(i);
         // r = ctx.r;
 
-        uint32_t lane = lane_id();
+        // if(lane==0)
+        // {
+        //     printf("wait i:%lu, r:%lu\n", i, r);
+        // }
         auto r_ = d_ranges + r;
         // 可执行到
         void *ret = nullptr;
@@ -3373,11 +3420,14 @@ struct array_d_t
     {
         // 全局高级接口异步版本
         // printf("acquire_page_wait_async:global\n"); // √ √
-        // uint32_t lane = lane_id();
+        uint32_t lane = lane_id();
         r = find_range(i);
         // r = ctx.r;
+        // if(lane==0)
+        // {
+        //     printf("wait i:%lu, r:%lu\n", i, r);
+        // }
 
-        uint32_t lane = lane_id();
         auto r_ = d_ranges + r;
         // 可执行到
         void *ret = nullptr;
@@ -3389,9 +3439,10 @@ struct array_d_t
             uint32_t count = ctx.count;
 
             uint64_t page = r_->get_page(i);
+            // uint64_t page = ctx.page;
             uint64_t subindex = r_->get_subindex(i);
             uint64_t gaddr = r_->get_global_address(page);
-            // uint64_t page = ctx.page;
+            
             // uint64_t subindex = ctx.subindex;
             // uint64_t gaddr = ctx.gaddr;
 
@@ -3407,6 +3458,33 @@ struct array_d_t
             ret = (void *)r_->get_cache_page_addr(base_master);
             start = r_->n_elems_per_page * page;
             end = start + r_->n_elems_per_page; // * (page+1);
+        }
+
+        return ret;
+    }
+
+    __forceinline__
+        __device__ void *
+        acquire_page_post_poll_light(const size_t i, data_page_t *&page_, size_t &start, size_t &end, int64_t &r, s_ctx &ctx) const
+    {
+        r = find_range(i);
+        auto r_ = d_ranges + r;
+
+        void *ret = nullptr;
+        page_ = nullptr;
+        if (r != -1)
+        {
+            const uint64_t page = r_->get_page(i);
+            const uint32_t page_trans = ctx.page_trans;
+            if (page_trans == ASYNC_PAGE_TRANS_PENDING || page_trans >= r_->cache.n_pages)
+            {
+                return nullptr;
+            }
+
+            page_ = &r_->pages[page];
+            ret = (void *)r_->get_cache_page_addr(page_trans);
+            start = r_->n_elems_per_page * page;
+            end = start + r_->n_elems_per_page;
         }
 
         return ret;

@@ -183,7 +183,6 @@ class _PrefetchingIter(object):
         # 获取迭代器
         cur_it = self.dataloader_it
         batch = self.GIDS_Loader.fetch_feature(self.dataloader.dim, cur_it, self.GIDS_Loader.gids_device)
-        
         return batch
 
 
