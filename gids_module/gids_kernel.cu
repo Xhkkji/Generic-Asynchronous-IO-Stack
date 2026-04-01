@@ -199,7 +199,7 @@ __global__ void read_feature_kernel_single_thread_poll(array_d_t<T> *dr, T *out_
 }
 // 假设一个结点的所有特征都在同一页上
 template <typename T = float>
-__global__ void read_feature_kernel_single_page_single_thread_poll(array_d_t<T> *dr, T *out_tensor_ptr,
+__global__ void read_feature_kernel_single_page_single_thread_poll(array_d_t<T> *dr,
                                     int64_t *index_ptr, int dim,
                                     int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs)
 {

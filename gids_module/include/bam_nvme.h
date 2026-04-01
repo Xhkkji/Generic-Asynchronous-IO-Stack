@@ -109,6 +109,11 @@ struct BAM_Feature_Store {
   void read_feature_submit_async(uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
   void read_feature_wait_async(uint64_t tensor_ptr, uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
 
+  void read_feature_single_page_single_thread_poll(uint64_t i_index_ptr,
+                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off);
+  void read_feature_get_feature_light(uint64_t i_ptr, uint64_t i_index_ptr,
+                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off);
+
 
   void cpu_backing_buffer(uint64_t dim, uint64_t len);
   void set_cpu_buffer(uint64_t idx_buffer, int num);  

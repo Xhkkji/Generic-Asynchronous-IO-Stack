@@ -10,6 +10,7 @@ sudo env \
   GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
   /home/xhk/miniconda3/envs/pytorch/bin/python homogenous_train_debug.py \
   --stop_after_step 50 \
+  --hidden_channels 256 \
   --path /data/igb/ \
   --dataset_size medium \
   --epochs 1 \

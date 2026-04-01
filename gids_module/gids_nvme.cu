@@ -448,7 +448,7 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
   // 分配设备内存
   cudaMalloc(&d_warp_ctxs, total_ctxs * sizeof(s_ctx));
   cudaMemset(d_warp_ctxs, 0, total_ctxs * sizeof(s_ctx));
-  this->iostack.d_warp_ctxs = d_warp_ctxs;  // 暂且只处理一个iter的情况
+  this->iostack.push_ctxs(d_warp_ctxs, total_ctxs);
   // this->iostack.d_warp_ctxs_array_size[0] = static_cast<uint64_t>(total_warps);
   // 无需接受返回值，只提交IO请求即可
   read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr,
@@ -489,7 +489,7 @@ void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i
   auto t1 = Clock::now();
 
   // printf("read_feature async..\n");
-  s_ctx *d_warp_ctxs = this->iostack.d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
+  s_ctx *d_warp_ctxs = this->iostack.front_ctxs(); // 取最早提交且尚未消费的一份 ctx
 
   // 每个样本保留 32 份 ctx，供单线程轮询后按 warp 回填特征使用。
   uint64_t warps_per_block = b_size / 32;
@@ -499,19 +499,20 @@ void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i
   // assert(d_warp_ctxs != nullptr && this->iostack.d_warp_ctxs_array_size[0] == total_warps 
   //   && "d_warp_ctxs is null or size mismatch");
   
-  // read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-  //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                            index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
   // uint64_t poll_g_size = (num_index + n_warp - 1) / n_warp;
-  uint64_t poll_g_size = (num_index + b_size - 1) / b_size;
-  // read_feature_kernel_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-  //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
-  read_feature_kernel_single_page_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-                                                                                     index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
-  cudaDeviceSynchronize();
-  // printf("单线程轮询已完成..\n");      
+
+  // uint64_t poll_g_size = (num_index + b_size - 1) / b_size;
+  // // read_feature_kernel_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+  // //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  // read_feature_kernel_single_page_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr,
+  //                                                                                    index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  // cudaDeviceSynchronize();
+  // // printf("单线程轮询已完成..\n");      
                                                
-  read_feature_kernel_get_feature_light<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-                                                                  index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  // read_feature_kernel_get_feature_light<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+  //                                                                 index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
   
   // constexpr uint64_t clear_pages_block_size = 256;
   // const uint64_t clear_pages_count = h_range->rdt.page_count;
@@ -527,8 +528,130 @@ void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i
 
   if (d_warp_ctxs != nullptr)
     cudaFree(d_warp_ctxs);
+  this->iostack.pop_ctxs();
     
   cuda_err_chk(cudaDeviceSynchronize());
+  cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  auto t2 = Clock::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      t2 - t1); // Microsecond (as int)
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      t2 - t1); // Microsecond (as int)
+  const float ms_fractional =
+      static_cast<float>(us.count()) / 1000; // Milliseconds (as float)
+
+  kernel_time += ms_fractional;
+  total_access += num_index;
+
+  return;
+}
+
+template <typename TYPE>
+void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll(uint64_t i_index_ptr,
+                                           int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
+{
+  printf("BAM_Feature_Store::read_feature_single_page_single_thread_poll..\n");
+  int64_t *index_ptr = (int64_t *)i_index_ptr;
+
+  uint64_t b_size = blkSize;  // 128
+  uint64_t n_warp = b_size / 32;
+  uint64_t g_size = (num_index + n_warp - 1) / n_warp;
+
+  cuda_err_chk(cudaDeviceSynchronize());
+  auto t1 = Clock::now();
+
+  // printf("read_feature async..\n");
+  s_ctx *d_warp_ctxs = this->iostack.front_ctxs(); // 取最早提交且尚未消费的一份 ctx
+
+  // 每个样本保留 32 份 ctx，供单线程轮询后按 warp 回填特征使用。
+  uint64_t warps_per_block = b_size / 32;
+  uint64_t total_warps = g_size * warps_per_block;
+  uint64_t total_ctxs = total_warps * 32;
+  // 保证对应关系
+  // assert(d_warp_ctxs != nullptr && this->iostack.d_warp_ctxs_array_size[0] == total_warps 
+  //   && "d_warp_ctxs is null or size mismatch");
+  
+  // read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+  //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  // uint64_t poll_g_size = (num_index + n_warp - 1) / n_warp;
+  uint64_t poll_g_size = (num_index + b_size - 1) / b_size;
+  // read_feature_kernel_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+  //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  read_feature_kernel_single_page_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr,
+                                                                                     index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  cudaDeviceSynchronize();
+  // printf("单线程轮询已完成..\n");      
+                                               
+  // read_feature_kernel_get_feature_light<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+  //                                                                 index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  
+  // constexpr uint64_t clear_pages_block_size = 256;
+  // const uint64_t clear_pages_count = h_range->rdt.page_count;
+  // const uint64_t clear_pages_grid_size =
+  //     (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
+  // print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+  // print_ctx_kernel_for<<<1, 1>>>(d_warp_ctxs, total_warps);
+  cuda_err_chk(cudaDeviceSynchronize());
+  
+  dump_warp_ctxs("wait", d_warp_ctxs, total_ctxs);
+  cuda_err_chk(cudaDeviceSynchronize());
+  cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  auto t2 = Clock::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      t2 - t1); // Microsecond (as int)
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      t2 - t1); // Microsecond (as int)
+  const float ms_fractional =
+      static_cast<float>(us.count()) / 1000; // Milliseconds (as float)
+
+  kernel_time += ms_fractional;
+  total_access += num_index;
+
+  return;
+}
+
+template <typename TYPE>
+void BAM_Feature_Store<TYPE>::read_feature_get_feature_light(uint64_t i_ptr, uint64_t i_index_ptr,
+                                           int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
+{
+  printf("BAM_Feature_Store::read_feature_get_feature_light..\n");
+  TYPE *tensor_ptr = (TYPE *)i_ptr;
+  int64_t *index_ptr = (int64_t *)i_index_ptr;
+
+  uint64_t b_size = blkSize;  // 128
+  uint64_t n_warp = b_size / 32;
+  uint64_t g_size = (num_index + n_warp - 1) / n_warp;
+  cuda_err_chk(cudaDeviceSynchronize());
+  auto t1 = Clock::now();
+
+  s_ctx *d_warp_ctxs = this->iostack.front_ctxs(); // 取最早提交且尚未消费的一份 ctx
+
+  // 每个样本保留 32 份 ctx，供单线程轮询后按 warp 回填特征使用。
+  uint64_t warps_per_block = b_size / 32;
+  uint64_t total_warps = g_size * warps_per_block;
+  uint64_t total_ctxs = total_warps * 32;
+  // 保证对应关系
+  // assert(d_warp_ctxs != nullptr && this->iostack.d_warp_ctxs_array_size[0] == total_warps 
+  //   && "d_warp_ctxs is null or size mismatch");
+                                       
+  read_feature_kernel_get_feature_light<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                                  index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  
+  // constexpr uint64_t clear_pages_block_size = 256;
+  // const uint64_t clear_pages_count = h_range->rdt.page_count;
+  // const uint64_t clear_pages_grid_size =
+  //     (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
+  // print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
+  // print_ctx_kernel_for<<<1, 1>>>(d_warp_ctxs, total_warps);
+
+  cuda_err_chk(cudaDeviceSynchronize());
+  
+  dump_warp_ctxs("wait", d_warp_ctxs, total_ctxs);
+  cuda_err_chk(cudaDeviceSynchronize());
+  if (d_warp_ctxs != nullptr)
+    cudaFree(d_warp_ctxs);
+  this->iostack.pop_ctxs();
+  
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
   auto t2 = Clock::now();
   auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -946,6 +1069,8 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       // 异步函数绑定
       .def("read_feature_submit_async", &BAM_Feature_Store<float>::read_feature_submit_async)
       .def("read_feature_wait_async", &BAM_Feature_Store<float>::read_feature_wait_async)
+      .def("read_feature_single_page_single_thread_poll", &BAM_Feature_Store<float>::read_feature_single_page_single_thread_poll)
+      .def("read_feature_get_feature_light", &BAM_Feature_Store<float>::read_feature_get_feature_light)
 
       .def("read_feature_hetero", &BAM_Feature_Store<float>::read_feature_hetero)
       .def("read_feature_merged_hetero", &BAM_Feature_Store<float>::read_feature_merged_hetero)

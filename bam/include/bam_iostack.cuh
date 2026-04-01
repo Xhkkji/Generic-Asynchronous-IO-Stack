@@ -26,6 +26,7 @@
 // 新增
 #include <atomic>  // std::atomic（如果支持）
 #include <cstdint> // 标准整数类型
+#include <deque>
 // CUDA相关
 #include <cuda_runtime.h> // CUDA运行时
 // #include <cuda_atomic.h>   // CUDA原子操作（如果使用）
@@ -90,6 +91,8 @@ struct BaM_IOStack
   // s_ctx **d_warp_ctxs_array = nullptr;
   // uint64_t *d_warp_ctxs_array_size = nullptr; // 每个iter的warp上下文数量
   s_ctx *d_warp_ctxs = nullptr;
+  std::deque<s_ctx *> d_warp_ctxs_queue;
+  std::deque<uint64_t> d_warp_ctxs_count_queue;
 
   BaM_IOStack(int presubmit_count = 1) : presubmit_count(presubmit_count) 
   {
@@ -98,6 +101,49 @@ struct BaM_IOStack
     // cudaMalloc(&d_warp_ctxs_array_size, presubmit_count * sizeof(uint64_t));
   }
   ~BaM_IOStack() = default;
+
+  void push_ctxs(s_ctx *ctxs, uint64_t ctx_count)
+  {
+    d_warp_ctxs_queue.push_back(ctxs);
+    d_warp_ctxs_count_queue.push_back(ctx_count);
+    if (d_warp_ctxs == nullptr)
+    {
+      d_warp_ctxs = ctxs;
+    }
+  }
+
+  s_ctx *front_ctxs()
+  {
+    if (d_warp_ctxs_queue.empty())
+    {
+      d_warp_ctxs = nullptr;
+      return nullptr;
+    }
+    d_warp_ctxs = d_warp_ctxs_queue.front();
+    return d_warp_ctxs;
+  }
+
+  uint64_t front_ctx_count() const
+  {
+    if (d_warp_ctxs_count_queue.empty())
+    {
+      return 0;
+    }
+    return d_warp_ctxs_count_queue.front();
+  }
+
+  void pop_ctxs()
+  {
+    if (d_warp_ctxs_queue.empty())
+    {
+      d_warp_ctxs = nullptr;
+      return;
+    }
+
+    d_warp_ctxs_queue.pop_front();
+    d_warp_ctxs_count_queue.pop_front();
+    d_warp_ctxs = d_warp_ctxs_queue.empty() ? nullptr : d_warp_ctxs_queue.front();
+  }
 
   // void read_feature_submit_async(uint64_t tensor_ptr, uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
   // void read_feature_wait_async(uint64_t tensor_ptr, uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);

@@ -1,4 +1,5 @@
 import math
+import os
 import time
 import torch
 import numpy as np
@@ -45,7 +46,7 @@ class CollateWrapper(object):
 
 import torch.profiler
 class _PrefetchingIter_async(object):
-    def __init__(self, dataloader, dataloader_it, GIDS_Loader=None):
+    def __init__(self, dataloader, dataloader_it, GIDS_Loader=None, prefetch_depth=1):
         self.dataloader_it = dataloader_it
         self.dataloader = dataloader
         self.graph_sampler = self.dataloader.graph_sampler
@@ -54,12 +55,13 @@ class _PrefetchingIter_async(object):
         # 自加
         self.prefetch_queue = []
         self.exhausted = False
-        # self.prefetch_depth = 3  # 需要调大cache的大小，保证IO请求能装得下
-        # for _ in range(2):
-        #     print(f"执行_submit_prefetch")
-        #     self._submit_prefetch()
-        print("GIDS.py提交..")
+        self.prefetch_depth = max(1, int(prefetch_depth))
+        print(f"GIDS.py提交, prefetch:{self.prefetch_depth}..")
+        # 先准备一个 ready 的 iter，再按预取深度继续补充 submit 队列。
         self._submit_prefetch()
+        self._poll_front_prefetch()
+        while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
+            self._submit_prefetch()
         
     # 用于记录性能数据的函数
     def start_profiling(self, output_dir="./profiler_logs"):
@@ -96,7 +98,7 @@ class _PrefetchingIter_async(object):
             
     def _submit_prefetch(self):
         if self.exhausted:
-            return
+            return False
         
         try:
             # 从原始迭代器获取下一个batch信息（并移动指针）
@@ -109,11 +111,27 @@ class _PrefetchingIter_async(object):
                 1, 
                 self.GIDS_Loader.gids_device
             )
-            # print('submit: ', next_batch[0][:10])  # 打印提交的batch信息（如节点ID列表的前10个）
-            self.prefetch_queue.append(next_batch)
+            self.prefetch_queue.append({
+                "batch": next_batch,
+                "polled": False,
+            })
+            return True
             
         except StopIteration:
             self.exhausted = True
+            return False
+
+    def _poll_front_prefetch(self):
+        if not self.prefetch_queue:
+            return
+
+        if self.prefetch_queue[0]["polled"]:
+            return
+
+        next_batch = self.prefetch_queue[0]["batch"]
+        self.GIDS_Loader.read_feature_single_page_single_thread_poll(
+            self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
+        self.prefetch_queue[0]["polled"] = True
     
     def __iter__(self):
         return self
@@ -125,13 +143,17 @@ class _PrefetchingIter_async(object):
         # 自加
         if not self.prefetch_queue and self.exhausted:
             raise StopIteration
-        
+
         # 获取最早提交的任务
         # print(f"Prefetch queue length: {len(self.prefetch_queue)}")  # 添加
-        next_batch = self.prefetch_queue.pop(0)
-        batch = self.GIDS_Loader.fetch_feature_wait(self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
-        # self.GIDS_Loader.fetch_feature_submit(self.dataloader.dim, cur_it, 1, self.GIDS_Loader.gids_device)
-        self._submit_prefetch()  # 提交下一个预取任务
+        self._poll_front_prefetch()
+        next_item = self.prefetch_queue.pop(0)
+        next_batch = next_item["batch"]
+        batch = self.GIDS_Loader.fetch_feature_get_feature_light(
+            self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
+        self._poll_front_prefetch()
+        while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
+            self._submit_prefetch()
         
         return batch
 
@@ -302,8 +324,13 @@ class GIDS_DGLDataLoader(torch.utils.data.DataLoader):
         # When using multiprocessing PyTorch sometimes set the number of PyTorch threads to 1
         # when spawning new Python threads.  This drastically slows down pinning features.
         num_threads = torch.get_num_threads() if self.num_workers > 0 else None
+        force_sync_read = os.environ.get("GIDS_FORCE_SYNC_READ", "0") not in ("0", "", "false", "False")
+        if force_sync_read:
+            return _PrefetchingIter(
+                self, super().__iter__(), GIDS_Loader=self.GIDS_Loader)
         return _PrefetchingIter_async(
-            self, super().__iter__(), GIDS_Loader=self.GIDS_Loader)
+            self, super().__iter__(), GIDS_Loader=self.GIDS_Loader,
+            prefetch_depth=getattr(self.GIDS_Loader, "iter_prefetch_depth", 1))
  
     def print_stats(self):
         self.GIDS_Loader.print_stats()
@@ -352,6 +379,7 @@ class GIDS():
         self.pre_submit_buffer_isInit = False
         self.pre_submit__buffer_size = 1
         self.pre_fetch_list = []
+        self.iter_prefetch_depth = 1
         
         # Cache Parameters
         self.page_size = page_size
@@ -502,9 +530,56 @@ class GIDS():
         #print(batch[0])
         index_ptr = index.data_ptr()
         return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device).contiguous()
-        # self.BAM_FS.read_feature(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
-        # self.BAM_FS.read_feature_submit_async(index_ptr, index_size, dim, self.cache_dim, 0)
         self.BAM_FS.read_feature_wait_async(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+
+        if type(batch) is tuple:
+            batch2 = (*batch, return_torch)
+            return batch2
+        else:
+            batch.append(return_torch)
+            return batch
+    
+    
+    def read_feature_single_page_single_thread_poll(self, dim, batch, device):
+        GIDS_time_start = time.time()
+            
+        #print("Sample  done")
+        
+        #print("batch 0: ", batch.ndata['_ID'])
+        index = batch[0].to(self.gids_device)
+        # print(f"GIDS get {index.shape[0]} nodes' features, len:{len(index)}")
+        
+        index_size = len(index)
+        #print(batch[0])
+        index_ptr = index.data_ptr()
+        # return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device).contiguous()
+        self.BAM_FS.read_feature_single_page_single_thread_poll(index_ptr, index_size, dim, self.cache_dim, 0)
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+
+        # if type(batch) is tuple:
+        #     batch2 = (*batch, return_torch)
+        #     return batch2
+        # else:
+        #     batch.append(return_torch)
+        #     return batch
+    
+    
+    # 异步轻量化轮询获取特征（不等待特征完全返回，而是先返回一个空的Tensor占位，后续通过其他机制确保特征数据被正确填充）
+    def fetch_feature_get_feature_light(self, dim, batch, device):
+        GIDS_time_start = time.time()
+            
+        #print("Sample  done")
+        
+        #print("batch 0: ", batch.ndata['_ID'])
+        index = batch[0].to(self.gids_device)
+        # print(f"GIDS get {index.shape[0]} nodes' features, len:{len(index)}")
+        
+        index_size = len(index)
+        #print(batch[0])
+        index_ptr = index.data_ptr()
+        return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device).contiguous()
+        self.BAM_FS.read_feature_get_feature_light(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
         self.GIDS_wait_time += time.time() - GIDS_time_start
 
         if type(batch) is tuple:
@@ -785,5 +860,3 @@ class GIDS():
 
     def flush_cache(self):
         self.BAM_FS.flush_cache()
-
-
