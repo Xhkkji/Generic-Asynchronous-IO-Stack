@@ -265,7 +265,6 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
 
-  cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
   if (cpu_buffer_flag == false)
   {
@@ -436,6 +435,7 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
 
+  cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
   s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
@@ -483,7 +483,6 @@ void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
 
-  cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
   // printf("read_feature async..\n");
@@ -555,6 +554,7 @@ void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll(uint64
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
 
+  // cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
   // printf("read_feature async..\n");
