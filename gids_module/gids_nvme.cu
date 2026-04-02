@@ -204,7 +204,6 @@ void BAM_Feature_Store<TYPE>::init_controllers(GIDS_Controllers GIDS_ctrl, uint3
 
   cudaMalloc(&d_cpu_access, sizeof(unsigned int));
   cudaMemset(d_cpu_access, 0, sizeof(unsigned));
-
   return;
 }
 
@@ -430,7 +429,6 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
   // printf("BAM_Feature_Store::read_feature_submit_async..\n");
   // TYPE *tensor_ptr = (TYPE *)i_ptr;
   int64_t *index_ptr = (int64_t *)i_index_ptr;
-
   uint64_t b_size = blkSize;
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
@@ -451,9 +449,9 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
   // this->iostack.d_warp_ctxs_array_size[0] = static_cast<uint64_t>(total_warps);
   // 无需接受返回值，只提交IO请求即可
   read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr,
-                                                              index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+                                                             index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
   // 等待submit完成
-  cudaDeviceSynchronize();
+  // cudaDeviceSynchronize();
   dump_warp_ctxs("submit", d_warp_ctxs, total_ctxs);
   
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
@@ -527,7 +525,7 @@ void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i
     cudaFree(d_warp_ctxs);
   this->iostack.pop_ctxs();
     
-  cuda_err_chk(cudaDeviceSynchronize());
+  // cuda_err_chk(cudaDeviceSynchronize());
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
   auto t2 = Clock::now();
   auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -549,7 +547,6 @@ void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll(uint64
 {
   printf("BAM_Feature_Store::read_feature_single_page_single_thread_poll..\n");
   int64_t *index_ptr = (int64_t *)i_index_ptr;
-
   uint64_t b_size = blkSize;  // 128
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
@@ -610,7 +607,6 @@ void BAM_Feature_Store<TYPE>::read_feature_get_feature_light(uint64_t i_ptr, uin
   printf("BAM_Feature_Store::read_feature_get_feature_light..\n");
   TYPE *tensor_ptr = (TYPE *)i_ptr;
   int64_t *index_ptr = (int64_t *)i_index_ptr;
-
   uint64_t b_size = blkSize;  // 128
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
