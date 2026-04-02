@@ -436,7 +436,6 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
 
-  cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
   s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
@@ -457,7 +456,6 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
   cudaDeviceSynchronize();
   dump_warp_ctxs("submit", d_warp_ctxs, total_ctxs);
   
-  cuda_err_chk(cudaDeviceSynchronize());
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
   auto t2 = Clock::now();
   auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -557,7 +555,6 @@ void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll(uint64
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
 
-  cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
   // printf("read_feature async..\n");
@@ -579,7 +576,6 @@ void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll(uint64
   //                                                           index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
   read_feature_kernel_single_page_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(a->d_array_ptr,
                                                                                      index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
-  cudaDeviceSynchronize();
   // printf("单线程轮询已完成..\n");      
                                                
   // read_feature_kernel_get_feature_light<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
@@ -591,10 +587,7 @@ void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll(uint64
   //     (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
   // print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
   // print_ctx_kernel_for<<<1, 1>>>(d_warp_ctxs, total_warps);
-  cuda_err_chk(cudaDeviceSynchronize());
-  
   dump_warp_ctxs("wait", d_warp_ctxs, total_ctxs);
-  cuda_err_chk(cudaDeviceSynchronize());
   cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
   auto t2 = Clock::now();
   auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -621,7 +614,6 @@ void BAM_Feature_Store<TYPE>::read_feature_get_feature_light(uint64_t i_ptr, uin
   uint64_t b_size = blkSize;  // 128
   uint64_t n_warp = b_size / 32;
   uint64_t g_size = (num_index + n_warp - 1) / n_warp;
-  cuda_err_chk(cudaDeviceSynchronize());
   auto t1 = Clock::now();
 
   s_ctx *d_warp_ctxs = this->iostack.front_ctxs(); // 取最早提交且尚未消费的一份 ctx
@@ -644,10 +636,7 @@ void BAM_Feature_Store<TYPE>::read_feature_get_feature_light(uint64_t i_ptr, uin
   // print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
   // print_ctx_kernel_for<<<1, 1>>>(d_warp_ctxs, total_warps);
 
-  cuda_err_chk(cudaDeviceSynchronize());
-  
   dump_warp_ctxs("wait", d_warp_ctxs, total_ctxs);
-  cuda_err_chk(cudaDeviceSynchronize());
   if (d_warp_ctxs != nullptr)
     cudaFree(d_warp_ctxs);
   this->iostack.pop_ctxs();
