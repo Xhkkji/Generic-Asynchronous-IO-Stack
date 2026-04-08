@@ -297,6 +297,17 @@ class _PrefetchingIter_async_sample_io_pipeline(object):
             self.GIDS_Loader.gids_device,
         )
 
+    def _ensure_current_batch_ready(self):
+        if self.current_batch is not None:
+            return True
+
+        if not self.prefetch_queue:
+            if not self._submit_prefetch_blocking():
+                return False
+
+        self.current_batch = self._consume_front_prefetch()
+        return self.current_batch is not None
+
     def _prepare_first_batch(self):
         if not self._submit_prefetch_blocking():
             self.current_batch = None
@@ -308,16 +319,11 @@ class _PrefetchingIter_async_sample_io_pipeline(object):
         return self
 
     def __next__(self):
-        if self.current_batch is None:
+        if not self._ensure_current_batch_ready():
             raise StopIteration
 
         batch = self.current_batch
-        if self.prefetch_queue:
-            self.current_batch = self._consume_front_prefetch()
-        else:
-            self.current_batch = None
-            if self._submit_prefetch_blocking():
-                self.current_batch = self._consume_front_prefetch()
+        self.current_batch = None
         self._submit_prefetch_nonblocking()
         return batch
 
