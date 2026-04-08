@@ -1,6 +1,8 @@
 import math
 import os
 import time
+import queue as py_queue
+import threading
 import torch
 import numpy as np
 import ctypes
@@ -155,6 +157,168 @@ class _PrefetchingIter_async(object):
         while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
             self._submit_prefetch()
         
+        return batch
+
+
+class _PrefetchingIter_async_sample_io_pipeline(object):
+    def __init__(self, dataloader, dataloader_it, GIDS_Loader=None):
+        self.dataloader_it = dataloader_it
+        self.dataloader = dataloader
+        self.graph_sampler = self.dataloader.graph_sampler
+        self.GIDS_Loader = GIDS_Loader
+
+        sampled_qsize = max(1, int(getattr(self.GIDS_Loader, "sample_io_sampled_queue_size", 1)))
+        self.sampled_queue = py_queue.Queue(maxsize=sampled_qsize)
+        self._sample_sentinel = object()
+        self._worker_exc = None
+        self.prefetch_queue = []
+        self.exhausted = False
+        self.current_batch = None
+
+        self._sampler_thread = threading.Thread(
+            target=self._sampler_loop,
+            name="gids-sample-worker",
+            daemon=True,
+        )
+        self._sampler_thread.start()
+
+        # 先同步做出第一批 ready 数据，之后只保持一个“已提交、待轮询”的下一批。
+        self._prepare_first_batch()
+
+    def start_profiling(self, output_dir="./profiler_logs"):
+        print("=== start_profiling called ===")
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        self.profiler.__enter__()
+
+    def stop_profiling(self):
+        print(f"=== stop_profiling called, profiler id: {id(self.profiler) if self.profiler else 'None'} ===")
+        if self.profiler:
+            self.profiler.__exit__(None, None, None)
+            print(self.profiler.key_averages().table(
+                sort_by="cuda_time_total",
+                row_limit=20
+            ))
+
+    def _sampler_loop(self):
+        try:
+            while True:
+                batch = next(self.dataloader_it)
+                self.sampled_queue.put(batch)
+        except StopIteration:
+            self.sampled_queue.put(self._sample_sentinel)
+        except Exception as exc:
+            self._worker_exc = exc
+            self.sampled_queue.put(self._sample_sentinel)
+
+    def _get_next_sampled_batch(self):
+        batch = self.sampled_queue.get()
+        if batch is self._sample_sentinel:
+            self.exhausted = True
+            if self._worker_exc is not None:
+                raise self._worker_exc
+            return None
+        return batch
+
+    def _try_get_next_sampled_batch_nowait(self):
+        try:
+            batch = self.sampled_queue.get_nowait()
+        except py_queue.Empty:
+            return None
+        if batch is self._sample_sentinel:
+            self.exhausted = True
+            if self._worker_exc is not None:
+                raise self._worker_exc
+            return None
+        return batch
+
+    def _submit_batch(self, next_batch):
+        self.GIDS_Loader.fetch_feature_submit(
+            self.dataloader.dim,
+            next_batch,
+            1,
+            self.GIDS_Loader.gids_device,
+        )
+        self.prefetch_queue.append({
+            "batch": next_batch,
+            "polled": False,
+        })
+
+    def _submit_prefetch_blocking(self):
+        if self.exhausted or self.prefetch_queue:
+            return False
+        next_batch = self._get_next_sampled_batch()
+        if next_batch is None:
+            return False
+        self._submit_batch(next_batch)
+        return True
+
+    def _submit_prefetch_nonblocking(self):
+        if self.exhausted or self.prefetch_queue:
+            return False
+        next_batch = self._try_get_next_sampled_batch_nowait()
+        if next_batch is None:
+            return False
+        self._submit_batch(next_batch)
+        return True
+
+    def _poll_front_prefetch(self):
+        if not self.prefetch_queue:
+            return
+
+        if self.prefetch_queue[0]["polled"]:
+            return
+
+        next_batch = self.prefetch_queue[0]["batch"]
+        self.GIDS_Loader.read_feature_single_page_single_thread_poll(
+            self.dataloader.dim,
+            next_batch,
+            self.GIDS_Loader.gids_device,
+        )
+        self.prefetch_queue[0]["polled"] = True
+
+    def _consume_front_prefetch(self):
+        if not self.prefetch_queue:
+            return None
+        self._poll_front_prefetch()
+        next_item = self.prefetch_queue.pop(0)
+        next_batch = next_item["batch"]
+        return self.GIDS_Loader.fetch_feature_get_feature_light(
+            self.dataloader.dim,
+            next_batch,
+            self.GIDS_Loader.gids_device,
+        )
+
+    def _prepare_first_batch(self):
+        if not self._submit_prefetch_blocking():
+            self.current_batch = None
+            return
+        self.current_batch = self._consume_front_prefetch()
+        self._submit_prefetch_nonblocking()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current_batch is None:
+            raise StopIteration
+
+        batch = self.current_batch
+        if self.prefetch_queue:
+            self.current_batch = self._consume_front_prefetch()
+        else:
+            self.current_batch = None
+            if self._submit_prefetch_blocking():
+                self.current_batch = self._consume_front_prefetch()
+        self._submit_prefetch_nonblocking()
         return batch
 
 class _PrefetchingIter(object):
@@ -325,6 +489,9 @@ class GIDS_DGLDataLoader(torch.utils.data.DataLoader):
         # when spawning new Python threads.  This drastically slows down pinning features.
         num_threads = torch.get_num_threads() if self.num_workers > 0 else None
         force_sync_read = os.environ.get("GIDS_FORCE_SYNC_READ", "0") not in ("0", "", "false", "False")
+        if getattr(self.GIDS_Loader, "use_async_sample_io_pipeline", False):
+            return _PrefetchingIter_async_sample_io_pipeline(
+                self, super().__iter__(), GIDS_Loader=self.GIDS_Loader)
         if force_sync_read:
             return _PrefetchingIter(
                 self, super().__iter__(), GIDS_Loader=self.GIDS_Loader)
@@ -380,6 +547,9 @@ class GIDS():
         self.pre_submit__buffer_size = 1
         self.pre_fetch_list = []
         self.iter_prefetch_depth = 1
+        self.use_async_sample_io_pipeline = True
+        self.sample_io_sampled_queue_size = 1
+        self.sample_io_ready_queue_size = 1
         
         # Cache Parameters
         self.page_size = page_size
