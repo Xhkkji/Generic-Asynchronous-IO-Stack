@@ -244,7 +244,7 @@ class _PrefetchingIter_async_registered_poll(object):
         self._poll_front_prefetch()
         next_item = self.prefetch_queue.pop(0)
         next_batch = next_item["batch"]
-        batch = self.GIDS_Loader.fetch_feature_get_feature_light(
+        batch = self.GIDS_Loader.fetch_feature_get_feature_light_registered(
             self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
 
         self._poll_front_prefetch()
@@ -872,6 +872,12 @@ class GIDS():
 
     def get_registered_ready_front_request_id(self):
         return self.BAM_FS.get_registered_ready_front_request_id()
+
+    def get_registered_front_state(self):
+        return self.BAM_FS.get_registered_front_state()
+
+    def get_registered_last_consumed_request_id(self):
+        return self.BAM_FS.get_registered_last_consumed_request_id()
     
     
     # 异步轻量化轮询获取特征（不等待特征完全返回，而是先返回一个空的Tensor占位，后续通过其他机制确保特征数据被正确填充）
@@ -889,6 +895,22 @@ class GIDS():
         index_ptr = index.data_ptr()
         return_torch =  torch.zeros([index_size,dim], dtype=torch.float, device=self.gids_device).contiguous()
         self.BAM_FS.read_feature_get_feature_light(return_torch.data_ptr(), index_ptr, index_size, dim, self.cache_dim, 0)
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+
+        if type(batch) is tuple:
+            batch2 = (*batch, return_torch)
+            return batch2
+        else:
+            batch.append(return_torch)
+            return batch
+
+    def fetch_feature_get_feature_light_registered(self, dim, batch, device):
+        GIDS_time_start = time.time()
+
+        index = batch[0].to(self.gids_device)
+        index_size = len(index)
+        return_torch = torch.zeros([index_size, dim], dtype=torch.float, device=self.gids_device).contiguous()
+        request_id = self.BAM_FS.read_feature_get_feature_light_registered(return_torch.data_ptr())
         self.GIDS_wait_time += time.time() - GIDS_time_start
 
         if type(batch) is tuple:

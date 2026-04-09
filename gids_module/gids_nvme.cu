@@ -687,7 +687,7 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_poll()
   {
     return 0;
   }
-  if (outstanding->ready)
+  if (outstanding->state == BaM_IOStack<TYPE>::READY)
   {
     return outstanding->request_id;
   }
@@ -698,6 +698,57 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_poll()
   {
     throw std::runtime_error("Failed to mark registered outstanding request as ready");
   }
+  return request_id;
+}
+
+template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::read_feature_get_feature_light_registered(uint64_t i_ptr)
+{
+  const auto *outstanding = this->iostack.front_outstanding();
+  if (outstanding == nullptr)
+  {
+    throw std::runtime_error("No registered outstanding request to get");
+  }
+  if (outstanding->state != BaM_IOStack<TYPE>::READY)
+  {
+    throw std::runtime_error("Registered outstanding request is not ready for get");
+  }
+
+  const uint64_t request_id = outstanding->request_id;
+  TYPE *tensor_ptr = (TYPE *)i_ptr;
+  int64_t *index_ptr = (int64_t *)outstanding->index_ptr;
+  const int64_t num_index = outstanding->num_index;
+  const int dim = outstanding->dim;
+  const int cache_dim = outstanding->cache_dim;
+  uint64_t b_size = blkSize;
+  uint64_t n_warp = b_size / 32;
+  uint64_t g_size = (num_index + n_warp - 1) / n_warp;
+  auto t1 = Clock::now();
+
+  s_ctx *d_warp_ctxs = this->iostack.front_ctxs();
+  uint64_t warps_per_block = b_size / 32;
+  uint64_t total_warps = g_size * warps_per_block;
+  uint64_t total_ctxs = total_warps * 32;
+
+  read_feature_kernel_get_feature_light<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                                  index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  dump_warp_ctxs("wait_registered_get", d_warp_ctxs, total_ctxs);
+
+  if (!this->iostack.mark_front_consumed(request_id))
+  {
+    throw std::runtime_error("Failed to mark registered outstanding request as consumed");
+  }
+  if (d_warp_ctxs != nullptr)
+    cudaFree(d_warp_ctxs);
+  this->iostack.pop_ctxs();
+
+  cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  auto t2 = Clock::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+  const float ms_fractional = static_cast<float>(us.count()) / 1000;
+
+  kernel_time += ms_fractional;
+  total_access += num_index;
   return request_id;
 }
 
@@ -776,6 +827,18 @@ template <typename TYPE>
 uint64_t BAM_Feature_Store<TYPE>::get_registered_ready_front_request_id() const
 {
   return this->iostack.front_ready_request_id();
+}
+
+template <typename TYPE>
+uint32_t BAM_Feature_Store<TYPE>::get_registered_front_state() const
+{
+  return static_cast<uint32_t>(this->iostack.front_state());
+}
+
+template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::get_registered_last_consumed_request_id() const
+{
+  return this->iostack.get_last_consumed_request_id();
 }
 
 template <typename TYPE>
@@ -1185,10 +1248,13 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("read_feature_single_page_single_thread_poll_registered", &BAM_Feature_Store<float>::read_feature_single_page_single_thread_poll_registered)
       .def("service_registered_poll", &BAM_Feature_Store<float>::service_registered_poll)
       .def("read_feature_get_feature_light", &BAM_Feature_Store<float>::read_feature_get_feature_light)
+      .def("read_feature_get_feature_light_registered", &BAM_Feature_Store<float>::read_feature_get_feature_light_registered)
       .def("get_registered_outstanding_count", &BAM_Feature_Store<float>::get_registered_outstanding_count)
       .def("get_registered_front_request_id", &BAM_Feature_Store<float>::get_registered_front_request_id)
       .def("registered_front_ready", &BAM_Feature_Store<float>::registered_front_ready)
       .def("get_registered_ready_front_request_id", &BAM_Feature_Store<float>::get_registered_ready_front_request_id)
+      .def("get_registered_front_state", &BAM_Feature_Store<float>::get_registered_front_state)
+      .def("get_registered_last_consumed_request_id", &BAM_Feature_Store<float>::get_registered_last_consumed_request_id)
 
       .def("read_feature_hetero", &BAM_Feature_Store<float>::read_feature_hetero)
       .def("read_feature_merged_hetero", &BAM_Feature_Store<float>::read_feature_merged_hetero)
@@ -1220,10 +1286,13 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("read_feature_wait_async", &BAM_Feature_Store<int64_t>::read_feature_wait_async)
       .def("read_feature_single_page_single_thread_poll_registered", &BAM_Feature_Store<int64_t>::read_feature_single_page_single_thread_poll_registered)
       .def("service_registered_poll", &BAM_Feature_Store<int64_t>::service_registered_poll)
+      .def("read_feature_get_feature_light_registered", &BAM_Feature_Store<int64_t>::read_feature_get_feature_light_registered)
       .def("get_registered_outstanding_count", &BAM_Feature_Store<int64_t>::get_registered_outstanding_count)
       .def("get_registered_front_request_id", &BAM_Feature_Store<int64_t>::get_registered_front_request_id)
       .def("registered_front_ready", &BAM_Feature_Store<int64_t>::registered_front_ready)
       .def("get_registered_ready_front_request_id", &BAM_Feature_Store<int64_t>::get_registered_ready_front_request_id)
+      .def("get_registered_front_state", &BAM_Feature_Store<int64_t>::get_registered_front_state)
+      .def("get_registered_last_consumed_request_id", &BAM_Feature_Store<int64_t>::get_registered_last_consumed_request_id)
 
       .def("read_feature_merged", &BAM_Feature_Store<int64_t>::read_feature_merged)
       .def("read_feature_merged_hetero", &BAM_Feature_Store<int64_t>::read_feature_merged_hetero)

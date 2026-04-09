@@ -83,6 +83,13 @@ struct s_ctx
 template <typename T>
 struct BaM_IOStack 
 {
+  enum request_state_t : uint32_t
+  {
+    SUBMITTED = 0,
+    READY = 1,
+    CONSUMED = 2,
+  };
+
   struct outstanding_meta_t
   {
     uint64_t request_id = 0;
@@ -93,7 +100,7 @@ struct BaM_IOStack
     uint64_t key_off = 0;
     s_ctx *ctxs = nullptr;
     uint64_t ctx_count = 0;
-    bool ready = false;
+    request_state_t state = SUBMITTED;
   };
 
     // 预先提交几个iter的请求，决定了d_warp_ctxs_array的元素个数
@@ -108,6 +115,7 @@ struct BaM_IOStack
   std::deque<uint64_t> d_warp_ctxs_count_queue;
   std::deque<outstanding_meta_t> outstanding_queue;
   uint64_t next_request_id = 1;
+  uint64_t last_consumed_request_id = 0;
 
   BaM_IOStack(int presubmit_count = 1) : presubmit_count(presubmit_count) 
   {
@@ -182,17 +190,23 @@ struct BaM_IOStack
   bool front_outstanding_ready() const
   {
     const outstanding_meta_t *meta = front_outstanding();
-    return meta != nullptr && meta->ready;
+    return meta != nullptr && meta->state == READY;
   }
 
   uint64_t front_ready_request_id() const
   {
     const outstanding_meta_t *meta = front_outstanding();
-    if (meta == nullptr || !meta->ready)
+    if (meta == nullptr || meta->state != READY)
     {
       return 0;
     }
     return meta->request_id;
+  }
+
+  request_state_t front_state() const
+  {
+    const outstanding_meta_t *meta = front_outstanding();
+    return meta == nullptr ? CONSUMED : meta->state;
   }
 
   bool mark_front_ready(uint64_t request_id)
@@ -205,8 +219,28 @@ struct BaM_IOStack
     {
       return false;
     }
-    outstanding_queue.front().ready = true;
+    outstanding_queue.front().state = READY;
     return true;
+  }
+
+  bool mark_front_consumed(uint64_t request_id)
+  {
+    if (outstanding_queue.empty())
+    {
+      return false;
+    }
+    if (request_id != 0 && outstanding_queue.front().request_id != request_id)
+    {
+      return false;
+    }
+    outstanding_queue.front().state = CONSUMED;
+    last_consumed_request_id = outstanding_queue.front().request_id;
+    return true;
+  }
+
+  uint64_t get_last_consumed_request_id() const
+  {
+    return last_consumed_request_id;
   }
 
   void pop_ctxs()
