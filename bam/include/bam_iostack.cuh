@@ -83,6 +83,19 @@ struct s_ctx
 template <typename T>
 struct BaM_IOStack 
 {
+  struct outstanding_meta_t
+  {
+    uint64_t request_id = 0;
+    uint64_t index_ptr = 0;
+    int64_t num_index = 0;
+    int dim = 0;
+    int cache_dim = 0;
+    uint64_t key_off = 0;
+    s_ctx *ctxs = nullptr;
+    uint64_t ctx_count = 0;
+    bool ready = false;
+  };
+
     // 预先提交几个iter的请求，决定了d_warp_ctxs_array的元素个数
   int presubmit_count = 1;
 
@@ -93,6 +106,8 @@ struct BaM_IOStack
   s_ctx *d_warp_ctxs = nullptr;
   std::deque<s_ctx *> d_warp_ctxs_queue;
   std::deque<uint64_t> d_warp_ctxs_count_queue;
+  std::deque<outstanding_meta_t> outstanding_queue;
+  uint64_t next_request_id = 1;
 
   BaM_IOStack(int presubmit_count = 1) : presubmit_count(presubmit_count) 
   {
@@ -110,6 +125,24 @@ struct BaM_IOStack
     {
       d_warp_ctxs = ctxs;
     }
+  }
+
+  uint64_t register_outstanding(s_ctx *ctxs, uint64_t ctx_count, uint64_t index_ptr,
+                                int64_t num_index, int dim, int cache_dim, uint64_t key_off)
+  {
+    push_ctxs(ctxs, ctx_count);
+
+    outstanding_meta_t meta;
+    meta.request_id = next_request_id++;
+    meta.index_ptr = index_ptr;
+    meta.num_index = num_index;
+    meta.dim = dim;
+    meta.cache_dim = cache_dim;
+    meta.key_off = key_off;
+    meta.ctxs = ctxs;
+    meta.ctx_count = ctx_count;
+    outstanding_queue.push_back(meta);
+    return meta.request_id;
   }
 
   s_ctx *front_ctxs()
@@ -132,6 +165,50 @@ struct BaM_IOStack
     return d_warp_ctxs_count_queue.front();
   }
 
+  const outstanding_meta_t *front_outstanding() const
+  {
+    if (outstanding_queue.empty())
+    {
+      return nullptr;
+    }
+    return &outstanding_queue.front();
+  }
+
+  uint64_t outstanding_count() const
+  {
+    return outstanding_queue.size();
+  }
+
+  bool front_outstanding_ready() const
+  {
+    const outstanding_meta_t *meta = front_outstanding();
+    return meta != nullptr && meta->ready;
+  }
+
+  uint64_t front_ready_request_id() const
+  {
+    const outstanding_meta_t *meta = front_outstanding();
+    if (meta == nullptr || !meta->ready)
+    {
+      return 0;
+    }
+    return meta->request_id;
+  }
+
+  bool mark_front_ready(uint64_t request_id)
+  {
+    if (outstanding_queue.empty())
+    {
+      return false;
+    }
+    if (request_id != 0 && outstanding_queue.front().request_id != request_id)
+    {
+      return false;
+    }
+    outstanding_queue.front().ready = true;
+    return true;
+  }
+
   void pop_ctxs()
   {
     if (d_warp_ctxs_queue.empty())
@@ -142,6 +219,10 @@ struct BaM_IOStack
 
     d_warp_ctxs_queue.pop_front();
     d_warp_ctxs_count_queue.pop_front();
+    if (!outstanding_queue.empty())
+    {
+      outstanding_queue.pop_front();
+    }
     d_warp_ctxs = d_warp_ctxs_queue.empty() ? nullptr : d_warp_ctxs_queue.front();
   }
 

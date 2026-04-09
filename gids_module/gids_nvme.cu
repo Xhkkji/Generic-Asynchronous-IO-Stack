@@ -470,6 +470,43 @@ void BAM_Feature_Store<TYPE>::read_feature_submit_async(uint64_t i_index_ptr,
 }
 
 template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::read_feature_submit_async_registered(uint64_t i_index_ptr,
+                                           int64_t num_index, int dim, int cache_dim, uint64_t key_off)
+{
+  int64_t *index_ptr = (int64_t *)i_index_ptr;
+  uint64_t b_size = blkSize;
+  uint64_t n_warp = b_size / 32;
+  uint64_t g_size = (num_index + n_warp - 1) / n_warp;
+
+  cuda_err_chk(cudaDeviceSynchronize());
+  auto t1 = Clock::now();
+
+  s_ctx *d_warp_ctxs;
+  uint64_t warps_per_block = b_size / 32;
+  uint64_t total_warps = g_size * warps_per_block;
+  uint64_t total_ctxs = total_warps * 32;
+  cudaMalloc(&d_warp_ctxs, total_ctxs * sizeof(s_ctx));
+  cudaMemset(d_warp_ctxs, 0, total_ctxs * sizeof(s_ctx));
+  const uint64_t request_id =
+      this->iostack.register_outstanding(d_warp_ctxs, total_ctxs, i_index_ptr, num_index,
+                                         dim, cache_dim, key_off);
+
+  read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr,
+                                                             index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+  dump_warp_ctxs("submit_registered", d_warp_ctxs, total_ctxs);
+
+  cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  auto t2 = Clock::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+  const float ms_fractional = static_cast<float>(us.count()) / 1000;
+
+  kernel_time += ms_fractional;
+  total_access += num_index;
+
+  return request_id;
+}
+
+template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_wait_async(uint64_t i_ptr, uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
@@ -601,6 +638,70 @@ void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll(uint64
 }
 
 template <typename TYPE>
+void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll_registered(uint64_t request_id)
+{
+  const auto *outstanding = this->iostack.front_outstanding();
+  if (outstanding == nullptr)
+  {
+    throw std::runtime_error("No registered outstanding request to poll");
+  }
+  if (request_id != 0 && outstanding->request_id != request_id)
+  {
+    throw std::runtime_error("Registered outstanding request id mismatch");
+  }
+
+  printf("BAM_Feature_Store::read_feature_single_page_single_thread_poll_registered..\n");
+  int64_t *index_ptr = reinterpret_cast<int64_t *>(outstanding->index_ptr);
+  const int64_t num_index = outstanding->num_index;
+  const int dim = outstanding->dim;
+  const int cache_dim = outstanding->cache_dim;
+  uint64_t b_size = blkSize;
+  uint64_t n_warp = b_size / 32;
+  uint64_t g_size = (num_index + n_warp - 1) / n_warp;
+
+  auto t1 = Clock::now();
+
+  s_ctx *d_warp_ctxs = this->iostack.front_ctxs();
+  uint64_t warps_per_block = b_size / 32;
+  uint64_t total_warps = g_size * warps_per_block;
+  uint64_t total_ctxs = total_warps * 32;
+  uint64_t poll_g_size = (num_index + b_size - 1) / b_size;
+  read_feature_kernel_single_page_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(
+      a->d_array_ptr, index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+
+  dump_warp_ctxs("wait_registered", d_warp_ctxs, total_ctxs);
+  cudaMemcpy(&cpu_access_count, d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  auto t2 = Clock::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+  const float ms_fractional = static_cast<float>(us.count()) / 1000;
+
+  kernel_time += ms_fractional;
+  total_access += num_index;
+}
+
+template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::service_registered_poll()
+{
+  const auto *outstanding = this->iostack.front_outstanding();
+  if (outstanding == nullptr)
+  {
+    return 0;
+  }
+  if (outstanding->ready)
+  {
+    return outstanding->request_id;
+  }
+
+  const uint64_t request_id = outstanding->request_id;
+  read_feature_single_page_single_thread_poll_registered(request_id);
+  if (!this->iostack.mark_front_ready(request_id))
+  {
+    throw std::runtime_error("Failed to mark registered outstanding request as ready");
+  }
+  return request_id;
+}
+
+template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature_get_feature_light(uint64_t i_ptr, uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
@@ -650,6 +751,31 @@ void BAM_Feature_Store<TYPE>::read_feature_get_feature_light(uint64_t i_ptr, uin
   total_access += num_index;
 
   return;
+}
+
+template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::get_registered_outstanding_count() const
+{
+  return this->iostack.outstanding_count();
+}
+
+template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::get_registered_front_request_id() const
+{
+  const auto *outstanding = this->iostack.front_outstanding();
+  return outstanding == nullptr ? 0 : outstanding->request_id;
+}
+
+template <typename TYPE>
+bool BAM_Feature_Store<TYPE>::registered_front_ready() const
+{
+  return this->iostack.front_outstanding_ready();
+}
+
+template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::get_registered_ready_front_request_id() const
+{
+  return this->iostack.front_ready_request_id();
 }
 
 template <typename TYPE>
@@ -1053,9 +1179,16 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("read_feature", &BAM_Feature_Store<float>::read_feature)
       // 异步函数绑定
       .def("read_feature_submit_async", &BAM_Feature_Store<float>::read_feature_submit_async)
+      .def("read_feature_submit_async_registered", &BAM_Feature_Store<float>::read_feature_submit_async_registered)
       .def("read_feature_wait_async", &BAM_Feature_Store<float>::read_feature_wait_async)
       .def("read_feature_single_page_single_thread_poll", &BAM_Feature_Store<float>::read_feature_single_page_single_thread_poll)
+      .def("read_feature_single_page_single_thread_poll_registered", &BAM_Feature_Store<float>::read_feature_single_page_single_thread_poll_registered)
+      .def("service_registered_poll", &BAM_Feature_Store<float>::service_registered_poll)
       .def("read_feature_get_feature_light", &BAM_Feature_Store<float>::read_feature_get_feature_light)
+      .def("get_registered_outstanding_count", &BAM_Feature_Store<float>::get_registered_outstanding_count)
+      .def("get_registered_front_request_id", &BAM_Feature_Store<float>::get_registered_front_request_id)
+      .def("registered_front_ready", &BAM_Feature_Store<float>::registered_front_ready)
+      .def("get_registered_ready_front_request_id", &BAM_Feature_Store<float>::get_registered_ready_front_request_id)
 
       .def("read_feature_hetero", &BAM_Feature_Store<float>::read_feature_hetero)
       .def("read_feature_merged_hetero", &BAM_Feature_Store<float>::read_feature_merged_hetero)
@@ -1083,7 +1216,14 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("read_feature_hetero", &BAM_Feature_Store<int64_t>::read_feature_hetero)
       // 异步函数绑定
       .def("read_feature_submit_async", &BAM_Feature_Store<int64_t>::read_feature_submit_async)
+      .def("read_feature_submit_async_registered", &BAM_Feature_Store<int64_t>::read_feature_submit_async_registered)
       .def("read_feature_wait_async", &BAM_Feature_Store<int64_t>::read_feature_wait_async)
+      .def("read_feature_single_page_single_thread_poll_registered", &BAM_Feature_Store<int64_t>::read_feature_single_page_single_thread_poll_registered)
+      .def("service_registered_poll", &BAM_Feature_Store<int64_t>::service_registered_poll)
+      .def("get_registered_outstanding_count", &BAM_Feature_Store<int64_t>::get_registered_outstanding_count)
+      .def("get_registered_front_request_id", &BAM_Feature_Store<int64_t>::get_registered_front_request_id)
+      .def("registered_front_ready", &BAM_Feature_Store<int64_t>::registered_front_ready)
+      .def("get_registered_ready_front_request_id", &BAM_Feature_Store<int64_t>::get_registered_ready_front_request_id)
 
       .def("read_feature_merged", &BAM_Feature_Store<int64_t>::read_feature_merged)
       .def("read_feature_merged_hetero", &BAM_Feature_Store<int64_t>::read_feature_merged_hetero)

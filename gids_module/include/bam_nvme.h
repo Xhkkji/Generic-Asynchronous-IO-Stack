@@ -107,12 +107,19 @@ struct BAM_Feature_Store {
   void read_feature_merged(int num_iter, const std::vector<uint64_t>&  i_ptr_list, const std::vector<uint64_t>& i_index_ptr_list, const std::vector<uint64_t>&   num_index, int dim, int cache_dim);
   void read_feature_merged_hetero(int num_iter, const std::vector<uint64_t>&  i_ptr_list, const std::vector<uint64_t>& i_index_ptr_list, const std::vector<uint64_t>&   num_index, int dim, int cache_dim, const std::vector<uint64_t>& key_off);
   void read_feature_submit_async(uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
+  uint64_t read_feature_submit_async_registered(uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
   void read_feature_wait_async(uint64_t tensor_ptr, uint64_t index_ptr,int64_t num_index, int dim, int cache_dim, uint64_t key_off);
 
   void read_feature_single_page_single_thread_poll(uint64_t i_index_ptr,
                                             int64_t num_index, int dim, int cache_dim, uint64_t key_off);
+  void read_feature_single_page_single_thread_poll_registered(uint64_t request_id);
+  uint64_t service_registered_poll();
   void read_feature_get_feature_light(uint64_t i_ptr, uint64_t i_index_ptr,
                                             int64_t num_index, int dim, int cache_dim, uint64_t key_off);
+  uint64_t get_registered_outstanding_count() const;
+  uint64_t get_registered_front_request_id() const;
+  bool registered_front_ready() const;
+  uint64_t get_registered_ready_front_request_id() const;
 
 
   void cpu_backing_buffer(uint64_t dim, uint64_t len);

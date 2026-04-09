@@ -160,6 +160,100 @@ class _PrefetchingIter_async(object):
         return batch
 
 
+class _PrefetchingIter_async_registered_poll(object):
+    def __init__(self, dataloader, dataloader_it, GIDS_Loader=None, prefetch_depth=1):
+        self.dataloader_it = dataloader_it
+        self.dataloader = dataloader
+        self.graph_sampler = self.dataloader.graph_sampler
+        self.GIDS_Loader = GIDS_Loader
+
+        self.prefetch_queue = []
+        self.exhausted = False
+        self.prefetch_depth = max(1, int(prefetch_depth))
+        print(f"GIDS.py提交(registered poll), prefetch:{self.prefetch_depth}..")
+
+        self._submit_prefetch()
+        self._poll_front_prefetch()
+        while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
+            self._submit_prefetch()
+
+    def start_profiling(self, output_dir="./profiler_logs"):
+        print("=== start_profiling called ===")
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        self.profiler.__enter__()
+
+    def stop_profiling(self):
+        print(f"=== stop_profiling called, profiler id: {id(self.profiler) if self.profiler else 'None'} ===")
+        if self.profiler:
+            self.profiler.__exit__(None, None, None)
+            print(self.profiler.key_averages().table(
+                sort_by="cuda_time_total",
+                row_limit=20
+            ))
+
+    def _submit_prefetch(self):
+        if self.exhausted:
+            return False
+
+        try:
+            next_batch = next(self.dataloader_it)
+            request_id = self.GIDS_Loader.fetch_feature_submit_registered(
+                self.dataloader.dim,
+                next_batch,
+                1,
+                self.GIDS_Loader.gids_device,
+            )
+            self.prefetch_queue.append({
+                "batch": next_batch,
+                "request_id": request_id,
+            })
+            return True
+        except StopIteration:
+            self.exhausted = True
+            return False
+
+    def _poll_front_prefetch(self):
+        if not self.prefetch_queue:
+            return
+
+        if self.GIDS_Loader.get_registered_ready_front_request_id() == self.prefetch_queue[0]["request_id"]:
+            return
+
+        request_id = self.GIDS_Loader.service_registered_poll()
+        if request_id != self.prefetch_queue[0]["request_id"]:
+            raise RuntimeError(
+                f"service_registered_poll返回了不匹配的request_id: {request_id} != {self.prefetch_queue[0]['request_id']}"
+            )
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.prefetch_queue and self.exhausted:
+            raise StopIteration
+
+        self._poll_front_prefetch()
+        next_item = self.prefetch_queue.pop(0)
+        next_batch = next_item["batch"]
+        batch = self.GIDS_Loader.fetch_feature_get_feature_light(
+            self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
+
+        self._poll_front_prefetch()
+        while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
+            self._submit_prefetch()
+
+        return batch
+
+
 class _PrefetchingIter_async_sample_io_pipeline(object):
     def __init__(self, dataloader, dataloader_it, GIDS_Loader=None):
         self.dataloader_it = dataloader_it
@@ -495,6 +589,10 @@ class GIDS_DGLDataLoader(torch.utils.data.DataLoader):
         # when spawning new Python threads.  This drastically slows down pinning features.
         num_threads = torch.get_num_threads() if self.num_workers > 0 else None
         force_sync_read = os.environ.get("GIDS_FORCE_SYNC_READ", "0") not in ("0", "", "false", "False")
+        if getattr(self.GIDS_Loader, "use_registered_poll", False):
+            return _PrefetchingIter_async_registered_poll(
+                self, super().__iter__(), GIDS_Loader=self.GIDS_Loader,
+                prefetch_depth=getattr(self.GIDS_Loader, "iter_prefetch_depth", 1))
         if getattr(self.GIDS_Loader, "use_async_sample_io_pipeline", False):
             return _PrefetchingIter_async_sample_io_pipeline(
                 self, super().__iter__(), GIDS_Loader=self.GIDS_Loader)
@@ -553,7 +651,8 @@ class GIDS():
         self.pre_submit__buffer_size = 1
         self.pre_fetch_list = []
         self.iter_prefetch_depth = 1
-        self.use_async_sample_io_pipeline = True
+        self.use_registered_poll = True
+        self.use_async_sample_io_pipeline = False
         self.sample_io_sampled_queue_size = 1
         self.sample_io_ready_queue_size = 1
         
@@ -691,6 +790,17 @@ class GIDS():
         self.GIDS_submit_time += time.time() - GIDS_time_start
         # print(f"Pre-submitted index.len{index_size}, index:{index[:10]}...")
         return index_size
+
+    def fetch_feature_submit_registered(self, dim, batch_info, pre_fetch_num, device):
+        GIDS_time_start = time.time()
+
+        index = batch_info[0].to(self.gids_device)
+        index_size = len(index)
+        index_ptr = index.data_ptr()
+        request_id = self.BAM_FS.read_feature_submit_async_registered(
+            index_ptr, index_size, dim, self.cache_dim, 0)
+        self.GIDS_submit_time += time.time() - GIDS_time_start
+        return request_id
     
     # 异步获取
     def fetch_feature_wait(self, dim, batch, device):
@@ -739,6 +849,29 @@ class GIDS():
         # else:
         #     batch.append(return_torch)
         #     return batch
+
+    def read_feature_single_page_single_thread_poll_registered(self, request_id):
+        GIDS_time_start = time.time()
+        self.BAM_FS.read_feature_single_page_single_thread_poll_registered(request_id)
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+
+    def service_registered_poll(self):
+        GIDS_time_start = time.time()
+        request_id = self.BAM_FS.service_registered_poll()
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+        return request_id
+
+    def get_registered_outstanding_count(self):
+        return self.BAM_FS.get_registered_outstanding_count()
+
+    def get_registered_front_request_id(self):
+        return self.BAM_FS.get_registered_front_request_id()
+
+    def registered_front_ready(self):
+        return self.BAM_FS.registered_front_ready()
+
+    def get_registered_ready_front_request_id(self):
+        return self.BAM_FS.get_registered_ready_front_request_id()
     
     
     # 异步轻量化轮询获取特征（不等待特征完全返回，而是先返回一个空的Tensor占位，后续通过其他机制确保特征数据被正确填充）
