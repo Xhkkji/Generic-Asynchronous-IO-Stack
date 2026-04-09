@@ -114,6 +114,7 @@ struct BAM_Feature_Store {
                                             int64_t num_index, int dim, int cache_dim, uint64_t key_off);
   void read_feature_single_page_single_thread_poll_registered(uint64_t request_id);
   uint64_t service_registered_poll();
+  uint64_t service_registered_poll_window(uint64_t window_size);
   void read_feature_get_feature_light(uint64_t i_ptr, uint64_t i_index_ptr,
                                             int64_t num_index, int dim, int cache_dim, uint64_t key_off);
   uint64_t read_feature_get_feature_light_registered(uint64_t i_ptr);

@@ -228,10 +228,11 @@ class _PrefetchingIter_async_registered_poll(object):
         if self.GIDS_Loader.get_registered_ready_front_request_id() == self.prefetch_queue[0]["request_id"]:
             return
 
-        request_id = self.GIDS_Loader.service_registered_poll()
+        window_size = max(1, int(getattr(self.GIDS_Loader, "registered_poll_window_size", 2)))
+        request_id = self.GIDS_Loader.service_registered_poll_window(window_size)
         if request_id != self.prefetch_queue[0]["request_id"]:
             raise RuntimeError(
-                f"service_registered_poll返回了不匹配的request_id: {request_id} != {self.prefetch_queue[0]['request_id']}"
+                f"service_registered_poll_window返回了不匹配的front-ready request_id: {request_id} != {self.prefetch_queue[0]['request_id']}"
             )
 
     def __iter__(self):
@@ -652,6 +653,7 @@ class GIDS():
         self.pre_fetch_list = []
         self.iter_prefetch_depth = 1
         self.use_registered_poll = True
+        self.registered_poll_window_size = 2
         self.use_async_sample_io_pipeline = False
         self.sample_io_sampled_queue_size = 1
         self.sample_io_ready_queue_size = 1
@@ -858,6 +860,12 @@ class GIDS():
     def service_registered_poll(self):
         GIDS_time_start = time.time()
         request_id = self.BAM_FS.service_registered_poll()
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+        return request_id
+
+    def service_registered_poll_window(self, window_size):
+        GIDS_time_start = time.time()
+        request_id = self.BAM_FS.service_registered_poll_window(window_size)
         self.GIDS_wait_time += time.time() - GIDS_time_start
         return request_id
 

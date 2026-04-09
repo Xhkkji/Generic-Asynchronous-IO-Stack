@@ -182,6 +182,28 @@ struct BaM_IOStack
     return &outstanding_queue.front();
   }
 
+  const outstanding_meta_t *outstanding_at(uint64_t offset) const
+  {
+    if (offset >= outstanding_queue.size())
+    {
+      return nullptr;
+    }
+    auto it = outstanding_queue.begin();
+    std::advance(it, offset);
+    return &(*it);
+  }
+
+  s_ctx *ctxs_at(uint64_t offset)
+  {
+    if (offset >= d_warp_ctxs_queue.size())
+    {
+      return nullptr;
+    }
+    auto it = d_warp_ctxs_queue.begin();
+    std::advance(it, offset);
+    return *it;
+  }
+
   uint64_t outstanding_count() const
   {
     return outstanding_queue.size();
@@ -220,6 +242,22 @@ struct BaM_IOStack
       return false;
     }
     outstanding_queue.front().state = READY;
+    return true;
+  }
+
+  bool mark_ready_at(uint64_t offset, uint64_t request_id)
+  {
+    if (offset >= outstanding_queue.size())
+    {
+      return false;
+    }
+    auto it = outstanding_queue.begin();
+    std::advance(it, offset);
+    if (request_id != 0 && it->request_id != request_id)
+    {
+      return false;
+    }
+    it->state = READY;
     return true;
   }
 

@@ -680,6 +680,51 @@ void BAM_Feature_Store<TYPE>::read_feature_single_page_single_thread_poll_regist
 }
 
 template <typename TYPE>
+static void poll_registered_outstanding_at(BAM_Feature_Store<TYPE> *store, uint64_t offset, uint64_t request_id)
+{
+  const auto *outstanding = store->iostack.outstanding_at(offset);
+  if (outstanding == nullptr)
+  {
+    throw std::runtime_error("No registered outstanding request at offset");
+  }
+  if (request_id != 0 && outstanding->request_id != request_id)
+  {
+    throw std::runtime_error("Registered outstanding request id mismatch at offset");
+  }
+
+  int64_t *index_ptr = reinterpret_cast<int64_t *>(outstanding->index_ptr);
+  const int64_t num_index = outstanding->num_index;
+  const int dim = outstanding->dim;
+  const int cache_dim = outstanding->cache_dim;
+  uint64_t b_size = store->blkSize;
+  uint64_t n_warp = b_size / 32;
+  uint64_t g_size = (num_index + n_warp - 1) / n_warp;
+
+  auto t1 = Clock::now();
+
+  s_ctx *d_warp_ctxs = store->iostack.ctxs_at(offset);
+  if (d_warp_ctxs == nullptr)
+  {
+    throw std::runtime_error("Registered ctxs are missing at offset");
+  }
+  uint64_t warps_per_block = b_size / 32;
+  uint64_t total_warps = g_size * warps_per_block;
+  uint64_t total_ctxs = total_warps * 32;
+  uint64_t poll_g_size = (num_index + b_size - 1) / b_size;
+  read_feature_kernel_single_page_single_thread_poll<TYPE><<<poll_g_size, b_size>>>(
+      store->a->d_array_ptr, index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
+
+  dump_warp_ctxs("wait_registered_window", d_warp_ctxs, total_ctxs);
+  cudaMemcpy(&store->cpu_access_count, store->d_cpu_access, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  auto t2 = Clock::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+  const float ms_fractional = static_cast<float>(us.count()) / 1000;
+
+  store->kernel_time += ms_fractional;
+  store->total_access += num_index;
+}
+
+template <typename TYPE>
 uint64_t BAM_Feature_Store<TYPE>::service_registered_poll()
 {
   const auto *outstanding = this->iostack.front_outstanding();
@@ -699,6 +744,38 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_poll()
     throw std::runtime_error("Failed to mark registered outstanding request as ready");
   }
   return request_id;
+}
+
+template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::service_registered_poll_window(uint64_t window_size)
+{
+  const uint64_t total = this->iostack.outstanding_count();
+  if (total == 0)
+  {
+    return 0;
+  }
+
+  const uint64_t limit = std::min<uint64_t>(std::max<uint64_t>(1, window_size), total);
+  for (uint64_t offset = 0; offset < limit; ++offset)
+  {
+    const auto *outstanding = this->iostack.outstanding_at(offset);
+    if (outstanding == nullptr)
+    {
+      break;
+    }
+    if (outstanding->state != BaM_IOStack<TYPE>::SUBMITTED)
+    {
+      continue;
+    }
+    const uint64_t request_id = outstanding->request_id;
+    poll_registered_outstanding_at(this, offset, request_id);
+    if (!this->iostack.mark_ready_at(offset, request_id))
+    {
+      throw std::runtime_error("Failed to mark registered outstanding request as ready in window");
+    }
+  }
+
+  return this->iostack.front_ready_request_id();
 }
 
 template <typename TYPE>
@@ -1247,6 +1324,7 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("read_feature_single_page_single_thread_poll", &BAM_Feature_Store<float>::read_feature_single_page_single_thread_poll)
       .def("read_feature_single_page_single_thread_poll_registered", &BAM_Feature_Store<float>::read_feature_single_page_single_thread_poll_registered)
       .def("service_registered_poll", &BAM_Feature_Store<float>::service_registered_poll)
+      .def("service_registered_poll_window", &BAM_Feature_Store<float>::service_registered_poll_window)
       .def("read_feature_get_feature_light", &BAM_Feature_Store<float>::read_feature_get_feature_light)
       .def("read_feature_get_feature_light_registered", &BAM_Feature_Store<float>::read_feature_get_feature_light_registered)
       .def("get_registered_outstanding_count", &BAM_Feature_Store<float>::get_registered_outstanding_count)
@@ -1286,6 +1364,7 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("read_feature_wait_async", &BAM_Feature_Store<int64_t>::read_feature_wait_async)
       .def("read_feature_single_page_single_thread_poll_registered", &BAM_Feature_Store<int64_t>::read_feature_single_page_single_thread_poll_registered)
       .def("service_registered_poll", &BAM_Feature_Store<int64_t>::service_registered_poll)
+      .def("service_registered_poll_window", &BAM_Feature_Store<int64_t>::service_registered_poll_window)
       .def("read_feature_get_feature_light_registered", &BAM_Feature_Store<int64_t>::read_feature_get_feature_light_registered)
       .def("get_registered_outstanding_count", &BAM_Feature_Store<int64_t>::get_registered_outstanding_count)
       .def("get_registered_front_request_id", &BAM_Feature_Store<int64_t>::get_registered_front_request_id)
