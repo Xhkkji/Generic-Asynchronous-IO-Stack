@@ -180,12 +180,11 @@ class _PrefetchingIter_async_registered_poll(object):
         print(f"GIDS.py提交(registered poll), prefetch:{self.prefetch_depth}..")
         self._debug_log(
             f"init prefetch_depth={self.prefetch_depth}, "
-            f"poll_window={getattr(self.GIDS_Loader, 'registered_poll_window_size', 1)}, "
+            f"poll_mode=front_only, "
             f"max_outstanding_ios={self.max_outstanding_ios}"
         )
 
         self._submit_prefetch()
-        self._poll_front_prefetch("init_poll")
         while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
             if not self._submit_prefetch():
                 break
@@ -298,15 +297,14 @@ class _PrefetchingIter_async_registered_poll(object):
             )
             return
 
-        window_size = max(1, int(getattr(self.GIDS_Loader, "registered_poll_window_size", 2)))
         self._debug_log(
             f"{label}_begin expected={expected_request_id}, ready_front={ready_request_id}, "
             f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
             f"state={self.GIDS_Loader.get_registered_front_state()}, "
-            f"window={window_size}, queue_len={len(self.prefetch_queue)}, "
+            f"queue_len={len(self.prefetch_queue)}, "
             f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
         )
-        request_id = self.GIDS_Loader.service_registered_poll_window(window_size)
+        request_id = self.GIDS_Loader.service_registered_poll()
         self._debug_log(
             f"{label}_done returned={request_id}, "
             f"ready_front={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
@@ -315,7 +313,7 @@ class _PrefetchingIter_async_registered_poll(object):
         )
         if request_id != expected_request_id:
             raise RuntimeError(
-                f"service_registered_poll_window返回了不匹配的front-ready request_id: {request_id} != {expected_request_id}"
+                f"service_registered_poll返回了不匹配的front-ready request_id: {request_id} != {expected_request_id}"
             )
 
     def __iter__(self):
@@ -348,7 +346,6 @@ class _PrefetchingIter_async_registered_poll(object):
             f"outstanding_ios={self.outstanding_io_count}"
         )
 
-        self._poll_front_prefetch("post_get_poll")
         while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
             if not self._submit_prefetch():
                 break

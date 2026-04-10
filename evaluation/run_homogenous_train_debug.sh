@@ -20,7 +20,7 @@ sudo env \
   --log_every 1000 \
   --uva_graph 1 \
   --GIDS \
-  --batch_size 512 \
+  --batch_size 1024 \
   --num_classes 19 \
   --data IGB \
   --emb_size 1024 \
