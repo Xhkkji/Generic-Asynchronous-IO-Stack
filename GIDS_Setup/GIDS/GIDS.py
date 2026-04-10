@@ -170,12 +170,25 @@ class _PrefetchingIter_async_registered_poll(object):
         self.prefetch_queue = []
         self.exhausted = False
         self.prefetch_depth = max(1, int(prefetch_depth))
+        self.pending_batch = None
+        self.pending_io_count = 0
+        self.outstanding_io_count = 0
+        self.max_outstanding_ios = max(0, int(getattr(
+            self.GIDS_Loader, "max_registered_outstanding_ios", 0)))
+        self.debug_registered_poll = os.environ.get(
+            "GIDS_REGISTERED_DEBUG", "0") not in ("0", "", "false", "False")
         print(f"GIDS.py提交(registered poll), prefetch:{self.prefetch_depth}..")
+        self._debug_log(
+            f"init prefetch_depth={self.prefetch_depth}, "
+            f"poll_window={getattr(self.GIDS_Loader, 'registered_poll_window_size', 1)}, "
+            f"max_outstanding_ios={self.max_outstanding_ios}"
+        )
 
         self._submit_prefetch()
-        self._poll_front_prefetch()
+        self._poll_front_prefetch("init_poll")
         while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
-            self._submit_prefetch()
+            if not self._submit_prefetch():
+                break
 
     def start_profiling(self, output_dir="./profiler_logs"):
         print("=== start_profiling called ===")
@@ -200,39 +213,109 @@ class _PrefetchingIter_async_registered_poll(object):
                 row_limit=20
             ))
 
-    def _submit_prefetch(self):
-        if self.exhausted:
-            return False
+    def _debug_log(self, message):
+        if self.debug_registered_poll:
+            print(f"[RegisteredPoll] {message}", flush=True)
 
+    def _get_next_batch_for_submit(self):
+        if self.pending_batch is not None:
+            return self.pending_batch, self.pending_io_count
         try:
             next_batch = next(self.dataloader_it)
-            request_id = self.GIDS_Loader.fetch_feature_submit_registered(
-                self.dataloader.dim,
-                next_batch,
-                1,
-                self.GIDS_Loader.gids_device,
-            )
-            self.prefetch_queue.append({
-                "batch": next_batch,
-                "request_id": request_id,
-            })
-            return True
+            self.pending_batch = next_batch
+            self.pending_io_count = len(next_batch[0])
+            return self.pending_batch, self.pending_io_count
         except StopIteration:
             self.exhausted = True
+            self._debug_log("submit_stop_iteration")
+            return None, 0
+
+    def _can_submit_ios(self, io_count):
+        if self.max_outstanding_ios <= 0:
+            return True
+        if self.outstanding_io_count == 0:
+            return True
+        return self.outstanding_io_count + io_count <= self.max_outstanding_ios
+
+    def _submit_prefetch(self):
+        if self.exhausted and self.pending_batch is None:
+            self._debug_log("submit_skip exhausted=True")
             return False
 
-    def _poll_front_prefetch(self):
+        self._debug_log(
+            f"submit_sample_begin queue_len={len(self.prefetch_queue)}, "
+            f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}, "
+            f"outstanding_ios={self.outstanding_io_count}"
+        )
+        next_batch, io_count = self._get_next_batch_for_submit()
+        if next_batch is None:
+            return False
+        if not self._can_submit_ios(io_count):
+            self._debug_log(
+                f"budget_block outstanding_ios={self.outstanding_io_count}, "
+                f"next_ios={io_count}, budget={self.max_outstanding_ios}"
+            )
+            return False
+        self._debug_log(
+            f"submit_begin ios={io_count}, queue_len={len(self.prefetch_queue)}, "
+            f"outstanding_before={self.GIDS_Loader.get_registered_outstanding_count()}, "
+            f"outstanding_ios_before={self.outstanding_io_count}"
+        )
+        request_id = self.GIDS_Loader.fetch_feature_submit_registered(
+            self.dataloader.dim,
+            next_batch,
+            1,
+            self.GIDS_Loader.gids_device,
+        )
+        self.prefetch_queue.append({
+            "batch": next_batch,
+            "request_id": request_id,
+            "io_count": io_count,
+        })
+        self.outstanding_io_count += io_count
+        self.pending_batch = None
+        self.pending_io_count = 0
+        self._debug_log(
+            f"submit_done request_id={request_id}, ios={io_count}, "
+            f"queue_len={len(self.prefetch_queue)}, "
+            f"outstanding_after={self.GIDS_Loader.get_registered_outstanding_count()}, "
+            f"outstanding_ios_after={self.outstanding_io_count}"
+        )
+        return True
+
+    def _poll_front_prefetch(self, label="poll"):
         if not self.prefetch_queue:
+            self._debug_log(f"{label}_skip_empty")
             return
 
-        if self.GIDS_Loader.get_registered_ready_front_request_id() == self.prefetch_queue[0]["request_id"]:
+        expected_request_id = self.prefetch_queue[0]["request_id"]
+        ready_request_id = self.GIDS_Loader.get_registered_ready_front_request_id()
+        if ready_request_id == expected_request_id:
+            self._debug_log(
+                f"{label}_skip_ready request_id={expected_request_id}, "
+                f"queue_len={len(self.prefetch_queue)}, "
+                f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+            )
             return
 
         window_size = max(1, int(getattr(self.GIDS_Loader, "registered_poll_window_size", 2)))
+        self._debug_log(
+            f"{label}_begin expected={expected_request_id}, ready_front={ready_request_id}, "
+            f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
+            f"state={self.GIDS_Loader.get_registered_front_state()}, "
+            f"window={window_size}, queue_len={len(self.prefetch_queue)}, "
+            f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+        )
         request_id = self.GIDS_Loader.service_registered_poll_window(window_size)
-        if request_id != self.prefetch_queue[0]["request_id"]:
+        self._debug_log(
+            f"{label}_done returned={request_id}, "
+            f"ready_front={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
+            f"state={self.GIDS_Loader.get_registered_front_state()}, "
+            f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+        )
+        if request_id != expected_request_id:
             raise RuntimeError(
-                f"service_registered_poll_window返回了不匹配的front-ready request_id: {request_id} != {self.prefetch_queue[0]['request_id']}"
+                f"service_registered_poll_window返回了不匹配的front-ready request_id: {request_id} != {expected_request_id}"
             )
 
     def __iter__(self):
@@ -242,16 +325,39 @@ class _PrefetchingIter_async_registered_poll(object):
         if not self.prefetch_queue and self.exhausted:
             raise StopIteration
 
-        self._poll_front_prefetch()
+        self._debug_log(
+            f"next_begin queue_len={len(self.prefetch_queue)}, exhausted={self.exhausted}, "
+            f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+        )
+        self._poll_front_prefetch("next_poll")
         next_item = self.prefetch_queue.pop(0)
         next_batch = next_item["batch"]
+        self._debug_log(
+            f"get_begin request_id={next_item['request_id']}, nodes={len(next_batch[0])}, "
+            f"queue_len_after_pop={len(self.prefetch_queue)}, "
+            f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+        )
         batch = self.GIDS_Loader.fetch_feature_get_feature_light_registered(
             self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
+        self.outstanding_io_count = max(
+            0, self.outstanding_io_count - next_item.get("io_count", len(next_batch[0])))
+        self._debug_log(
+            f"get_done request_id={next_item['request_id']}, "
+            f"last_consumed={self.GIDS_Loader.get_registered_last_consumed_request_id()}, "
+            f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}, "
+            f"outstanding_ios={self.outstanding_io_count}"
+        )
 
-        self._poll_front_prefetch()
+        self._poll_front_prefetch("post_get_poll")
         while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
-            self._submit_prefetch()
+            if not self._submit_prefetch():
+                break
 
+        self._debug_log(
+            f"return request_id={next_item['request_id']}, queue_len={len(self.prefetch_queue)}, "
+            f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}, "
+            f"outstanding_ios={self.outstanding_io_count}"
+        )
         return batch
 
 
@@ -651,9 +757,11 @@ class GIDS():
         self.pre_submit_buffer_isInit = False
         self.pre_submit__buffer_size = 1
         self.pre_fetch_list = []
-        self.iter_prefetch_depth = 1
+        self.iter_prefetch_depth = 3
         self.use_registered_poll = True
-        self.registered_poll_window_size = 1
+        self.registered_poll_window_size = 2
+        self.max_registered_outstanding_ios = int(os.environ.get(
+            "GIDS_MAX_REGISTERED_OUTSTANDING_IOS", "0"))
         self.use_async_sample_io_pipeline = False
         self.sample_io_sampled_queue_size = 1
         self.sample_io_ready_queue_size = 1
