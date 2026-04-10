@@ -653,7 +653,7 @@ class GIDS():
         self.pre_fetch_list = []
         self.iter_prefetch_depth = 1
         self.use_registered_poll = True
-        self.registered_poll_window_size = 2
+        self.registered_poll_window_size = 1
         self.use_async_sample_io_pipeline = False
         self.sample_io_sampled_queue_size = 1
         self.sample_io_ready_queue_size = 1
