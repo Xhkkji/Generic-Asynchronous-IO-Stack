@@ -56,6 +56,7 @@ struct s_ctx
 
     // 修改：自加， 用于异步
     uint16_t cid;
+    uint8_t has_pending_io;
     nvm_cmd_t cmd;
     uint32_t page_trans;
 
@@ -77,7 +78,10 @@ struct s_ctx
 
     // 添加构造函数确保初始化
     __device__ s_ctx() : addr(0), r(-1), eq_mask(0), master(-1),
-                         count(0), base_master(0), observed_page_translation(0), isHit(false) {}
+                         count(0), base_master(0), observed_page_translation(0), isHit(false)
+    {
+        has_pending_io = 0;
+    }
 };
 
 template <typename T>
@@ -100,6 +104,7 @@ struct BaM_IOStack
     uint64_t key_off = 0;
     s_ctx *ctxs = nullptr;
     uint64_t ctx_count = 0;
+    uint32_t ctx_stride = 32;
     request_state_t state = SUBMITTED;
   };
 
@@ -136,7 +141,8 @@ struct BaM_IOStack
   }
 
   uint64_t register_outstanding(s_ctx *ctxs, uint64_t ctx_count, uint64_t index_ptr,
-                                int64_t num_index, int dim, int cache_dim, uint64_t key_off)
+                                int64_t num_index, int dim, int cache_dim, uint64_t key_off,
+                                uint32_t ctx_stride = 32)
   {
     push_ctxs(ctxs, ctx_count);
 
@@ -149,6 +155,7 @@ struct BaM_IOStack
     meta.key_off = key_off;
     meta.ctxs = ctxs;
     meta.ctx_count = ctx_count;
+    meta.ctx_stride = ctx_stride;
     outstanding_queue.push_back(meta);
     return meta.request_id;
   }

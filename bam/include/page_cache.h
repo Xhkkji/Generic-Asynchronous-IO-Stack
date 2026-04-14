@@ -3406,7 +3406,7 @@ struct array_d_t
         //     printf("submit i:%lu, r:%lu\n", i, r);
         // }
         // ctx.lane = lane;
-        // ctx.r = r;
+        ctx.r = r;
 
         void *ret = nullptr;
         page_ = nullptr;
@@ -5056,6 +5056,7 @@ inline __device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp,
     uint16_t sq_pos = sq_enqueue(&qp->sq, &cmd); // 将命令放入提交队列 (Submission Queue),sq_pos：命令在 SQ 中的位置
     // printf("NVMe命令已提交,sq_pos:%d..\n", sq_pos); 
     ctx.cid = cid;
+    ctx.has_pending_io = 1;
     ctx.cmd = cmd;
     // printf("NVMe命令已提交..\n"); // 执行到
     
@@ -5081,6 +5082,7 @@ inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, c
     // enqueue_second(pc, qp, starting_lba, &ctx.cmd, ctx.cid, pc_pos, pc_prev_head);  // XXX导致轮询强制变成同步
 
     put_cid(&qp->sq, ctx.cid);
+    ctx.has_pending_io = 0;
 }
 
 inline __device__ bool read_data_try_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx)
@@ -5106,6 +5108,7 @@ inline __device__ bool read_data_try_wait_async(page_cache_d_t *pc, QueuePair *q
 
     cq_dequeue(&qp->cq, cq_pos, &qp->sq, head, head_);
     put_cid(&qp->sq, ctx.cid);
+    ctx.has_pending_io = 0;
     return true;
 }
 

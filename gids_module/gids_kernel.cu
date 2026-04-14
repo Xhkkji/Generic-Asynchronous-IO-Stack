@@ -217,6 +217,24 @@ __global__ void read_feature_kernel_single_page_single_thread_poll(array_d_t<T> 
 }
 
 template <typename T = float>
+__global__ void read_feature_kernel_single_page_single_thread_poll_rowctx(array_d_t<T> *dr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_row_ctxs)
+{
+  (void)dim;
+  uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (global_tid < static_cast<uint32_t>(num_idx))
+  {
+    bam_ptr<T> ptr(dr, false);
+    uint64_t row_index = index_ptr[global_tid] + key_off;
+    const uint64_t submit_idx = (row_index) * cache_dim;
+    s_ctx& ctx = d_row_ctxs[global_tid];
+    ptr.read_single_thread_poll(submit_idx, ctx);
+  }
+}
+
+template <typename T = float>
 __global__ void read_feature_kernel_single_page_single_thread_try_poll(array_d_t<T> *dr,
                                     int64_t *index_ptr, int dim,
                                     int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs,
@@ -235,6 +253,301 @@ __global__ void read_feature_kernel_single_page_single_thread_try_poll(array_d_t
     {
       atomicAdd(pending_count, 1U);
     }
+  }
+}
+
+template <typename T = float>
+__global__ void read_feature_kernel_single_page_single_thread_try_poll_serial(array_d_t<T> *dr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs,
+                                    uint32_t *pending_count)
+{
+  (void)dim;
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+  {
+    return;
+  }
+
+  bam_ptr<T> ptr(dr, false);
+  uint32_t local_pending = 0;
+  for (int64_t row = 0; row < num_idx; ++row)
+  {
+    uint64_t row_index = index_ptr[row] + key_off;
+    const uint64_t submit_idx = row_index * cache_dim;
+    s_ctx &ctx = d_warp_ctxs[row * 32];
+    if (!ptr.read_single_thread_try_poll(submit_idx, ctx))
+    {
+      ++local_pending;
+    }
+  }
+  *pending_count = local_pending;
+}
+
+template <typename T = float>
+__global__ void read_feature_kernel_submit_async_rowctx(array_d_t<T> *dr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_row_ctxs)
+{
+  (void)dim;
+  uint64_t bid = blockIdx.x;
+  int num_warps = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  int lane_id = threadIdx.x % 32;
+  int idx_idx = bid * num_warps + warp_id;
+
+  if (idx_idx >= num_idx || lane_id != 0)
+  {
+    return;
+  }
+
+  bam_ptr<T> ptr(dr, false);
+  uint64_t row_index = index_ptr[idx_idx] + key_off;
+  const uint64_t submit_idx = row_index * cache_dim;
+  s_ctx &ctx = d_row_ctxs[idx_idx];
+  ptr.read_submit_async(submit_idx, ctx);
+}
+
+template <typename T = float>
+__global__ void read_feature_kernel_get_feature_light_rowctx(array_d_t<T> *dr, T *out_tensor_ptr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_row_ctxs)
+{
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= static_cast<uint32_t>(num_idx))
+  {
+    return;
+  }
+
+  bam_ptr<T> ptr(dr, true);
+  uint64_t row_index = index_ptr[row] + key_off;
+  s_ctx &ctx = d_row_ctxs[row];
+  for (int tid = 0; tid < dim; ++tid)
+  {
+    out_tensor_ptr[static_cast<uint64_t>(row) * dim + tid] =
+        ptr.read_post_poll_light(static_cast<uint64_t>(row_index) * cache_dim + tid, ctx);
+  }
+}
+
+template <typename T = float>
+__device__ bool finalize_registered_ctx_completion(array_d_t<T> *dr, s_ctx &ctx)
+{
+  if (ctx.isHit || ctx.r < 0)
+  {
+    return false;
+  }
+
+  auto range = dr->d_ranges + ctx.r;
+  data_page_t &page = range->pages[ctx.page];
+  const uint64_t read_state = page.state.load(simt::memory_order_acquire);
+  const uint64_t st = (read_state >> (CNT_SHIFT + 1)) & 0x03;
+
+  if (st == V_NB)
+  {
+    const uint32_t page_trans = page.offset;
+    ctx.page_trans = page_trans;
+    ctx.observed_page_translation = (page_trans == ASYNC_PAGE_TRANS_PENDING || page_trans >= range->cache.n_pages)
+                                        ? 0
+                                        : range->cache.cache_pages[page_trans].page_translation;
+    ctx.isHit = true;
+    ctx.has_pending_io = 0;
+    page.polling_flag.store(0, simt::memory_order_release);
+    return true;
+  }
+
+  if (st != NV_B)
+  {
+    return false;
+  }
+
+  page.offset = ctx.page_trans;
+  ctx.observed_page_translation = (ctx.page_trans == ASYNC_PAGE_TRANS_PENDING || ctx.page_trans >= range->cache.n_pages)
+                                      ? 0
+                                      : range->cache.cache_pages[ctx.page_trans].page_translation;
+  range->miss_cnt.fetch_add(ctx.count, simt::memory_order_relaxed);
+  page.state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
+  page.polling_flag.store(0, simt::memory_order_release);
+  ctx.isHit = true;
+  ctx.has_pending_io = 0;
+  return true;
+}
+
+template <typename T = float>
+__device__ bool refresh_registered_ctx_from_valid_page(array_d_t<T> *dr, s_ctx &ctx)
+{
+  if (ctx.isHit || ctx.r < 0)
+  {
+    return ctx.isHit;
+  }
+
+  auto range = dr->d_ranges + ctx.r;
+  data_page_t &page = range->pages[ctx.page];
+  const uint64_t read_state = page.state.load(simt::memory_order_acquire);
+  const uint64_t st = (read_state >> (CNT_SHIFT + 1)) & 0x03;
+  if (st != V_NB)
+  {
+    return false;
+  }
+
+  const uint32_t page_trans = page.offset;
+  if (page_trans == ASYNC_PAGE_TRANS_PENDING || page_trans >= range->cache.n_pages)
+  {
+    return false;
+  }
+
+  ctx.page_trans = page_trans;
+  ctx.observed_page_translation = range->cache.cache_pages[page_trans].page_translation;
+  ctx.isHit = true;
+  page.polling_flag.store(0, simt::memory_order_release);
+  return true;
+}
+
+template <typename T = float>
+__global__ void register_registered_ctx_lookup_kernel(array_d_t<T> *dr,
+                                                      s_ctx *d_row_ctxs,
+                                                      int64_t num_index,
+                                                      uint32_t n_ctrls,
+                                                      uint32_t cid_capacity,
+                                                      s_ctx **ctx_lookup)
+{
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= static_cast<uint32_t>(num_index))
+  {
+    return;
+  }
+
+  s_ctx &ctx = d_row_ctxs[row];
+  if (ctx.r < 0 || ctx.isHit || ctx.has_pending_io == 0)
+  {
+    return;
+  }
+
+  uint32_t logical_queue_idx = ctx.queue;
+  for (uint32_t ctrl_idx = 0; ctrl_idx < ctx.ctrl && ctrl_idx < n_ctrls; ++ctrl_idx)
+  {
+    Controller *candidate = dr->d_ranges[0].cache.d_ctrls[ctrl_idx];
+    if (candidate == nullptr)
+    {
+      return;
+    }
+    logical_queue_idx += candidate->n_qps;
+  }
+
+  if (ctx.cid >= cid_capacity)
+  {
+    return;
+  }
+
+  const uint64_t slot = static_cast<uint64_t>(logical_queue_idx) * cid_capacity + ctx.cid;
+  ctx_lookup[slot] = &ctx;
+}
+
+template <typename T = float>
+__global__ void service_registered_cq_window_kernel(array_d_t<T> *dr,
+                                                    uint32_t n_ctrls,
+                                                    uint32_t total_logical_queues,
+                                                    uint32_t *event_count,
+                                                    uint32_t *progress_count,
+                                                    uint32_t *lookup_miss_count,
+                                                    uint32_t max_events_per_queue,
+                                                    uint32_t cid_capacity,
+                                                    s_ctx **ctx_lookup)
+{
+  if (ctx_lookup == nullptr)
+  {
+    return;
+  }
+
+  uint32_t logical_queue_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (logical_queue_idx >= total_logical_queues)
+  {
+    return;
+  }
+
+  Controller *ctrl = nullptr;
+  uint32_t local_queue_idx = logical_queue_idx;
+  uint32_t ctrl_idx = 0;
+  for (; ctrl_idx < n_ctrls; ++ctrl_idx)
+  {
+    Controller *candidate = dr->d_ranges[0].cache.d_ctrls[ctrl_idx];
+    if (candidate == nullptr)
+    {
+      return;
+    }
+    if (local_queue_idx < candidate->n_qps)
+    {
+      ctrl = candidate;
+      break;
+    }
+    local_queue_idx -= candidate->n_qps;
+  }
+
+  if (ctrl == nullptr || local_queue_idx >= ctrl->n_qps)
+  {
+    return;
+  }
+
+  QueuePair *qp = (ctrl->d_qps) + local_queue_idx;
+  uint32_t handled = 0;
+  while (handled < max_events_per_queue)
+  {
+    uint16_t cid = 0;
+    uint32_t cq_pos = 0;
+    uint32_t loc = 0;
+    uint32_t head = 0;
+    if (!cq_try_peek_head(&qp->cq, &cid, &cq_pos, &loc, &head))
+    {
+      break;
+    }
+
+    qp->cq.tail.fetch_add(1, simt::memory_order_acq_rel);
+    cq_dequeue(&qp->cq, cq_pos, &qp->sq, loc, head);
+    put_cid(&qp->sq, cid);
+    atomicAdd(event_count, 1U);
+    ++handled;
+
+    if (cid >= cid_capacity)
+    {
+      atomicAdd(lookup_miss_count, 1U);
+      continue;
+    }
+
+    const uint64_t slot = static_cast<uint64_t>(logical_queue_idx) * cid_capacity + cid;
+    s_ctx *ctx_ptr = ctx_lookup[slot];
+    if (ctx_ptr == nullptr)
+    {
+      atomicAdd(lookup_miss_count, 1U);
+      continue;
+    }
+
+    if (finalize_registered_ctx_completion(dr, *ctx_ptr))
+    {
+      atomicAdd(progress_count, 1U);
+    }
+    ctx_lookup[slot] = nullptr;
+  }
+}
+
+template <typename T = float>
+__global__ void check_registered_request_ready_kernel(array_d_t<T> *dr,
+                                                      s_ctx *d_warp_ctxs,
+                                                      int64_t num_index,
+                                                      uint32_t ctx_stride,
+                                                      uint32_t *pending_count)
+{
+  uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (global_tid >= static_cast<uint32_t>(num_index))
+  {
+    return;
+  }
+
+  s_ctx &ctx = d_warp_ctxs[static_cast<uint64_t>(global_tid) * ctx_stride];
+  if (!ctx.isHit)
+  {
+    refresh_registered_ctx_from_valid_page(dr, ctx);
+  }
+  if (!ctx.isHit)
+  {
+    atomicAdd(pending_count, 1U);
   }
 }
 // 单独获取，走状态机

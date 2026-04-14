@@ -378,13 +378,16 @@ class _PrefetchingIter_async_registered_try_service(object):
         self.try_window_size = max(1, int(getattr(
             self.GIDS_Loader, "registered_try_window_size",
             getattr(self.GIDS_Loader, "registered_poll_window_size", 1))))
+        self.try_poll_fallback_loops = max(32, int(getattr(
+            self.GIDS_Loader, "registered_try_fallback_loops", 256)))
         self.debug_registered_poll = os.environ.get(
             "GIDS_REGISTERED_DEBUG", "0") not in ("0", "", "false", "False")
         print(f"GIDS.py提交(registered try service), prefetch:{self.prefetch_depth}..")
         self._debug_log(
             f"init prefetch_depth={self.prefetch_depth}, "
             f"poll_mode=try_service, try_window={self.try_window_size}, "
-            f"max_outstanding_ios={self.max_outstanding_ios}"
+            f"max_outstanding_ios={self.max_outstanding_ios}, "
+            f"fallback_loops={self.try_poll_fallback_loops}"
         )
 
         # Warmup: 第 0 个 iter 先只保留 1 个 outstanding，避免首轮 front poll
@@ -453,7 +456,7 @@ class _PrefetchingIter_async_registered_try_service(object):
             )
             return False
 
-        request_id = self.GIDS_Loader.fetch_feature_submit_registered(
+        request_id = self.GIDS_Loader.fetch_feature_submit_registered_rowctx(
             self.dataloader.dim,
             next_batch,
             1,
@@ -518,16 +521,45 @@ class _PrefetchingIter_async_registered_try_service(object):
             f"state={self.GIDS_Loader.get_registered_front_state()}, "
             f"queue_len={len(self.prefetch_queue)}"
         )
-        request_id = self.GIDS_Loader.service_registered_poll()
-        self._debug_log(
-            f"{label}_done returned={request_id}, "
-            f"ready_front={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
-            f"state={self.GIDS_Loader.get_registered_front_state()}"
-        )
-        if request_id != expected_request_id:
-            raise RuntimeError(
-                f"service_registered_poll返回了不匹配的front-ready request_id: {request_id} != {expected_request_id}"
+        outstanding_count = self.GIDS_Loader.get_registered_outstanding_count()
+        if outstanding_count <= 1:
+            self._debug_log(
+                f"{label}_fallback_single expected={expected_request_id}, "
+                f"outstanding={outstanding_count}"
             )
+            request_id = self.GIDS_Loader.service_registered_poll_compatible()
+            self._debug_log(
+                f"{label}_fallback_single_done returned={request_id}, "
+                f"ready_front={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
+                f"state={self.GIDS_Loader.get_registered_front_state()}"
+            )
+            return
+        try_loops = 0
+        while True:
+            request_id = self.GIDS_Loader.service_registered_try_poll()
+            try_loops += 1
+            ready_request_id = self.GIDS_Loader.get_registered_ready_front_request_id()
+            if ready_request_id == expected_request_id:
+                self._debug_log(
+                    f"{label}_done returned={request_id}, loops={try_loops}, "
+                    f"ready_front={ready_request_id}, "
+                    f"state={self.GIDS_Loader.get_registered_front_state()}"
+                )
+                return
+            if try_loops % 8 == 0:
+                self._debug_log(
+                    f"{label}_retry loops={try_loops}, returned={request_id}, "
+                    f"ready_front={ready_request_id}, "
+                    f"state={self.GIDS_Loader.get_registered_front_state()}"
+                )
+                self._service_prefetch_nonblocking(f"{label}_window")
+            if try_loops >= self.try_poll_fallback_loops:
+                self._debug_log(
+                    f"{label}_continue_try loops={try_loops}, expected={expected_request_id}, "
+                    f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
+                    f"state={self.GIDS_Loader.get_registered_front_state()}"
+                )
+                try_loops = 0
 
     def __iter__(self):
         return self
@@ -540,7 +572,7 @@ class _PrefetchingIter_async_registered_try_service(object):
         self._service_prefetch_nonblocking("after_front_ready_service")
         next_item = self.prefetch_queue.pop(0)
         next_batch = next_item["batch"]
-        batch = self.GIDS_Loader.fetch_feature_get_feature_light_registered(
+        batch = self.GIDS_Loader.fetch_feature_get_feature_light_registered_rowctx(
             self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
         self.outstanding_io_count = max(
             0, self.outstanding_io_count - next_item.get("io_count", len(next_batch[0])))
@@ -1116,7 +1148,18 @@ class GIDS():
         index = batch_info[0].to(self.gids_device)
         index_size = len(index)
         index_ptr = index.data_ptr()
-        request_id = self.BAM_FS.read_feature_submit_async_registered(
+        request_id = self.BAM_FS.read_feature_submit_async_registered_rowctx(
+            index_ptr, index_size, dim, self.cache_dim, 0)
+        self.GIDS_submit_time += time.time() - GIDS_time_start
+        return request_id
+
+    def fetch_feature_submit_registered_rowctx(self, dim, batch_info, pre_fetch_num, device):
+        GIDS_time_start = time.time()
+
+        index = batch_info[0].to(self.gids_device)
+        index_size = len(index)
+        index_ptr = index.data_ptr()
+        request_id = self.BAM_FS.read_feature_submit_async_registered_rowctx(
             index_ptr, index_size, dim, self.cache_dim, 0)
         self.GIDS_submit_time += time.time() - GIDS_time_start
         return request_id
@@ -1176,7 +1219,13 @@ class GIDS():
 
     def service_registered_poll(self):
         GIDS_time_start = time.time()
-        request_id = self.BAM_FS.service_registered_poll()
+        request_id = self.BAM_FS.service_registered_poll_compatible()
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+        return request_id
+
+    def service_registered_poll_compatible(self):
+        GIDS_time_start = time.time()
+        request_id = self.BAM_FS.service_registered_poll_compatible()
         self.GIDS_wait_time += time.time() - GIDS_time_start
         return request_id
 
@@ -1253,7 +1302,23 @@ class GIDS():
         index = batch[0].to(self.gids_device)
         index_size = len(index)
         return_torch = torch.zeros([index_size, dim], dtype=torch.float, device=self.gids_device).contiguous()
-        request_id = self.BAM_FS.read_feature_get_feature_light_registered(return_torch.data_ptr())
+        request_id = self.BAM_FS.read_feature_get_feature_light_registered_rowctx(return_torch.data_ptr())
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+
+        if type(batch) is tuple:
+            batch2 = (*batch, return_torch)
+            return batch2
+        else:
+            batch.append(return_torch)
+            return batch
+
+    def fetch_feature_get_feature_light_registered_rowctx(self, dim, batch, device):
+        GIDS_time_start = time.time()
+
+        index = batch[0].to(self.gids_device)
+        index_size = len(index)
+        return_torch = torch.zeros([index_size, dim], dtype=torch.float, device=self.gids_device).contiguous()
+        request_id = self.BAM_FS.read_feature_get_feature_light_registered_rowctx(return_torch.data_ptr())
         self.GIDS_wait_time += time.time() - GIDS_time_start
 
         if type(batch) is tuple:
