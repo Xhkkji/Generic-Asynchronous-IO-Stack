@@ -574,6 +574,14 @@ struct bam_ptr
 
     __forceinline__
         __host__ __device__ T *
+        update_page_single_thread_try_poll(const size_t i, s_ctx &ctx)
+    {
+        addr = (T *)array->acquire_page_single_thread_try_poll(i, page, start, end, range_id, ctx);
+        return addr;
+    }
+
+    __forceinline__
+        __host__ __device__ T *
         update_page_post_poll_light(const size_t i, s_ctx &ctx)
     {
         addr = (T *)array->acquire_page_post_poll_light(i, page, start, end, range_id, ctx);
@@ -673,6 +681,14 @@ struct bam_ptr
         // ctx.addr = addr;
 
         return addr[i - start];    // 不是这里的问题
+    }
+
+    __forceinline__
+        __host__ __device__
+            bool
+            read_single_thread_try_poll(size_t i, s_ctx &ctx)
+    {
+        return update_page_single_thread_try_poll(i, ctx) != nullptr;
     }
 
     __forceinline__
@@ -1137,6 +1153,7 @@ __device__ void write_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t sta
 // 异步版本
 __device__ void read_data_submit_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx);
 __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx);
+__device__ bool read_data_try_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx);
 // 修改后的异步版本 read_data
 // __device__ void read_data_submit(
 //     page_cache_d_t *pc,
@@ -1605,6 +1622,11 @@ struct range_d_t
         __device__
             uint64_t
             acquire_page_wait_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl, const uint32_t queue, s_ctx &ctx);
+
+    __forceinline__
+        __device__
+            bool
+            acquire_page_try_wait_async(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl, const uint32_t queue, s_ctx &ctx, uint64_t &resolved_page_trans);
 
     // 修改
     // __forceinline__
@@ -2570,6 +2592,96 @@ __forceinline__
 template <typename T>
 __forceinline__
     __device__
+        bool
+        range_d_t<T>::acquire_page_try_wait_async(const size_t pg, const uint32_t count, const bool write,
+                                                  const uint32_t ctrl_, const uint32_t queue, s_ctx &ctx,
+                                                  uint64_t &resolved_page_trans)
+{
+    (void)ctrl_;
+    uint64_t index = pg;
+    uint64_t read_state = pages[index].state.load(simt::memory_order_acquire);
+
+    if (ctx.isHit)
+    {
+        ctx.observed_page_translation = (ctx.page_trans == ASYNC_PAGE_TRANS_PENDING || ctx.page_trans >= cache.n_pages)
+                                            ? 0
+                                            : cache.cache_pages[ctx.page_trans].page_translation;
+        resolved_page_trans = ctx.page_trans;
+        return true;
+    }
+
+    const uint64_t st = (read_state >> (CNT_SHIFT + 1)) & 0x03;
+    switch (st)
+    {
+    case V_NB:
+    {
+        pages[index].polling_flag.store(0, simt::memory_order_release);
+        if (write && ((read_state & DIRTY) == 0))
+            pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+        uint32_t page_trans = pages[index].offset;
+        ctx.page_trans = page_trans;
+        ctx.observed_page_translation = (page_trans == ASYNC_PAGE_TRANS_PENDING || page_trans >= cache.n_pages)
+                                            ? 0
+                                            : cache.cache_pages[page_trans].page_translation;
+        resolved_page_trans = page_trans;
+        return true;
+    }
+    case NV_B:
+    {
+        uint32_t expected = 0;
+        uint32_t desired = 1;
+        if (pages[index].polling_flag.compare_exchange_strong(
+                expected, desired, simt::memory_order_acquire, simt::memory_order_relaxed))
+        {
+            uint64_t b_page = get_backing_page(index);
+            uint64_t ctrl = ctx.member_acquire_ctrl;
+            Controller *c = cache.d_ctrls[ctrl];
+
+            if (!read_data_try_wait_async(&cache, (c->d_qps) + queue,
+                                          ((b_page) * cache.n_blocks_per_page),
+                                          cache.n_blocks_per_page, ctx))
+            {
+                pages[index].polling_flag.store(0, simt::memory_order_release);
+                return false;
+            }
+
+            pages[index].offset = ctx.page_trans;
+            ctx.observed_page_translation = (ctx.page_trans == ASYNC_PAGE_TRANS_PENDING || ctx.page_trans >= cache.n_pages)
+                                                ? 0
+                                                : cache.cache_pages[ctx.page_trans].page_translation;
+            miss_cnt.fetch_add(count, simt::memory_order_relaxed);
+            if (write)
+                pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+            pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
+            pages[index].polling_flag.store(0, simt::memory_order_release);
+            ctx.isHit = true;
+            resolved_page_trans = ctx.page_trans;
+            return true;
+        }
+
+        read_state = pages[index].state.load(simt::memory_order_acquire);
+        if (((read_state >> (CNT_SHIFT + 1)) & 0x03) == V_NB)
+        {
+            uint32_t page_trans = pages[index].offset;
+            ctx.page_trans = page_trans;
+            ctx.observed_page_translation = (page_trans == ASYNC_PAGE_TRANS_PENDING || page_trans >= cache.n_pages)
+                                                ? 0
+                                                : cache.cache_pages[page_trans].page_translation;
+            resolved_page_trans = page_trans;
+            return true;
+        }
+        return false;
+    }
+    case NV_NB:
+    case V_B:
+    default:
+        return false;
+    }
+}
+
+template <typename T>
+__forceinline__
+    __device__
         uint64_t
         range_d_t<T>::wb_cont_acquire_page(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl_, const uint32_t queue,
                                            uint32_t *wb_queue_counter, uint32_t wb_depth, T *queue_ptr,
@@ -3458,6 +3570,37 @@ struct array_d_t
             ret = (void *)r_->get_cache_page_addr(base_master);
             start = r_->n_elems_per_page * page;
             end = start + r_->n_elems_per_page; // * (page+1);
+        }
+
+        return ret;
+    }
+
+    __forceinline__
+        __device__ void *
+        acquire_page_single_thread_try_poll(const size_t i, data_page_t *&page_, size_t &start, size_t &end, int64_t &r, s_ctx &ctx) const
+    {
+        r = find_range(i);
+        auto r_ = d_ranges + r;
+
+        void *ret = nullptr;
+        page_ = nullptr;
+        if (r != -1)
+        {
+            uint64_t base_master = ctx.base_master;
+            uint32_t count = ctx.count;
+            uint64_t page = r_->get_page(i);
+            uint64_t resolved_page_trans = 0;
+
+            if (!r_->acquire_page_try_wait_async(page, count, false, ctx.ctrl, ctx.queue, ctx, resolved_page_trans))
+            {
+                return nullptr;
+            }
+
+            ctx.base_master = resolved_page_trans;
+            page_ = &r_->pages[resolved_page_trans];
+            ret = (void *)r_->get_cache_page_addr(resolved_page_trans);
+            start = r_->n_elems_per_page * page;
+            end = start + r_->n_elems_per_page;
         }
 
         return ret;
@@ -4938,6 +5081,32 @@ inline __device__ void read_data_wait_async(page_cache_d_t *pc, QueuePair *qp, c
     // enqueue_second(pc, qp, starting_lba, &ctx.cmd, ctx.cid, pc_pos, pc_prev_head);  // XXX导致轮询强制变成同步
 
     put_cid(&qp->sq, ctx.cid);
+}
+
+inline __device__ bool read_data_try_wait_async(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, s_ctx &ctx)
+{
+    (void)starting_lba;
+    (void)n_blocks;
+
+    uint32_t head = 0;
+    uint32_t head_ = 0;
+    uint32_t cq_pos = 0;
+    if (!cq_try_poll(&qp->cq, ctx.cid, &cq_pos, &head, &head_))
+    {
+        return false;
+    }
+
+    uint64_t pc_pos;
+    uint64_t pc_prev_head;
+    qp->cq.tail.fetch_add(1, simt::memory_order_acq_rel);
+    pc_prev_head = pc->q_head->load(simt::memory_order_relaxed);
+    pc_pos = pc->q_tail->fetch_add(1, simt::memory_order_acq_rel);
+    (void)pc_prev_head;
+    (void)pc_pos;
+
+    cq_dequeue(&qp->cq, cq_pos, &qp->sq, head, head_);
+    put_cid(&qp->sq, ctx.cid);
+    return true;
 }
 
 inline __device__ void write_data(page_cache_d_t *pc, QueuePair *qp, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long pc_entry)

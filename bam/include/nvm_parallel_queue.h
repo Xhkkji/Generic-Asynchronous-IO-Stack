@@ -840,6 +840,36 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
 }
 
 inline __device__
+bool cq_try_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* pos = NULL, uint32_t* loc_ = NULL, uint32_t* cq_head = NULL) {
+    uint32_t head = cq->head.load(simt::memory_order_relaxed);
+    for (size_t i = 0; i < cq->qs_minus_1; i++) {
+        uint32_t cur_head = head + i;
+        bool search_phase = ((~(cur_head >> cq->qs_log2)) & 0x01);
+        uint32_t loc = cur_head & (cq->qs_minus_1);
+        uint32_t cpl_entry = ((nvm_cpl_t*)cq->vaddr)[loc].dword[3];
+        uint32_t cid = (cpl_entry & 0x0000ffff);
+        bool phase = (cpl_entry & 0x00010000) >> 16;
+
+        if ((cid == search_cid) && (phase == search_phase)) {
+            if (pos != NULL) {
+                *pos = loc;
+            }
+            if (loc_ != NULL) {
+                *loc_ = cur_head;
+            }
+            if (cq_head != NULL) {
+                *cq_head = head;
+            }
+            return true;
+        }
+        if (phase != search_phase) {
+            break;
+        }
+    }
+    return false;
+}
+
+inline __device__
 void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 0, uint32_t cur_head_ = 0) { 
     // 自加=============================================
     // uint32_t cur_tail = sq->tail.load(simt::memory_order_relaxed);

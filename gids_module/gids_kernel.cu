@@ -215,6 +215,28 @@ __global__ void read_feature_kernel_single_page_single_thread_poll(array_d_t<T> 
     ptr.read_single_thread_poll(submit_idx, ctx);
   }
 }
+
+template <typename T = float>
+__global__ void read_feature_kernel_single_page_single_thread_try_poll(array_d_t<T> *dr,
+                                    int64_t *index_ptr, int dim,
+                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs,
+                                    uint32_t *pending_count)
+{
+  (void)dim;
+  uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (global_tid < num_idx)
+  {
+    bam_ptr<T> ptr(dr, false);
+    uint64_t row_index = index_ptr[global_tid] + key_off;
+    const uint64_t submit_idx = (row_index) * cache_dim;
+    s_ctx& ctx = d_warp_ctxs[global_tid * 32];
+    if (!ptr.read_single_thread_try_poll(submit_idx, ctx))
+    {
+      atomicAdd(pending_count, 1U);
+    }
+  }
+}
 // 单独获取，走状态机
 template <typename T = float>
 __global__ void read_feature_kernel_get_feature(array_d_t<T> *dr, T *out_tensor_ptr,

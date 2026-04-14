@@ -173,6 +173,7 @@ class _PrefetchingIter_async_registered_poll(object):
         self.pending_batch = None
         self.pending_io_count = 0
         self.outstanding_io_count = 0
+        self._returned_any_batch = False
         self.max_outstanding_ios = max(0, int(getattr(
             self.GIDS_Loader, "max_registered_outstanding_ios", 0)))
         self.debug_registered_poll = os.environ.get(
@@ -355,6 +356,206 @@ class _PrefetchingIter_async_registered_poll(object):
             f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}, "
             f"outstanding_ios={self.outstanding_io_count}"
         )
+        return batch
+
+
+class _PrefetchingIter_async_registered_try_service(object):
+    def __init__(self, dataloader, dataloader_it, GIDS_Loader=None, prefetch_depth=1):
+        self.dataloader_it = dataloader_it
+        self.dataloader = dataloader
+        self.graph_sampler = self.dataloader.graph_sampler
+        self.GIDS_Loader = GIDS_Loader
+
+        self.prefetch_queue = []
+        self.exhausted = False
+        self.prefetch_depth = max(1, int(prefetch_depth))
+        self.pending_batch = None
+        self.pending_io_count = 0
+        self.outstanding_io_count = 0
+        self._returned_any_batch = False
+        self.max_outstanding_ios = max(0, int(getattr(
+            self.GIDS_Loader, "max_registered_outstanding_ios", 0)))
+        self.try_window_size = max(1, int(getattr(
+            self.GIDS_Loader, "registered_try_window_size",
+            getattr(self.GIDS_Loader, "registered_poll_window_size", 1))))
+        self.debug_registered_poll = os.environ.get(
+            "GIDS_REGISTERED_DEBUG", "0") not in ("0", "", "false", "False")
+        print(f"GIDS.py提交(registered try service), prefetch:{self.prefetch_depth}..")
+        self._debug_log(
+            f"init prefetch_depth={self.prefetch_depth}, "
+            f"poll_mode=try_service, try_window={self.try_window_size}, "
+            f"max_outstanding_ios={self.max_outstanding_ios}"
+        )
+
+        # Warmup: 第 0 个 iter 先只保留 1 个 outstanding，避免首轮 front poll
+        # 在多 outstanding 下触发底层旧问题。等第一批返回后再补满深度。
+        self._submit_prefetch()
+
+    def start_profiling(self, output_dir="./profiler_logs"):
+        print("=== start_profiling called ===")
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        self.profiler.__enter__()
+
+    def stop_profiling(self):
+        print(f"=== stop_profiling called, profiler id: {id(self.profiler) if self.profiler else 'None'} ===")
+        if self.profiler:
+            self.profiler.__exit__(None, None, None)
+            print(self.profiler.key_averages().table(
+                sort_by="cuda_time_total",
+                row_limit=20
+            ))
+
+    def _debug_log(self, message):
+        if self.debug_registered_poll:
+            print(f"[RegisteredTryService] {message}", flush=True)
+
+    def _get_next_batch_for_submit(self):
+        if self.pending_batch is not None:
+            return self.pending_batch, self.pending_io_count
+        try:
+            next_batch = next(self.dataloader_it)
+            self.pending_batch = next_batch
+            self.pending_io_count = len(next_batch[0])
+            return self.pending_batch, self.pending_io_count
+        except StopIteration:
+            self.exhausted = True
+            self._debug_log("submit_stop_iteration")
+            return None, 0
+
+    def _can_submit_ios(self, io_count):
+        if self.max_outstanding_ios <= 0:
+            return True
+        if self.outstanding_io_count == 0:
+            return True
+        return self.outstanding_io_count + io_count <= self.max_outstanding_ios
+
+    def _submit_prefetch(self):
+        if self.exhausted and self.pending_batch is None:
+            self._debug_log("submit_skip exhausted=True")
+            return False
+
+        next_batch, io_count = self._get_next_batch_for_submit()
+        if next_batch is None:
+            return False
+        if not self._can_submit_ios(io_count):
+            self._debug_log(
+                f"budget_block outstanding_ios={self.outstanding_io_count}, "
+                f"next_ios={io_count}, budget={self.max_outstanding_ios}"
+            )
+            return False
+
+        request_id = self.GIDS_Loader.fetch_feature_submit_registered(
+            self.dataloader.dim,
+            next_batch,
+            1,
+            self.GIDS_Loader.gids_device,
+        )
+        self.prefetch_queue.append({
+            "batch": next_batch,
+            "request_id": request_id,
+            "io_count": io_count,
+        })
+        self.outstanding_io_count += io_count
+        self.pending_batch = None
+        self.pending_io_count = 0
+        self._debug_log(
+            f"submit_done request_id={request_id}, ios={io_count}, "
+            f"queue_len={len(self.prefetch_queue)}, "
+            f"outstanding_after={self.GIDS_Loader.get_registered_outstanding_count()}, "
+            f"outstanding_ios_after={self.outstanding_io_count}"
+        )
+        return True
+
+    def _service_prefetch_nonblocking(self, label="service"):
+        if not self.prefetch_queue:
+            self._debug_log(f"{label}_skip_empty")
+            return 0
+        if len(self.prefetch_queue) <= 1 or self.GIDS_Loader.get_registered_outstanding_count() <= 1:
+            self._debug_log(
+                f"{label}_skip_single queue_len={len(self.prefetch_queue)}, "
+                f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+            )
+            return 0
+
+        self._debug_log(
+            f"{label}_begin ready_front={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
+            f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
+            f"state={self.GIDS_Loader.get_registered_front_state()}, "
+            f"window={self.try_window_size}, outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+        )
+        ready_front = self.GIDS_Loader.get_registered_ready_front_request_id()
+        request_id = self.GIDS_Loader.service_registered_try_poll_window_skip_front(self.try_window_size)
+        self._debug_log(
+            f"{label}_done returned={request_id}, ready_front_before={ready_front}, "
+            f"ready_front_after={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
+            f"window={self.try_window_size}, outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+        )
+        return request_id
+
+    def _poll_front_prefetch(self, label="poll"):
+        if not self.prefetch_queue:
+            self._debug_log(f"{label}_skip_empty")
+            return
+
+        expected_request_id = self.prefetch_queue[0]["request_id"]
+        ready_request_id = self.GIDS_Loader.get_registered_ready_front_request_id()
+        if ready_request_id == expected_request_id:
+            self._debug_log(f"{label}_skip_ready request_id={expected_request_id}")
+            return
+
+        self._debug_log(
+            f"{label}_begin expected={expected_request_id}, "
+            f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
+            f"state={self.GIDS_Loader.get_registered_front_state()}, "
+            f"queue_len={len(self.prefetch_queue)}"
+        )
+        request_id = self.GIDS_Loader.service_registered_poll()
+        self._debug_log(
+            f"{label}_done returned={request_id}, "
+            f"ready_front={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
+            f"state={self.GIDS_Loader.get_registered_front_state()}"
+        )
+        if request_id != expected_request_id:
+            raise RuntimeError(
+                f"service_registered_poll返回了不匹配的front-ready request_id: {request_id} != {expected_request_id}"
+            )
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.prefetch_queue and self.exhausted:
+            raise StopIteration
+
+        self._poll_front_prefetch("next_poll")
+        self._service_prefetch_nonblocking("after_front_ready_service")
+        next_item = self.prefetch_queue.pop(0)
+        next_batch = next_item["batch"]
+        batch = self.GIDS_Loader.fetch_feature_get_feature_light_registered(
+            self.dataloader.dim, next_batch, self.GIDS_Loader.gids_device)
+        self.outstanding_io_count = max(
+            0, self.outstanding_io_count - next_item.get("io_count", len(next_batch[0])))
+
+        if not self._returned_any_batch:
+            self._debug_log(
+                f"warmup_complete request_id={next_item['request_id']}, "
+                f"queue_len={len(self.prefetch_queue)}, "
+                f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+            )
+
+        while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
+            if not self._submit_prefetch():
+                break
+        self._returned_any_batch = True
         return batch
 
 
@@ -693,6 +894,10 @@ class GIDS_DGLDataLoader(torch.utils.data.DataLoader):
         # when spawning new Python threads.  This drastically slows down pinning features.
         num_threads = torch.get_num_threads() if self.num_workers > 0 else None
         force_sync_read = os.environ.get("GIDS_FORCE_SYNC_READ", "0") not in ("0", "", "false", "False")
+        if getattr(self.GIDS_Loader, "use_registered_try_service", False):
+            return _PrefetchingIter_async_registered_try_service(
+                self, super().__iter__(), GIDS_Loader=self.GIDS_Loader,
+                prefetch_depth=getattr(self.GIDS_Loader, "iter_prefetch_depth", 1))
         if getattr(self.GIDS_Loader, "use_registered_poll", False):
             return _PrefetchingIter_async_registered_poll(
                 self, super().__iter__(), GIDS_Loader=self.GIDS_Loader,
@@ -755,11 +960,18 @@ class GIDS():
         self.pre_submit__buffer_size = 1
         self.pre_fetch_list = []
         self.iter_prefetch_depth = 3
-        self.use_registered_poll = True
+        self.use_registered_try_service = os.environ.get(
+            "GIDS_USE_REGISTERED_TRY_SERVICE", "0") not in ("0", "", "false", "False")
+        self.use_registered_poll = os.environ.get(
+            "GIDS_USE_REGISTERED_POLL",
+            "0" if self.use_registered_try_service else "1") not in ("0", "", "false", "False")
         self.registered_poll_window_size = 2
+        self.registered_try_window_size = int(os.environ.get(
+            "GIDS_REGISTERED_TRY_WINDOW_SIZE", str(self.registered_poll_window_size)))
         self.max_registered_outstanding_ios = int(os.environ.get(
             "GIDS_MAX_REGISTERED_OUTSTANDING_IOS", "0"))
-        self.use_async_sample_io_pipeline = False
+        self.use_async_sample_io_pipeline = os.environ.get(
+            "GIDS_USE_ASYNC_SAMPLE_IO_PIPELINE", "0") not in ("0", "", "false", "False")
         self.sample_io_sampled_queue_size = 1
         self.sample_io_ready_queue_size = 1
         
@@ -971,6 +1183,24 @@ class GIDS():
     def service_registered_poll_window(self, window_size):
         GIDS_time_start = time.time()
         request_id = self.BAM_FS.service_registered_poll_window(window_size)
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+        return request_id
+
+    def service_registered_try_poll(self):
+        GIDS_time_start = time.time()
+        request_id = self.BAM_FS.service_registered_try_poll()
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+        return request_id
+
+    def service_registered_try_poll_window(self, window_size):
+        GIDS_time_start = time.time()
+        request_id = self.BAM_FS.service_registered_try_poll_window(window_size)
+        self.GIDS_wait_time += time.time() - GIDS_time_start
+        return request_id
+
+    def service_registered_try_poll_window_skip_front(self, window_size):
+        GIDS_time_start = time.time()
+        request_id = self.BAM_FS.service_registered_try_poll_window_skip_front(window_size)
         self.GIDS_wait_time += time.time() - GIDS_time_start
         return request_id
 
