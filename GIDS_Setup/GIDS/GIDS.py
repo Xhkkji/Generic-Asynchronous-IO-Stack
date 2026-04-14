@@ -178,7 +178,6 @@ class _PrefetchingIter_async_registered_poll(object):
             self.GIDS_Loader, "max_registered_outstanding_ios", 0)))
         self.debug_registered_poll = os.environ.get(
             "GIDS_REGISTERED_DEBUG", "0") not in ("0", "", "false", "False")
-        print(f"GIDS.py提交(registered poll), prefetch:{self.prefetch_depth}..")
         self._debug_log(
             f"init prefetch_depth={self.prefetch_depth}, "
             f"poll_mode=front_only, "
@@ -382,7 +381,6 @@ class _PrefetchingIter_async_registered_try_service(object):
             self.GIDS_Loader, "registered_try_fallback_loops", 256)))
         self.debug_registered_poll = os.environ.get(
             "GIDS_REGISTERED_DEBUG", "0") not in ("0", "", "false", "False")
-        print(f"GIDS.py提交(registered try service), prefetch:{self.prefetch_depth}..")
         self._debug_log(
             f"init prefetch_depth={self.prefetch_depth}, "
             f"poll_mode=try_service, try_window={self.try_window_size}, "
@@ -480,28 +478,19 @@ class _PrefetchingIter_async_registered_try_service(object):
 
     def _service_prefetch_nonblocking(self, label="service"):
         if not self.prefetch_queue:
-            self._debug_log(f"{label}_skip_empty")
             return 0
         if len(self.prefetch_queue) <= 1 or self.GIDS_Loader.get_registered_outstanding_count() <= 1:
-            self._debug_log(
-                f"{label}_skip_single queue_len={len(self.prefetch_queue)}, "
-                f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
-            )
             return 0
 
-        self._debug_log(
-            f"{label}_begin ready_front={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
-            f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
-            f"state={self.GIDS_Loader.get_registered_front_state()}, "
-            f"window={self.try_window_size}, outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
-        )
-        ready_front = self.GIDS_Loader.get_registered_ready_front_request_id()
+        ready_front_before = self.GIDS_Loader.get_registered_ready_front_request_id()
         request_id = self.GIDS_Loader.service_registered_try_poll_window_skip_front(self.try_window_size)
-        self._debug_log(
-            f"{label}_done returned={request_id}, ready_front_before={ready_front}, "
-            f"ready_front_after={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
-            f"window={self.try_window_size}, outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
-        )
+        ready_front_after = self.GIDS_Loader.get_registered_ready_front_request_id()
+        if request_id != 0 or ready_front_after != ready_front_before:
+            self._debug_log(
+                f"{label}_done returned={request_id}, ready_front_before={ready_front_before}, "
+                f"ready_front_after={ready_front_after}, "
+                f"window={self.try_window_size}, outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
+            )
         return request_id
 
     def _poll_front_prefetch(self, label="poll"):
@@ -547,19 +536,19 @@ class _PrefetchingIter_async_registered_try_service(object):
                 )
                 return
             if try_loops % 8 == 0:
-                self._debug_log(
-                    f"{label}_retry loops={try_loops}, returned={request_id}, "
-                    f"ready_front={ready_request_id}, "
-                    f"state={self.GIDS_Loader.get_registered_front_state()}"
-                )
+                if try_loops % 64 == 0:
+                    self._debug_log(
+                        f"{label}_retry loops={try_loops}, returned={request_id}, "
+                        f"ready_front={ready_request_id}, "
+                        f"state={self.GIDS_Loader.get_registered_front_state()}"
+                    )
                 self._service_prefetch_nonblocking(f"{label}_window")
-            if try_loops >= self.try_poll_fallback_loops:
+            if try_loops % self.try_poll_fallback_loops == 0:
                 self._debug_log(
-                    f"{label}_continue_try loops={try_loops}, expected={expected_request_id}, "
+                    f"{label}_progress loops={try_loops}, expected={expected_request_id}, "
                     f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
                     f"state={self.GIDS_Loader.get_registered_front_state()}"
                 )
-                try_loops = 0
 
     def __iter__(self):
         return self

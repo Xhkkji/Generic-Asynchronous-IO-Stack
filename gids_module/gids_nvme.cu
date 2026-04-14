@@ -27,6 +27,8 @@ namespace
 constexpr uint64_t kWarpCtxDebugSampleCount = 0;
 constexpr int64_t kAsyncDebugRows = 0;
 constexpr int kAsyncDebugDims = 8;
+constexpr uint32_t kRegisteredFrontServiceBursts = 4;
+constexpr uint32_t kRegisteredWindowServiceBursts = 2;
 
 bool env_flag_enabled(const char *name)
 {
@@ -510,13 +512,6 @@ template <typename TYPE>
 uint64_t BAM_Feature_Store<TYPE>::read_feature_submit_async_registered_rowctx(uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off)
 {
-  static bool logged_rowctx_submit = false;
-  if (!logged_rowctx_submit)
-  {
-    printf("[ROWCTX_SUBMIT]\n");
-    logged_rowctx_submit = true;
-  }
-
   int64_t *index_ptr = (int64_t *)i_index_ptr;
   constexpr uint64_t b_size = 256;
   const uint64_t n_warp = b_size / 32;
@@ -803,64 +798,9 @@ static void poll_registered_outstanding_at(BAM_Feature_Store<TYPE> *store, uint6
 }
 
 template <typename TYPE>
-static bool try_poll_registered_outstanding_at(BAM_Feature_Store<TYPE> *store, uint64_t offset, uint64_t request_id)
+static uint32_t service_registered_completions_burst(BAM_Feature_Store<TYPE> *store, uint32_t rounds)
 {
-  const auto *outstanding = store->iostack.outstanding_at(offset);
-  if (outstanding == nullptr)
-  {
-    throw std::runtime_error("No registered outstanding request at offset");
-  }
-  if (request_id != 0 && outstanding->request_id != request_id)
-  {
-    throw std::runtime_error("Registered outstanding request id mismatch at offset");
-  }
-
-  if (store->d_registered_try_pending == nullptr)
-  {
-    cuda_err_chk(cudaMalloc(&store->d_registered_try_pending, sizeof(uint32_t)));
-  }
-  cuda_err_chk(cudaMemset(store->d_registered_try_pending, 0, sizeof(uint32_t)));
-
-  int64_t *index_ptr = reinterpret_cast<int64_t *>(outstanding->index_ptr);
-  const int64_t num_index = outstanding->num_index;
-  const int dim = outstanding->dim;
-  const int cache_dim = outstanding->cache_dim;
-  const uint64_t b_size = store->blkSize;
-  const uint64_t poll_g_size = (num_index + b_size - 1) / b_size;
-  s_ctx *d_warp_ctxs = store->iostack.ctxs_at(offset);
-  if (d_warp_ctxs == nullptr)
-  {
-    throw std::runtime_error("Registered ctxs are missing at offset");
-  }
-
-  auto t1 = Clock::now();
-  read_feature_kernel_single_page_single_thread_try_poll_serial<TYPE><<<1, 1>>>(
-      store->a->d_array_ptr, index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs,
-      store->d_registered_try_pending);
-  cuda_err_chk(cudaDeviceSynchronize());
-
-  uint32_t pending_count = 0;
-  cuda_err_chk(cudaMemcpy(&pending_count, store->d_registered_try_pending,
-                          sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-  auto t2 = Clock::now();
-  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-  const float ms_fractional = static_cast<float>(us.count()) / 1000;
-  store->kernel_time += ms_fractional;
-  return pending_count == 0;
-}
-
-template <typename TYPE>
-static uint32_t service_registered_completions_once(BAM_Feature_Store<TYPE> *store)
-{
-  static bool logged_cq_service = false;
   static uint64_t debug_round = 0;
-  if (!logged_cq_service)
-  {
-    printf("[CQ_SERVICE]\n");
-    logged_cq_service = true;
-  }
-
   const uint32_t request_count = static_cast<uint32_t>(store->iostack.outstanding_count());
   if (request_count == 0)
   {
@@ -902,37 +842,47 @@ static uint32_t service_registered_completions_once(BAM_Feature_Store<TYPE> *sto
   constexpr uint32_t kMaxEventsPerQueue = 64;
   const uint32_t total_logical_queues = store->registered_total_logical_queues;
   const uint32_t blocks = (total_logical_queues + kThreadsPerBlock - 1) / kThreadsPerBlock;
+  const uint32_t effective_rounds = std::max<uint32_t>(1, rounds);
+  const bool debug_enabled = env_flag_enabled("GIDS_REGISTERED_DEBUG");
 
   auto t1 = Clock::now();
-  service_registered_cq_window_kernel<TYPE><<<blocks, kThreadsPerBlock>>>(
-      store->a->d_array_ptr,
-      store->n_ctrls,
-      total_logical_queues,
-      store->d_registered_service_events,
-      store->d_registered_service_progress,
-      store->d_registered_service_lookup_misses,
-      kMaxEventsPerQueue,
-      kRegisteredCidCapacity,
-      store->d_registered_ctx_lookup);
-  cuda_err_chk(cudaDeviceSynchronize());
-
-  auto t2 = Clock::now();
-  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-  store->kernel_time += static_cast<float>(us.count()) / 1000.0f;
+  for (uint32_t round = 0; round < effective_rounds; ++round)
+  {
+    service_registered_cq_window_kernel<TYPE><<<blocks, kThreadsPerBlock>>>(
+        store->a->d_array_ptr,
+        store->n_ctrls,
+        total_logical_queues,
+        store->d_registered_service_events,
+        store->d_registered_service_progress,
+        store->d_registered_service_lookup_misses,
+        kMaxEventsPerQueue,
+        kRegisteredCidCapacity,
+        store->d_registered_ctx_lookup);
+  }
 
   uint32_t event_count = 0;
   uint32_t progress_count = 0;
   uint32_t lookup_miss_count = 0;
-  cuda_err_chk(cudaMemcpy(&event_count, store->d_registered_service_events,
-                          sizeof(uint32_t), cudaMemcpyDeviceToHost));
-  cuda_err_chk(cudaMemcpy(&progress_count, store->d_registered_service_progress,
-                          sizeof(uint32_t), cudaMemcpyDeviceToHost));
-  cuda_err_chk(cudaMemcpy(&lookup_miss_count, store->d_registered_service_lookup_misses,
-                          sizeof(uint32_t), cudaMemcpyDeviceToHost));
-  if (env_flag_enabled("GIDS_REGISTERED_DEBUG"))
+  if (debug_enabled)
   {
+    cuda_err_chk(cudaDeviceSynchronize());
+    auto t2 = Clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+    store->kernel_time += static_cast<float>(us.count()) / 1000.0f;
+
+    cuda_err_chk(cudaMemcpy(&event_count, store->d_registered_service_events,
+                            sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    cuda_err_chk(cudaMemcpy(&progress_count, store->d_registered_service_progress,
+                            sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    cuda_err_chk(cudaMemcpy(&lookup_miss_count, store->d_registered_service_lookup_misses,
+                            sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
     ++debug_round;
-    if (debug_round <= 32 || event_count > 0 || progress_count > 0 || lookup_miss_count > 0)
+    const bool anomaly = lookup_miss_count > 0;
+    const bool early_round = debug_round <= 4;
+    const bool stall = event_count == 0 && progress_count == 0 && debug_round <= 16;
+    const bool periodic = (debug_round % 512) == 0;
+    if (anomaly || early_round || stall || periodic)
     {
       printf("[CQ_SERVICE_ROUND] round=%llu outstanding=%u events=%u hits=%u misses=%u queues=%u\n",
              (unsigned long long)debug_round,
@@ -1097,7 +1047,7 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_try_poll()
   }
 
   const uint64_t request_id = outstanding->request_id;
-  service_registered_completions_once(this);
+  service_registered_completions_burst(this, kRegisteredFrontServiceBursts);
   if (registered_request_ready_at(this, 0))
   {
     if (!this->iostack.mark_front_ready(request_id))
@@ -1118,7 +1068,7 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_try_poll_window(uint64_t wi
     return 0;
   }
 
-  service_registered_completions_once(this);
+  service_registered_completions_burst(this, kRegisteredWindowServiceBursts);
 
   const uint64_t limit = std::min<uint64_t>(std::max<uint64_t>(1, window_size), total);
   for (uint64_t offset = 0; offset < limit; ++offset)
@@ -1155,7 +1105,7 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_try_poll_window_skip_front(
     return this->iostack.front_ready_request_id();
   }
 
-  service_registered_completions_once(this);
+  service_registered_completions_burst(this, kRegisteredWindowServiceBursts);
 
   const uint64_t limit = std::min<uint64_t>(std::max<uint64_t>(1, window_size), total - 1);
   for (uint64_t inner_offset = 0; inner_offset < limit; ++inner_offset)
@@ -1238,13 +1188,6 @@ uint64_t BAM_Feature_Store<TYPE>::read_feature_get_feature_light_registered(uint
 template <typename TYPE>
 uint64_t BAM_Feature_Store<TYPE>::read_feature_get_feature_light_registered_rowctx(uint64_t i_ptr)
 {
-  static bool logged_rowctx_get = false;
-  if (!logged_rowctx_get)
-  {
-    printf("[ROWCTX_GET]\n");
-    logged_rowctx_get = true;
-  }
-
   const auto *outstanding = this->iostack.front_outstanding();
   if (outstanding == nullptr)
   {
@@ -1262,7 +1205,8 @@ uint64_t BAM_Feature_Store<TYPE>::read_feature_get_feature_light_registered_rowc
   const int dim = outstanding->dim;
   const int cache_dim = outstanding->cache_dim;
   constexpr uint64_t b_size = 128;
-  const uint64_t g_size = (num_index + b_size - 1) / b_size;
+  const uint64_t n_warp = b_size / 32;
+  const uint64_t g_size = (num_index + n_warp - 1) / n_warp;
   auto t1 = Clock::now();
 
   s_ctx *d_row_ctxs = this->iostack.front_ctxs();

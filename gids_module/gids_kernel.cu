@@ -235,55 +235,6 @@ __global__ void read_feature_kernel_single_page_single_thread_poll_rowctx(array_
 }
 
 template <typename T = float>
-__global__ void read_feature_kernel_single_page_single_thread_try_poll(array_d_t<T> *dr,
-                                    int64_t *index_ptr, int dim,
-                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs,
-                                    uint32_t *pending_count)
-{
-  (void)dim;
-  uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (global_tid < num_idx)
-  {
-    bam_ptr<T> ptr(dr, false);
-    uint64_t row_index = index_ptr[global_tid] + key_off;
-    const uint64_t submit_idx = (row_index) * cache_dim;
-    s_ctx& ctx = d_warp_ctxs[global_tid * 32];
-    if (!ptr.read_single_thread_try_poll(submit_idx, ctx))
-    {
-      atomicAdd(pending_count, 1U);
-    }
-  }
-}
-
-template <typename T = float>
-__global__ void read_feature_kernel_single_page_single_thread_try_poll_serial(array_d_t<T> *dr,
-                                    int64_t *index_ptr, int dim,
-                                    int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_warp_ctxs,
-                                    uint32_t *pending_count)
-{
-  (void)dim;
-  if (blockIdx.x != 0 || threadIdx.x != 0)
-  {
-    return;
-  }
-
-  bam_ptr<T> ptr(dr, false);
-  uint32_t local_pending = 0;
-  for (int64_t row = 0; row < num_idx; ++row)
-  {
-    uint64_t row_index = index_ptr[row] + key_off;
-    const uint64_t submit_idx = row_index * cache_dim;
-    s_ctx &ctx = d_warp_ctxs[row * 32];
-    if (!ptr.read_single_thread_try_poll(submit_idx, ctx))
-    {
-      ++local_pending;
-    }
-  }
-  *pending_count = local_pending;
-}
-
-template <typename T = float>
 __global__ void read_feature_kernel_submit_async_rowctx(array_d_t<T> *dr,
                                     int64_t *index_ptr, int dim,
                                     int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_row_ctxs)
@@ -312,19 +263,44 @@ __global__ void read_feature_kernel_get_feature_light_rowctx(array_d_t<T> *dr, T
                                     int64_t *index_ptr, int dim,
                                     int64_t num_idx, int cache_dim, uint64_t key_off, s_ctx* d_row_ctxs)
 {
-  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= static_cast<uint32_t>(num_idx))
+  uint64_t bid = blockIdx.x;
+  int num_warps = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  int lane_id = threadIdx.x % 32;
+  int idx_idx = bid * num_warps + warp_id;
+
+  if (idx_idx >= num_idx)
   {
     return;
   }
 
   bam_ptr<T> ptr(dr, true);
-  uint64_t row_index = index_ptr[row] + key_off;
-  s_ctx &ctx = d_row_ctxs[row];
-  for (int tid = 0; tid < dim; ++tid)
+  uint64_t row_index = index_ptr[idx_idx] + key_off;
+  s_ctx &ctx = d_row_ctxs[idx_idx];
+  const uint64_t base_i = static_cast<uint64_t>(row_index) * cache_dim;
+  uint64_t page_addr_u64 = 0;
+  uint64_t row_start = 0;
+
+  if (lane_id == 0)
   {
-    out_tensor_ptr[static_cast<uint64_t>(row) * dim + tid] =
-        ptr.read_post_poll_light(static_cast<uint64_t>(row_index) * cache_dim + tid, ctx);
+    T *page_addr = ptr.update_page_post_poll_light(base_i, ctx);
+    page_addr_u64 = reinterpret_cast<uint64_t>(page_addr);
+    row_start = ptr.start;
+  }
+
+  page_addr_u64 = __shfl_sync(0xffffffff, page_addr_u64, 0);
+  row_start = __shfl_sync(0xffffffff, row_start, 0);
+  T *page_addr = reinterpret_cast<T *>(page_addr_u64);
+  if (page_addr == nullptr)
+  {
+    return;
+  }
+
+  for (int tid = lane_id; tid < dim; tid += 32)
+  {
+    const uint64_t i = base_i + static_cast<uint64_t>(tid);
+    out_tensor_ptr[static_cast<uint64_t>(idx_idx) * dim + tid] =
+        page_addr[i - row_start];
   }
 }
 
