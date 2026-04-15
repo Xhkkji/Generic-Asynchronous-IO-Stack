@@ -1002,38 +1002,6 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_poll_compatible()
 }
 
 template <typename TYPE>
-uint64_t BAM_Feature_Store<TYPE>::service_registered_poll_window(uint64_t window_size)
-{
-  const uint64_t total = this->iostack.outstanding_count();
-  if (total == 0)
-  {
-    return 0;
-  }
-
-  const uint64_t limit = std::min<uint64_t>(std::max<uint64_t>(1, window_size), total);
-  for (uint64_t offset = 0; offset < limit; ++offset)
-  {
-    const auto *outstanding = this->iostack.outstanding_at(offset);
-    if (outstanding == nullptr)
-    {
-      break;
-    }
-    if (outstanding->state != BaM_IOStack<TYPE>::SUBMITTED)
-    {
-      continue;
-    }
-    const uint64_t request_id = outstanding->request_id;
-    poll_registered_outstanding_at(this, offset, request_id);
-    if (!this->iostack.mark_ready_at(offset, request_id))
-    {
-      throw std::runtime_error("Failed to mark registered outstanding request as ready in window");
-    }
-  }
-
-  return this->iostack.front_ready_request_id();
-}
-
-template <typename TYPE>
 uint64_t BAM_Feature_Store<TYPE>::service_registered_try_poll()
 {
   const auto *outstanding = this->iostack.front_outstanding();
@@ -1056,43 +1024,6 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_try_poll()
     }
     return request_id;
   }
-  return this->iostack.front_ready_request_id();
-}
-
-template <typename TYPE>
-uint64_t BAM_Feature_Store<TYPE>::service_registered_try_poll_window(uint64_t window_size)
-{
-  const uint64_t total = this->iostack.outstanding_count();
-  if (total == 0)
-  {
-    return 0;
-  }
-
-  service_registered_completions_burst(this, kRegisteredWindowServiceBursts);
-
-  const uint64_t limit = std::min<uint64_t>(std::max<uint64_t>(1, window_size), total);
-  for (uint64_t offset = 0; offset < limit; ++offset)
-  {
-    const auto *outstanding = this->iostack.outstanding_at(offset);
-    if (outstanding == nullptr)
-    {
-      break;
-    }
-    if (outstanding->state != BaM_IOStack<TYPE>::SUBMITTED)
-    {
-      continue;
-    }
-
-    const uint64_t request_id = outstanding->request_id;
-    if (registered_request_ready_at(this, offset))
-    {
-      if (!this->iostack.mark_ready_at(offset, request_id))
-      {
-        throw std::runtime_error("Failed to mark registered outstanding request as ready in try window");
-      }
-    }
-  }
-
   return this->iostack.front_ready_request_id();
 }
 
@@ -1728,12 +1659,9 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("read_feature_submit_async_registered_rowctx", &BAM_Feature_Store<float>::read_feature_submit_async_registered_rowctx)
       .def("read_feature_wait_async", &BAM_Feature_Store<float>::read_feature_wait_async)
       .def("read_feature_single_page_single_thread_poll", &BAM_Feature_Store<float>::read_feature_single_page_single_thread_poll)
-      .def("read_feature_single_page_single_thread_poll_registered", &BAM_Feature_Store<float>::read_feature_single_page_single_thread_poll_registered)
       .def("service_registered_poll", &BAM_Feature_Store<float>::service_registered_poll)
       .def("service_registered_poll_compatible", &BAM_Feature_Store<float>::service_registered_poll_compatible)
-      .def("service_registered_poll_window", &BAM_Feature_Store<float>::service_registered_poll_window)
       .def("service_registered_try_poll", &BAM_Feature_Store<float>::service_registered_try_poll)
-      .def("service_registered_try_poll_window", &BAM_Feature_Store<float>::service_registered_try_poll_window)
       .def("service_registered_try_poll_window_skip_front", &BAM_Feature_Store<float>::service_registered_try_poll_window_skip_front)
       .def("read_feature_get_feature_light", &BAM_Feature_Store<float>::read_feature_get_feature_light)
       .def("read_feature_get_feature_light_registered", &BAM_Feature_Store<float>::read_feature_get_feature_light_registered)
@@ -1774,12 +1702,9 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("read_feature_submit_async_registered", &BAM_Feature_Store<int64_t>::read_feature_submit_async_registered)
       .def("read_feature_submit_async_registered_rowctx", &BAM_Feature_Store<int64_t>::read_feature_submit_async_registered_rowctx)
       .def("read_feature_wait_async", &BAM_Feature_Store<int64_t>::read_feature_wait_async)
-      .def("read_feature_single_page_single_thread_poll_registered", &BAM_Feature_Store<int64_t>::read_feature_single_page_single_thread_poll_registered)
       .def("service_registered_poll", &BAM_Feature_Store<int64_t>::service_registered_poll)
       .def("service_registered_poll_compatible", &BAM_Feature_Store<int64_t>::service_registered_poll_compatible)
-      .def("service_registered_poll_window", &BAM_Feature_Store<int64_t>::service_registered_poll_window)
       .def("service_registered_try_poll", &BAM_Feature_Store<int64_t>::service_registered_try_poll)
-      .def("service_registered_try_poll_window", &BAM_Feature_Store<int64_t>::service_registered_try_poll_window)
       .def("service_registered_try_poll_window_skip_front", &BAM_Feature_Store<int64_t>::service_registered_try_poll_window_skip_front)
       .def("read_feature_get_feature_light_registered", &BAM_Feature_Store<int64_t>::read_feature_get_feature_light_registered)
       .def("read_feature_get_feature_light_registered_rowctx", &BAM_Feature_Store<int64_t>::read_feature_get_feature_light_registered_rowctx)
