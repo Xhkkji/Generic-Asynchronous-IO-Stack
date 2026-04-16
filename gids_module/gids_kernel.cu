@@ -478,12 +478,18 @@ __global__ void service_registered_cq_window_kernel(array_d_t<T> *dr,
     qp->cq.tail.fetch_add(1, simt::memory_order_acq_rel);
     cq_dequeue(&qp->cq, cq_pos, &qp->sq, loc, head);
     put_cid(&qp->sq, cid);
-    atomicAdd(event_count, 1U);
+    if (event_count != nullptr)
+    {
+      atomicAdd(event_count, 1U);
+    }
     ++handled;
 
     if (cid >= cid_capacity)
     {
-      atomicAdd(lookup_miss_count, 1U);
+      if (lookup_miss_count != nullptr)
+      {
+        atomicAdd(lookup_miss_count, 1U);
+      }
       continue;
     }
 
@@ -491,13 +497,19 @@ __global__ void service_registered_cq_window_kernel(array_d_t<T> *dr,
     s_ctx *ctx_ptr = ctx_lookup[slot];
     if (ctx_ptr == nullptr)
     {
-      atomicAdd(lookup_miss_count, 1U);
+      if (lookup_miss_count != nullptr)
+      {
+        atomicAdd(lookup_miss_count, 1U);
+      }
       continue;
     }
 
     if (finalize_registered_ctx_completion(dr, *ctx_ptr))
     {
-      atomicAdd(progress_count, 1U);
+      if (progress_count != nullptr)
+      {
+        atomicAdd(progress_count, 1U);
+      }
     }
     ctx_lookup[slot] = nullptr;
   }

@@ -27,8 +27,10 @@ namespace
 constexpr uint64_t kWarpCtxDebugSampleCount = 0;
 constexpr int64_t kAsyncDebugRows = 0;
 constexpr int kAsyncDebugDims = 8;
+// Run more CQ-service rounds before each front ready-check so the hot
+// request-level aggregation happens less frequently.
 constexpr uint32_t kRegisteredFrontServiceBursts = 4;
-constexpr uint32_t kRegisteredWindowServiceBursts = 2;
+constexpr uint32_t kRegisteredWindowServiceBursts = 3;
 
 bool env_flag_enabled(const char *name)
 {
@@ -807,18 +809,6 @@ static uint32_t service_registered_completions_burst(BAM_Feature_Store<TYPE> *st
     return 0;
   }
 
-  if (store->d_registered_service_progress == nullptr)
-  {
-    cuda_err_chk(cudaMalloc(&store->d_registered_service_progress, sizeof(uint32_t)));
-  }
-  if (store->d_registered_service_events == nullptr)
-  {
-    cuda_err_chk(cudaMalloc(&store->d_registered_service_events, sizeof(uint32_t)));
-  }
-  if (store->d_registered_service_lookup_misses == nullptr)
-  {
-    cuda_err_chk(cudaMalloc(&store->d_registered_service_lookup_misses, sizeof(uint32_t)));
-  }
   if (store->registered_total_logical_queues == 0)
   {
     for (uint32_t ctrl_idx = 0; ctrl_idx < store->n_ctrls; ++ctrl_idx)
@@ -834,9 +824,6 @@ static uint32_t service_registered_completions_burst(BAM_Feature_Store<TYPE> *st
   {
     return 0;
   }
-  cuda_err_chk(cudaMemset(store->d_registered_service_events, 0, sizeof(uint32_t)));
-  cuda_err_chk(cudaMemset(store->d_registered_service_progress, 0, sizeof(uint32_t)));
-  cuda_err_chk(cudaMemset(store->d_registered_service_lookup_misses, 0, sizeof(uint32_t)));
 
   constexpr uint32_t kThreadsPerBlock = 128;
   constexpr uint32_t kMaxEventsPerQueue = 64;
@@ -844,6 +831,31 @@ static uint32_t service_registered_completions_burst(BAM_Feature_Store<TYPE> *st
   const uint32_t blocks = (total_logical_queues + kThreadsPerBlock - 1) / kThreadsPerBlock;
   const uint32_t effective_rounds = std::max<uint32_t>(1, rounds);
   const bool debug_enabled = env_flag_enabled("GIDS_REGISTERED_DEBUG");
+  uint32_t *d_event_count = nullptr;
+  uint32_t *d_progress_count = nullptr;
+  uint32_t *d_lookup_miss_count = nullptr;
+
+  if (debug_enabled)
+  {
+    if (store->d_registered_service_progress == nullptr)
+    {
+      cuda_err_chk(cudaMalloc(&store->d_registered_service_progress, sizeof(uint32_t)));
+    }
+    if (store->d_registered_service_events == nullptr)
+    {
+      cuda_err_chk(cudaMalloc(&store->d_registered_service_events, sizeof(uint32_t)));
+    }
+    if (store->d_registered_service_lookup_misses == nullptr)
+    {
+      cuda_err_chk(cudaMalloc(&store->d_registered_service_lookup_misses, sizeof(uint32_t)));
+    }
+    cuda_err_chk(cudaMemset(store->d_registered_service_events, 0, sizeof(uint32_t)));
+    cuda_err_chk(cudaMemset(store->d_registered_service_progress, 0, sizeof(uint32_t)));
+    cuda_err_chk(cudaMemset(store->d_registered_service_lookup_misses, 0, sizeof(uint32_t)));
+    d_event_count = store->d_registered_service_events;
+    d_progress_count = store->d_registered_service_progress;
+    d_lookup_miss_count = store->d_registered_service_lookup_misses;
+  }
 
   auto t1 = Clock::now();
   for (uint32_t round = 0; round < effective_rounds; ++round)
@@ -852,9 +864,9 @@ static uint32_t service_registered_completions_burst(BAM_Feature_Store<TYPE> *st
         store->a->d_array_ptr,
         store->n_ctrls,
         total_logical_queues,
-        store->d_registered_service_events,
-        store->d_registered_service_progress,
-        store->d_registered_service_lookup_misses,
+        d_event_count,
+        d_progress_count,
+        d_lookup_miss_count,
         kMaxEventsPerQueue,
         kRegisteredCidCapacity,
         store->d_registered_ctx_lookup);
