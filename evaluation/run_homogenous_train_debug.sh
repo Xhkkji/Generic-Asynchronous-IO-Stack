@@ -12,7 +12,7 @@ sudo env \
   GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
   GIDS_REGISTERED_DEBUG="${GIDS_REGISTERED_DEBUG:-0}" \
   GIDS_REGISTERED_TRY_WINDOW_SIZE="${GIDS_REGISTERED_TRY_WINDOW_SIZE:-2}" \
-  GIDS_MAX_REGISTERED_OUTSTANDING_IOS="${GIDS_MAX_REGISTERED_OUTSTANDING_IOS:-200000}" \
+  GIDS_MAX_REGISTERED_OUTSTANDING_IOS="${GIDS_MAX_REGISTERED_OUTSTANDING_IOS:-260000}" \
   /home/xhk/miniconda3/envs/pytorch/bin/python homogenous_train_debug.py \
   --stop_after_step 150 \
   --hidden_channels 256 \
@@ -23,7 +23,7 @@ sudo env \
   --log_every 1000 \
   --uva_graph 1 \
   --GIDS \
-  --batch_size 512 \
+  --batch_size 1024 \
   --num_classes 19 \
   --data IGB \
   --emb_size 1024 \
