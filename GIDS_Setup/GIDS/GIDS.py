@@ -184,6 +184,10 @@ class _PrefetchingIter_async_registered_try_service(object):
             self.GIDS_Loader, "registered_try_fallback_loops", 256)))
         self.submit_commands_per_batch = max(1, int(getattr(
             self.GIDS_Loader, "registered_submit_commands_per_batch", 1)))
+        # 控制是否启用 skip-front 预热。关闭后，只强轮询当前 front iter，
+        # 后排 iter 仍然可以继续 submit，但不会被主动做 skip-front service。
+        self.enable_skip_front = bool(getattr(
+            self.GIDS_Loader, "registered_enable_skip_front", True))
         self.debug_registered_poll = os.environ.get(
             "GIDS_REGISTERED_DEBUG", "0") not in ("0", "", "false", "False")
         self.pending_split_item = None
@@ -193,7 +197,8 @@ class _PrefetchingIter_async_registered_try_service(object):
             f"poll_mode=try_service, try_window={self.try_window_size}, "
             f"max_outstanding_ios={self.max_outstanding_ios}, "
             f"fallback_loops={self.try_poll_fallback_loops}, "
-            f"submit_commands_per_batch={self.submit_commands_per_batch}"
+            f"submit_commands_per_batch={self.submit_commands_per_batch}, "
+            f"enable_skip_front={self.enable_skip_front}"
         )
 
         # Warmup: 第 0 个 iter 先只保留 1 个 outstanding，避免首轮 front poll
@@ -488,6 +493,8 @@ class _PrefetchingIter_async_registered_try_service(object):
 
     def _service_prefetch_nonblocking(self, label="service"):
         if not self.prefetch_queue:
+            return 0
+        if not self.enable_skip_front:
             return 0
         if self.GIDS_Loader.get_registered_outstanding_count() <= 1:
             return 0
@@ -1083,6 +1090,8 @@ class GIDS():
             "GIDS_USE_REGISTERED_TRY_SERVICE", "0") not in ("0", "", "false", "False")
         self.registered_try_window_size = int(os.environ.get(
             "GIDS_REGISTERED_TRY_WINDOW_SIZE", "2"))
+        self.registered_enable_skip_front = os.environ.get(
+            "GIDS_REGISTERED_ENABLE_SKIP_FRONT", "1") not in ("0", "", "false", "False")
         self.registered_submit_commands_per_batch = int(os.environ.get(
             "GIDS_REGISTERED_SUBMIT_COMMANDS_PER_BATCH", "1"))
         self.max_registered_outstanding_ios = int(os.environ.get(
