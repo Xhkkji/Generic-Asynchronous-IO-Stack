@@ -201,6 +201,7 @@ class _PrefetchingIter_async_registered_try_service(object):
         self._submit_prefetch()
         if self.submit_commands_per_batch > 1:
             self._ensure_front_logical_item_fully_submitted()
+            self._fill_prefetch_queue("warmup补提")
 
     def start_profiling(self, output_dir="./profiler_logs"):
         print("=== start_profiling called ===")
@@ -234,18 +235,27 @@ class _PrefetchingIter_async_registered_try_service(object):
         self.next_logical_iter_id += 1
         return logical_iter_id
 
+    def _format_request_list(self, item):
+        if "request_id" in item:
+            return f"[{item['request_id']}]"
+        total = len(item.get("micro_batches", []))
+        request_ids = list(item.get("request_ids", []))
+        request_ids.extend(["-"] * max(0, total - len(request_ids)))
+        return "[" + ",".join(str(x) for x in request_ids) + "]"
+
     def _format_logical_item_state(self, item):
         if "request_id" in item:
             return (
                 f"iterid={item.get('logical_iter_id', -1)}"
-                f"[batchid=0, 已提交=1/1, request_id={item['request_id']}]"
+                f"[batchid=0, 已提交=1/1, 已消费=0/1, requests={self._format_request_list(item)}]"
             )
         submitted = item.get("submitted_micro_count", 0)
         total = len(item.get("micro_batches", []))
         consumed = item.get("consumed_micro_count", 0)
         return (
             f"iterid={item.get('logical_iter_id', -1)}"
-            f"[已提交batch={submitted}/{total}, 已消费batch={consumed}/{total}]"
+            f"[已提交batch={submitted}/{total}, 已消费batch={consumed}/{total}, "
+            f"requests={self._format_request_list(item)}]"
         )
 
     def _debug_queue_snapshot(self, label):
@@ -257,7 +267,7 @@ class _PrefetchingIter_async_registered_try_service(object):
                 "待提交:" + self._format_logical_item_state(self.pending_split_item)
             )
         queue_state = " | ".join(queue_items) if queue_items else "empty"
-        self._debug_log(f"{label} 队列={queue_state}")
+        self._debug_log(f"[队列] {label} 队列={queue_state}")
 
     def _get_next_batch_for_submit(self):
         if self.pending_batch is not None:
@@ -268,11 +278,11 @@ class _PrefetchingIter_async_registered_try_service(object):
             next_batch = next(self.dataloader_it)
             self.pending_batch = next_batch
             self.pending_io_count = len(next_batch[0])
-            self._debug_log(f"采样完成 节点数={self.pending_io_count}")
+            self._debug_log(f"[采样] 完成 节点数={self.pending_io_count}")
             return self.pending_batch, self.pending_io_count
         except StopIteration:
             self.exhausted = True
-            self._debug_log("submit_stop_iteration")
+            self._debug_log("[采样] 结束 StopIteration")
             return None, 0
 
     def _can_submit_ios(self, io_count):
@@ -341,7 +351,7 @@ class _PrefetchingIter_async_registered_try_service(object):
         self.pending_io_count = 0
         self.pending_split_item = split_item
         self._debug_log(
-            f"切分完成 iterid={split_item['logical_iter_id']}, "
+            f"[切分] 完成 iterid={split_item['logical_iter_id']}, "
             f"batch总数={len(split_item['micro_batches'])}, "
             f"batch_ranges={split_item['micro_ranges']}"
         )
@@ -366,7 +376,7 @@ class _PrefetchingIter_async_registered_try_service(object):
         # 返回的 request_id 后面用于跟踪 ready 状态和消费顺序。
         logical_iter_id = self._next_logical_iter_id()
         self._debug_log(
-            f"开始提交 iterid={logical_iter_id}, batchid=0, ios={io_count}"
+            f"[提交] 开始 iterid={logical_iter_id}, batchid=0, ios={io_count}"
         )
         request_id = self.GIDS_Loader.fetch_feature_submit_registered_rowctx(
             self.dataloader.dim,
@@ -384,7 +394,7 @@ class _PrefetchingIter_async_registered_try_service(object):
         self.pending_batch = None
         self.pending_io_count = 0
         self._debug_log(
-            f"提交完成 iterid={logical_iter_id}, batchid=0, request_id={request_id}, "
+            f"[提交] 完成 iterid={logical_iter_id}, batchid=0, request_id={request_id}, "
             f"ios={io_count}, "
             f"逻辑队列长度={len(self.prefetch_queue)}, "
             f"提交后outstanding={self.GIDS_Loader.get_registered_outstanding_count()}, "
@@ -404,6 +414,11 @@ class _PrefetchingIter_async_registered_try_service(object):
 
         micro_idx = split_item["submitted_micro_count"]
         micro_io_count = split_item["micro_io_counts"][micro_idx]
+        self._debug_log(
+            f"[提交] 开始 iterid={split_item['logical_iter_id']}, "
+            f"batchid={micro_idx}, batch_range={split_item['micro_ranges'][micro_idx]}, "
+            f"ios={micro_io_count}"
+        )
         if not self._can_submit_ios(micro_io_count):
             self._debug_log(
                 f"budget_block outstanding_ios={self.outstanding_io_count}, "
@@ -429,7 +444,7 @@ class _PrefetchingIter_async_registered_try_service(object):
             self.pending_split_item = None
 
         self._debug_log(
-            f"提交完成 iterid={split_item['logical_iter_id']}, "
+            f"[提交] 完成 iterid={split_item['logical_iter_id']}, "
             f"batchid={micro_idx}, request_id={request_id}, "
             f"batch_range={split_item['micro_ranges'][micro_idx]}, "
             f"micro_ios={micro_io_count}, logical_queue_len={len(self.prefetch_queue)}, "
@@ -444,6 +459,20 @@ class _PrefetchingIter_async_registered_try_service(object):
         if self.submit_commands_per_batch <= 1:
             return self._submit_prefetch_single()
         return self._submit_prefetch_split()
+
+    def _fill_prefetch_queue(self, label="fill"):
+        if self.submit_commands_per_batch <= 1:
+            while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
+                if not self._submit_prefetch():
+                    break
+            return
+
+        while not self.exhausted:
+            if len(self.prefetch_queue) >= self.prefetch_depth and self.pending_split_item is None:
+                break
+            if not self._submit_prefetch():
+                break
+        self._debug_queue_snapshot(f"{label}")
 
     def _ensure_front_logical_item_fully_submitted(self):
         if self.submit_commands_per_batch <= 1 or not self.prefetch_queue:
@@ -472,20 +501,25 @@ class _PrefetchingIter_async_registered_try_service(object):
         ready_front_after = self.GIDS_Loader.get_registered_ready_front_request_id()
         if request_id != 0 or ready_front_after != ready_front_before:
             self._debug_log(
-                f"{label}_done returned={request_id}, ready_front_before={ready_front_before}, "
+                f"[轮询] 函数=service_registered_try_poll_window_skip_front, 事件={label}_done, "
+                f"returned={request_id}, ready_front_before={ready_front_before}, "
                 f"ready_front_after={ready_front_after}, "
                 f"window={self.try_window_size}, outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
             )
         return request_id
 
-    def _poll_front_request(self, expected_request_id, label="poll"):
+    def _poll_front_request(self, expected_request_id, label="poll", iterid=None, batchid=None):
         ready_request_id = self.GIDS_Loader.get_registered_ready_front_request_id()
         if ready_request_id == expected_request_id:
-            self._debug_log(f"{label}_skip_ready request_id={expected_request_id}")
+            self._debug_log(
+                f"[轮询] 函数=skip_ready, 事件={label}_skip_ready, "
+                f"iterid={iterid}, batchid={batchid}, request_id={expected_request_id}"
+            )
             return
 
         self._debug_log(
-            f"{label}_begin expected={expected_request_id}, "
+            f"[轮询] 函数=front_poll, 事件={label}_begin, "
+            f"iterid={iterid}, batchid={batchid}, expected={expected_request_id}, "
             f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
             f"state={self.GIDS_Loader.get_registered_front_state()}, "
             f"queue_len={len(self.prefetch_queue)}"
@@ -495,12 +529,14 @@ class _PrefetchingIter_async_registered_try_service(object):
             # outstanding 太浅时，退回兼容的 blocking poll。
             # 这里只是兜底路径，不是希望长期依赖的主路径。
             self._debug_log(
-                f"{label}_fallback_single expected={expected_request_id}, "
+                f"[轮询] 函数=service_registered_poll_compatible, 事件={label}_fallback_single, "
+                f"iterid={iterid}, batchid={batchid}, expected={expected_request_id}, "
                 f"outstanding={outstanding_count}"
             )
             request_id = self.GIDS_Loader.service_registered_poll_compatible()
             self._debug_log(
-                f"{label}_fallback_single_done returned={request_id}, "
+                f"[轮询] 函数=service_registered_poll_compatible, 事件={label}_fallback_single_done, "
+                f"iterid={iterid}, batchid={batchid}, returned={request_id}, "
                 f"ready_front={self.GIDS_Loader.get_registered_ready_front_request_id()}, "
                 f"state={self.GIDS_Loader.get_registered_front_state()}"
             )
@@ -514,7 +550,8 @@ class _PrefetchingIter_async_registered_try_service(object):
             ready_request_id = self.GIDS_Loader.get_registered_ready_front_request_id()
             if ready_request_id == expected_request_id:
                 self._debug_log(
-                    f"{label}_done returned={request_id}, loops={try_loops}, "
+                    f"[轮询] 函数=service_registered_try_poll, 事件={label}_done, "
+                    f"iterid={iterid}, batchid={batchid}, returned={request_id}, loops={try_loops}, "
                     f"ready_front={ready_request_id}, "
                     f"state={self.GIDS_Loader.get_registered_front_state()}"
                 )
@@ -522,14 +559,16 @@ class _PrefetchingIter_async_registered_try_service(object):
             if try_loops % 8 == 0:
                 if try_loops % 64 == 0:
                     self._debug_log(
-                        f"{label}_retry loops={try_loops}, returned={request_id}, "
+                        f"[轮询] 函数=service_registered_try_poll, 事件={label}_retry, "
+                        f"iterid={iterid}, batchid={batchid}, loops={try_loops}, returned={request_id}, "
                         f"ready_front={ready_request_id}, "
                         f"state={self.GIDS_Loader.get_registered_front_state()}"
                     )
                 self._service_prefetch_nonblocking(f"{label}_window")
             if try_loops % self.try_poll_fallback_loops == 0:
                 self._debug_log(
-                    f"{label}_progress loops={try_loops}, expected={expected_request_id}, "
+                    f"[轮询] 函数=service_registered_try_poll, 事件={label}_progress, "
+                    f"iterid={iterid}, batchid={batchid}, loops={try_loops}, expected={expected_request_id}, "
                     f"front={self.GIDS_Loader.get_registered_front_request_id()}, "
                     f"state={self.GIDS_Loader.get_registered_front_state()}"
                 )
@@ -545,7 +584,7 @@ class _PrefetchingIter_async_registered_try_service(object):
         next_item = self.prefetch_queue.pop(0)
         next_batch = next_item["batch"]
         self._debug_log(
-            f"开始获取 iterid={next_item.get('logical_iter_id', -1)}, "
+            f"[获取] 开始 iterid={next_item.get('logical_iter_id', -1)}, "
             f"batchid=0, request_id={next_item['request_id']}"
         )
         batch = self.GIDS_Loader.fetch_feature_get_feature_light_registered_rowctx(
@@ -557,6 +596,7 @@ class _PrefetchingIter_async_registered_try_service(object):
 
     def _consume_front_split(self):
         self._ensure_front_logical_item_fully_submitted()
+        self._fill_prefetch_queue("front消费前补提")
         front_item = self.prefetch_queue[0]
         full_batch = front_item["batch"]
         input_nodes = full_batch[0]
@@ -570,11 +610,16 @@ class _PrefetchingIter_async_registered_try_service(object):
             micro_idx = front_item["consumed_micro_count"]
             expected_request_id = front_item["request_ids"][micro_idx]
             self._debug_log(
-                f"开始获取 iterid={front_item['logical_iter_id']}, "
+                f"[获取] 开始 iterid={front_item['logical_iter_id']}, "
                 f"batchid={micro_idx}, request_id={expected_request_id}, "
                 f"batch_range={front_item['micro_ranges'][micro_idx]}"
             )
-            self._poll_front_request(expected_request_id, f"next_poll_micro{micro_idx}")
+            self._poll_front_request(
+                expected_request_id,
+                f"next_poll_micro{micro_idx}",
+                iterid=front_item["logical_iter_id"],
+                batchid=micro_idx,
+            )
             micro_batch = front_item["micro_batches"][micro_idx]
             micro_result = self.GIDS_Loader.fetch_feature_get_feature_light_registered_rowctx(
                 self.dataloader.dim, micro_batch, self.GIDS_Loader.gids_device)
@@ -584,6 +629,10 @@ class _PrefetchingIter_async_registered_try_service(object):
             self.outstanding_io_count = max(
                 0, self.outstanding_io_count - front_item["micro_io_counts"][micro_idx])
             front_item["consumed_micro_count"] += 1
+            if front_item["consumed_micro_count"] < len(front_item["micro_batches"]):
+                self._fill_prefetch_queue(
+                    f"iter{front_item['logical_iter_id']}_batch{micro_idx}_后补提"
+                )
 
         self.prefetch_queue.pop(0)
         self._debug_queue_snapshot("获取状态")
@@ -596,7 +645,7 @@ class _PrefetchingIter_async_registered_try_service(object):
         if not self.prefetch_queue and self.exhausted:
             raise StopIteration
         self._debug_log(
-            f"next开始 逻辑队列长度={len(self.prefetch_queue)}, "
+            f"[next] 开始 逻辑队列长度={len(self.prefetch_queue)}, "
             f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}, "
             f"outstanding_ios={self.outstanding_io_count}"
         )
@@ -606,9 +655,10 @@ class _PrefetchingIter_async_registered_try_service(object):
         # queue so later iters can overlap in the background.
         if self.submit_commands_per_batch <= 1:
             self._poll_front_prefetch("next_poll")
-            self._service_prefetch_nonblocking("after_front_ready_service")
+            self._service_prefetch_nonblocking("before_front_poll")
             next_item, batch = self._consume_front_single()
         else:
+            self._fill_prefetch_queue("next开始补提")
             next_item, batch = self._consume_front_split()
 
         if not self._returned_any_batch:
@@ -616,18 +666,14 @@ class _PrefetchingIter_async_registered_try_service(object):
             if warmup_request_id == 0 and next_item.get("request_ids"):
                 warmup_request_id = next_item["request_ids"][0]
             self._debug_log(
-                f"warmup_complete request_id={warmup_request_id}, "
+                f"[next] warmup完成 request_id={warmup_request_id}, "
                 f"queue_len={len(self.prefetch_queue)}, "
                 f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}"
             )
 
-        while not self.exhausted:
-            if len(self.prefetch_queue) >= self.prefetch_depth and self.pending_split_item is None:
-                break
-            if not self._submit_prefetch():
-                break
+        self._fill_prefetch_queue("next返回后补提")
         self._debug_log(
-            f"next返回 iterid={next_item.get('logical_iter_id', -1)}, "
+            f"[next] 返回 iterid={next_item.get('logical_iter_id', -1)}, "
             f"逻辑队列长度={len(self.prefetch_queue)}, "
             f"outstanding={self.GIDS_Loader.get_registered_outstanding_count()}, "
             f"outstanding_ios={self.outstanding_io_count}"
