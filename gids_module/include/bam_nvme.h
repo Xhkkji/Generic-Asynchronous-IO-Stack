@@ -136,6 +136,8 @@ struct BAM_Feature_Store {
   bool registered_front_ready() const;
   uint64_t get_registered_ready_front_request_id() const;
   uint32_t get_registered_front_state() const;
+  uint64_t get_registered_request_id_at(uint64_t offset) const;
+  uint32_t get_registered_request_state_at(uint64_t offset) const;
   uint64_t get_registered_last_consumed_request_id() const;
 
 

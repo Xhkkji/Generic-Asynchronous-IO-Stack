@@ -1261,6 +1261,24 @@ uint32_t BAM_Feature_Store<TYPE>::get_registered_front_state() const
 }
 
 template <typename TYPE>
+uint64_t BAM_Feature_Store<TYPE>::get_registered_request_id_at(uint64_t offset) const
+{
+  const auto *outstanding = this->iostack.outstanding_at(offset);
+  return outstanding == nullptr ? 0 : outstanding->request_id;
+}
+
+template <typename TYPE>
+uint32_t BAM_Feature_Store<TYPE>::get_registered_request_state_at(uint64_t offset) const
+{
+  const auto *outstanding = this->iostack.outstanding_at(offset);
+  if (outstanding == nullptr)
+  {
+    return static_cast<uint32_t>(BaM_IOStack<TYPE>::CONSUMED);
+  }
+  return static_cast<uint32_t>(outstanding->state);
+}
+
+template <typename TYPE>
 uint64_t BAM_Feature_Store<TYPE>::get_registered_last_consumed_request_id() const
 {
   return this->iostack.get_last_consumed_request_id();
@@ -1683,6 +1701,8 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("registered_front_ready", &BAM_Feature_Store<float>::registered_front_ready)
       .def("get_registered_ready_front_request_id", &BAM_Feature_Store<float>::get_registered_ready_front_request_id)
       .def("get_registered_front_state", &BAM_Feature_Store<float>::get_registered_front_state)
+      .def("get_registered_request_id_at", &BAM_Feature_Store<float>::get_registered_request_id_at)
+      .def("get_registered_request_state_at", &BAM_Feature_Store<float>::get_registered_request_state_at)
       .def("get_registered_last_consumed_request_id", &BAM_Feature_Store<float>::get_registered_last_consumed_request_id)
 
       .def("read_feature_hetero", &BAM_Feature_Store<float>::read_feature_hetero)
@@ -1725,6 +1745,8 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("registered_front_ready", &BAM_Feature_Store<int64_t>::registered_front_ready)
       .def("get_registered_ready_front_request_id", &BAM_Feature_Store<int64_t>::get_registered_ready_front_request_id)
       .def("get_registered_front_state", &BAM_Feature_Store<int64_t>::get_registered_front_state)
+      .def("get_registered_request_id_at", &BAM_Feature_Store<int64_t>::get_registered_request_id_at)
+      .def("get_registered_request_state_at", &BAM_Feature_Store<int64_t>::get_registered_request_state_at)
       .def("get_registered_last_consumed_request_id", &BAM_Feature_Store<int64_t>::get_registered_last_consumed_request_id)
 
       .def("read_feature_merged", &BAM_Feature_Store<int64_t>::read_feature_merged)
