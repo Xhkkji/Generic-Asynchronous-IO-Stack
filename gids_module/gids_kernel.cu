@@ -860,7 +860,6 @@ __global__ void write_feature_kernel(Controller **ctrls, page_cache_d_t *pc, arr
 template <typename T = float>
 __global__ void write_feature_kernel2(Controller **ctrls, page_cache_d_t *pc, array_d_t<T> *dr, T *in_tensor_ptr, uint64_t dim, uint32_t num_ctrls, uint64_t offset)
 {
-
   bam_ptr<T> ptr(dr);
   uint64_t row_index = blockIdx.x;
 

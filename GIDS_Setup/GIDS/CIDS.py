@@ -445,10 +445,28 @@ class CIDS(object):
 
     def load_prepared_images_to_bam(self, prepared_root=None, sample_id_offset=0):
         # 把 prepared dataset 的 images.bin 线性写入当前 BaM 数组。
+        storage_array, meta = self._load_prepared_storage_array(prepared_root)
+        num_samples = int(meta["num_samples"])
+        tensor = torch.from_numpy(storage_array).to(self.cids_device).contiguous()
+        offset_bytes = sample_id_offset * self.storage_sample_dim * tensor.element_size()
+        self.store_tensor(tensor, offset_bytes)
+        prepared_root = os.path.abspath(prepared_root if prepared_root is not None else self.prepared_root)
+        return {
+            "prepared_root": prepared_root,
+            "num_samples": num_samples,
+            "sample_id_offset": sample_id_offset,
+            "offset_bytes": offset_bytes,
+            "dtype": "float32",
+            "sample_row_count": self.sample_row_count,
+            "row_dim": self.row_dim,
+        }
+
+    def _load_prepared_storage_array(self, prepared_root=None):
+        # 读取 prepared dataset，并转换成适合 BaM row 写入的二维 float32 数组。
         if prepared_root is None:
             prepared_root = self.prepared_root
         if prepared_root is None:
-            raise ValueError("load_prepared_images_to_bam 需要 prepared_root")
+            raise ValueError("_load_prepared_storage_array 需要 prepared_root")
 
         prepared_root = os.path.abspath(prepared_root)
         meta_path = os.path.join(prepared_root, "meta.json")
@@ -486,18 +504,36 @@ class CIDS(object):
             storage_array[:, :sample_dim] = host_array
             storage_array = storage_array.reshape(num_samples * self.sample_row_count, self.row_dim)
 
-        tensor = torch.from_numpy(storage_array).to(self.cids_device).contiguous()
-        offset_bytes = sample_id_offset * self.storage_sample_dim * tensor.element_size()
-        self.store_tensor(tensor, offset_bytes)
-        return {
-            "prepared_root": prepared_root,
-            "num_samples": num_samples,
-            "sample_id_offset": sample_id_offset,
-            "offset_bytes": offset_bytes,
-            "dtype": "float32",
-            "sample_row_count": self.sample_row_count,
-            "row_dim": self.row_dim,
-        }
+        return storage_array, meta
+
+    def load_combined_prepared_images_to_bam(self, prepared_roots):
+        # 把多套 prepared dataset 在 Python 侧先拼成一块，再一次性写入 BaM。
+        if not prepared_roots:
+            raise ValueError("load_combined_prepared_images_to_bam 需要至少一个 prepared_root")
+
+        storage_arrays = []
+        infos = []
+        sample_id_offset = 0
+
+        for prepared_root in prepared_roots:
+            storage_array, meta = self._load_prepared_storage_array(prepared_root)
+            num_samples = int(meta["num_samples"])
+            prepared_root = os.path.abspath(prepared_root)
+            storage_arrays.append(storage_array)
+            infos.append({
+                "prepared_root": prepared_root,
+                "num_samples": num_samples,
+                "sample_id_offset": sample_id_offset,
+                "dtype": "float32",
+                "sample_row_count": self.sample_row_count,
+                "row_dim": self.row_dim,
+            })
+            sample_id_offset += num_samples
+
+        combined_storage_array = np.concatenate(storage_arrays, axis=0)
+        tensor = torch.from_numpy(combined_storage_array).to(self.cids_device).contiguous()
+        self.store_tensor(tensor, 0)
+        return infos
 
     def _sample_ids_from_batch(self, batch):
         # 约定 batch 的第一个字段是 sample_id tensor。
