@@ -4,8 +4,10 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,32 @@ def _load_meta(prepared_root):
         return json.load(f)
 
 
+class _TorchPreparedDataset(Dataset):
+    # 使用 PyTorch 原生 Dataset/DataLoader 直接从 prepared 文件读取图片。
+    def __init__(self, prepared_root):
+        self.prepared_root = Path(prepared_root)
+        self.meta = _load_meta(prepared_root)
+        self.shape = tuple(self.meta["shape"])
+        self.sample_dim = int(self.meta["sample_dim"])
+        self.num_samples = int(self.meta["num_samples"])
+        self.dtype = np.float32
+        self.labels = np.load(self.prepared_root / self.meta.get("labels_file", "labels.npy"))
+        self.images = np.memmap(
+            self.prepared_root / self.meta.get("images_file", "images.bin"),
+            dtype=self.dtype,
+            mode="r",
+            shape=(self.num_samples, self.sample_dim),
+        )
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        image = torch.from_numpy(np.array(self.images[idx], copy=True)).view(*self.shape)
+        label = int(self.labels[idx])
+        return image, label
+
+
 def _build_loader(prepared_root, batch_size, shuffle, cids_loader, prefetch_depth,
                   start_sample_id=0, io_mode="registered"):
     # 基于 prepared dataset 构建最小 CIDS dataloader。
@@ -40,6 +68,20 @@ def _build_loader(prepared_root, batch_size, shuffle, cids_loader, prefetch_dept
         CIDS_Loader=cids_loader,
         prefetch_depth=prefetch_depth,
         io_mode=io_mode,
+    )
+    return dataset, dataloader
+
+
+def _build_torch_loader(prepared_root, batch_size, shuffle):
+    # 基于 PyTorch 原生 DataLoader 构建 prepared dataset 读取路径。
+    dataset = _TorchPreparedDataset(prepared_root)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
     )
     return dataset, dataloader
 
@@ -114,9 +156,9 @@ def main():
     parser.add_argument("--pretrained", action="store_true", help="是否使用 torchvision 预训练权重")
     parser.add_argument(
         "--io-mode",
-        choices=["sync", "registered"],
+        choices=["sync", "registered", "torch"],
         default="registered",
-        help="读取模式：sync 为最原始同步读取，registered 为异步 registered try-service",
+        help="读取模式：sync 为最原始同步读取，registered 为异步 registered try-service，torch 为 PyTorch 原生 DataLoader",
     )
     parser.add_argument(
         "--force-sync-read",
@@ -140,33 +182,48 @@ def main():
     if num_classes <= 0:
         raise ValueError("prepared train dataset 的 meta.json 中没有有效 classes 信息")
 
-    train_cids = CIDS.from_prepared_dataset(
-        args.train_root,
-        ctrl_idx=args.ctrl_idx,
-    )
-
-    _, train_loader = _build_loader(
-        prepared_root=args.train_root,
-        batch_size=args.batch_size,
-        shuffle=True,
-        cids_loader=train_cids,
-        prefetch_depth=args.prefetch_depth,
-        start_sample_id=0,
-        io_mode=args.io_mode,
-    )
-
-    val_loader = None
-    if args.val_root is not None:
-        val_start_sample_id = int(train_meta["num_samples"])
-        _, val_loader = _build_loader(
-            prepared_root=args.val_root,
+    train_cids = None
+    if args.io_mode == "torch":
+        _, train_loader = _build_torch_loader(
+            prepared_root=args.train_root,
             batch_size=args.batch_size,
-            shuffle=False,
+            shuffle=True,
+        )
+        val_loader = None
+        if args.val_root is not None:
+            _, val_loader = _build_torch_loader(
+                prepared_root=args.val_root,
+                batch_size=args.batch_size,
+                shuffle=False,
+            )
+    else:
+        train_cids = CIDS.from_prepared_dataset(
+            args.train_root,
+            ctrl_idx=args.ctrl_idx,
+        )
+
+        _, train_loader = _build_loader(
+            prepared_root=args.train_root,
+            batch_size=args.batch_size,
+            shuffle=True,
             cids_loader=train_cids,
             prefetch_depth=args.prefetch_depth,
-            start_sample_id=val_start_sample_id,
+            start_sample_id=0,
             io_mode=args.io_mode,
         )
+
+        val_loader = None
+        if args.val_root is not None:
+            val_start_sample_id = int(train_meta["num_samples"])
+            _, val_loader = _build_loader(
+                prepared_root=args.val_root,
+                batch_size=args.batch_size,
+                shuffle=False,
+                cids_loader=train_cids,
+                prefetch_depth=args.prefetch_depth,
+                start_sample_id=val_start_sample_id,
+                io_mode=args.io_mode,
+            )
 
     model = build_resnet18(
         num_classes=num_classes,
@@ -188,20 +245,28 @@ def main():
         f"GIDS_FORCE_SYNC_READ={os.environ.get('GIDS_FORCE_SYNC_READ', '0')}",
         flush=True,
     )
-    print(
-        "[CIDS_TRAIN] 假设 prepared images 已经通过单独脚本写入 BaM；"
-        "训练阶段不再负责写入。",
-        flush=True,
-    )
+    if args.io_mode == "torch":
+        print(
+            "[CIDS_TRAIN] 当前使用 PyTorch 原生 DataLoader，直接读取 prepared dataset 文件。",
+            flush=True,
+        )
+    else:
+        print(
+            "[CIDS_TRAIN] 假设 prepared images 已经通过单独脚本写入 BaM；"
+            "训练阶段不再负责写入。",
+            flush=True,
+        )
 
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device)
+        submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
+        wait_time = train_cids.GIDS_wait_time if train_cids is not None else 0.0
         print(
             f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-            f"submit_time={train_cids.GIDS_submit_time:.4f} "
-            f"wait_time={train_cids.GIDS_wait_time:.4f}",
+            f"submit_time={submit_time:.4f} "
+            f"wait_time={wait_time:.4f}",
             flush=True,
         )
 
