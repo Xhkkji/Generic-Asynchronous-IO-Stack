@@ -5,6 +5,7 @@ import json
 from collections.abc import Mapping
 
 import torch
+from torch.autograd.profiler import record_function
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 
@@ -48,7 +49,12 @@ def _dtype_name_to_numpy_dtype(dtype_name):
 class _PrefetchingIter_async_registered_try_service_cids(object):
     # CIDS 的最小 registered try-service 迭代器：
     # 按 sample_id 提交图片读取，请求完成后再把图片 batch 返回给训练。
-    def __init__(self, dataloader, dataloader_it, CIDS_Loader=None, prefetch_depth=1):
+    REQUEST_STATE_SUBMITTED = 0
+    REQUEST_STATE_READY = 1
+    REQUEST_STATE_CONSUMED = 2
+
+    def __init__(self, dataloader, dataloader_it, CIDS_Loader=None, prefetch_depth=1,
+                 registered_split=1):
         self.dataloader = dataloader
         self.dataloader_it = dataloader_it
         self.CIDS_Loader = CIDS_Loader
@@ -56,12 +62,15 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
         self.prefetch_queue = []
         self.exhausted = False
         self.prefetch_depth = max(1, int(prefetch_depth))
+        self.registered_split = max(1, int(registered_split))
         self.enable_skip_front = bool(getattr(
             self.CIDS_Loader, "registered_enable_skip_front", True))
         self.try_window_size = max(1, int(getattr(
             self.CIDS_Loader, "registered_try_window_size", 1)))
         self.debug = os.environ.get(
             "CIDS_DEBUG", "0") not in ("0", "", "false", "False")
+        self.profile_gpu_timing = os.environ.get(
+            "CIDS_PROFILE_GPU_TIMING", "0") not in ("0", "", "false", "False")
 
         self._warmup_prefetch_queue()
 
@@ -70,11 +79,169 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
         if self.debug:
             print(f"[CIDS] {message}", flush=True)
 
+    def _sync_for_profile_timing(self):
+        # 仅在 profiling 时把异步 GPU 工作结算到当前阶段区间里，便于看到 submit/poll/get 的 GPU 时间。
+        device = _get_device(self.CIDS_Loader.cids_device)
+        if self.profile_gpu_timing and device.type == "cuda":
+            torch.cuda.synchronize(device)
+
     def _warmup_prefetch_queue(self):
         # 初始化时先把预取队列填到目标深度。
         while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
             if not self._submit_prefetch():
                 break
+
+    def _slice_batch(self, batch, start, end):
+        # 沿 batch 维切出一个 sub-batch，供 split submit 使用。
+        if isinstance(batch, Mapping):
+            result = {}
+            for key, value in batch.items():
+                if torch.is_tensor(value):
+                    result[key] = value[start:end]
+                elif isinstance(value, np.ndarray):
+                    result[key] = value[start:end]
+                elif isinstance(value, (list, tuple)):
+                    result[key] = value[start:end]
+                else:
+                    result[key] = value
+            return result
+
+        if isinstance(batch, tuple):
+            items = []
+            for value in batch:
+                if torch.is_tensor(value):
+                    items.append(value[start:end])
+                elif isinstance(value, np.ndarray):
+                    items.append(value[start:end])
+                elif isinstance(value, (list, tuple)):
+                    items.append(value[start:end])
+                else:
+                    items.append(value)
+            return tuple(items)
+
+        if isinstance(batch, list):
+            items = []
+            for value in batch:
+                if torch.is_tensor(value):
+                    items.append(value[start:end])
+                elif isinstance(value, np.ndarray):
+                    items.append(value[start:end])
+                elif isinstance(value, (list, tuple)):
+                    items.append(value[start:end])
+                else:
+                    items.append(value)
+            return items
+
+        if torch.is_tensor(batch):
+            return batch[start:end]
+        if isinstance(batch, np.ndarray):
+            return batch[start:end]
+        if isinstance(batch, (list, tuple)):
+            return batch[start:end]
+        return batch
+
+    def _split_batch(self, batch):
+        # 把一个训练 batch 按 sample 维切成多个 sub-batch request。
+        sample_ids = self.CIDS_Loader._sample_ids_from_batch(batch)
+        batch_size = int(sample_ids.numel())
+        if batch_size == 0:
+            return [batch]
+
+        split = min(self.registered_split, batch_size)
+        if split <= 1:
+            return [batch]
+
+        chunk_size = math.ceil(batch_size / split)
+        sub_batches = []
+        for start in range(0, batch_size, chunk_size):
+            end = min(batch_size, start + chunk_size)
+            sub_batches.append(self._slice_batch(batch, start, end))
+        return sub_batches
+
+    def _merge_return_batches(self, merged_batches):
+        # 把多个 sub-batch 的返回结果重新拼回一个完整训练 batch。
+        if not merged_batches:
+            raise ValueError("merge_return_batches 需要至少一个 sub-batch")
+        if len(merged_batches) == 1:
+            return merged_batches[0]
+
+        first = merged_batches[0]
+        if isinstance(first, Mapping):
+            result = {}
+            for key in first.keys():
+                values = [item[key] for item in merged_batches]
+                if torch.is_tensor(values[0]):
+                    result[key] = torch.cat(values, dim=0)
+                elif isinstance(values[0], np.ndarray):
+                    result[key] = np.concatenate(values, axis=0)
+                elif isinstance(values[0], list):
+                    merged = []
+                    for value in values:
+                        merged.extend(value)
+                    result[key] = merged
+                elif isinstance(values[0], tuple):
+                    merged = []
+                    for value in values:
+                        merged.extend(list(value))
+                    result[key] = tuple(merged)
+                else:
+                    result[key] = values
+            return result
+
+        if isinstance(first, tuple):
+            merged_fields = []
+            for field_idx in range(len(first)):
+                values = [item[field_idx] for item in merged_batches]
+                if torch.is_tensor(values[0]):
+                    merged_fields.append(torch.cat(values, dim=0))
+                elif isinstance(values[0], np.ndarray):
+                    merged_fields.append(np.concatenate(values, axis=0))
+                elif isinstance(values[0], list):
+                    merged = []
+                    for value in values:
+                        merged.extend(value)
+                    merged_fields.append(merged)
+                elif isinstance(values[0], tuple):
+                    merged = []
+                    for value in values:
+                        merged.extend(list(value))
+                    merged_fields.append(tuple(merged))
+                else:
+                    merged_fields.append(values)
+            return tuple(merged_fields)
+
+        if isinstance(first, list):
+            merged_fields = []
+            for field_idx in range(len(first)):
+                values = [item[field_idx] for item in merged_batches]
+                if torch.is_tensor(values[0]):
+                    merged_fields.append(torch.cat(values, dim=0))
+                elif isinstance(values[0], np.ndarray):
+                    merged_fields.append(np.concatenate(values, axis=0))
+                elif isinstance(values[0], list):
+                    merged = []
+                    for value in values:
+                        merged.extend(value)
+                    merged_fields.append(merged)
+                elif isinstance(values[0], tuple):
+                    merged = []
+                    for value in values:
+                        merged.extend(list(value))
+                    merged_fields.append(merged)
+                else:
+                    merged_fields.append(values)
+            return merged_fields
+
+        if torch.is_tensor(first):
+            return torch.cat(merged_batches, dim=0)
+        if isinstance(first, np.ndarray):
+            return np.concatenate(merged_batches, axis=0)
+        if isinstance(first, list):
+            merged = []
+            for item in merged_batches:
+                merged.extend(item)
+            return merged
+        return merged_batches
 
     def _submit_prefetch(self):
         # 从底层 dataloader 取一个 batch，并提交对应图片读取请求。
@@ -87,14 +254,25 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
             self.exhausted = True
             return False
 
-        request_id = self.CIDS_Loader.fetch_samples_submit_registered(
-            next_batch, self.CIDS_Loader.cids_device)
+        split_batches = self._split_batch(next_batch)
+        request_ids = []
+        row_indices_refs = []
+        for split_batch in split_batches:
+            with record_function("cids.registered.submit"):
+                request_id, row_indices = self.CIDS_Loader.fetch_samples_submit_registered(
+                    split_batch, self.CIDS_Loader.cids_device)
+                self._sync_for_profile_timing()
+            request_ids.append(request_id)
+            row_indices_refs.append(row_indices)
+
         self.prefetch_queue.append({
             "batch": next_batch,
-            "request_id": request_id,
+            "split_batches": split_batches,
+            "request_ids": request_ids,
+            "row_indices_refs": row_indices_refs,
         })
         self._debug_log(
-            f"提交完成 request_id={request_id}, queue_len={len(self.prefetch_queue)}")
+            f"提交完成 request_ids={request_ids}, split={len(request_ids)}, queue_len={len(self.prefetch_queue)}")
         return True
 
     def _service_prefetch_nonblocking(self):
@@ -108,28 +286,44 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
         self.CIDS_Loader.service_registered_try_poll_window_skip_front(
             self.try_window_size)
 
-    def _poll_front_prefetch(self):
-        # 强轮询当前 front request，直到它 ready。
-        if not self.prefetch_queue:
+    def _poll_request_ready(self, expected_request_id):
+        # 只等待当前 front 的一个 sub-request ready。
+        if expected_request_id == 0:
             return
-
-        expected = self.prefetch_queue[0]["request_id"]
         ready_front = self.CIDS_Loader.get_registered_ready_front_request_id()
-        if ready_front == expected:
+        if ready_front == expected_request_id:
             return
-
+        self._debug_log(
+            f"开始等待 sub-request ready expected={expected_request_id} "
+            f"outstanding={self.CIDS_Loader.get_registered_outstanding_count()} "
+            f"ready_front={ready_front}"
+        )
         try_loops = 0
         while True:
-            outstanding = self.CIDS_Loader.get_registered_outstanding_count()
-            if outstanding <= 1:
+            # 对当前 front sub-request，始终优先走 compatible poll。
+            # rowctx registered 的 front request 需要这个路径主动把 page 从
+            # SUBMITTED/NV_NB 推进到 READY；try_poll 只做 completion/ready 检查，
+            # 在 outstanding>1 时单独用它容易一直卡住。
+            with record_function("cids.registered.poll"):
                 request_id = self.CIDS_Loader.service_registered_poll_compatible()
-            else:
-                request_id = self.CIDS_Loader.service_registered_try_poll()
-                try_loops += 1
-                if try_loops % 8 == 0:
-                    self._service_prefetch_nonblocking()
-
-            if request_id == expected:
+                self._sync_for_profile_timing()
+            try_loops += 1
+            if try_loops == 1 or try_loops % 16 == 0:
+                self._debug_log(
+                    f"等待中 expected={expected_request_id} "
+                    f"returned={request_id} "
+                    f"ready_front={self.CIDS_Loader.get_registered_ready_front_request_id()} "
+                    f"outstanding={self.CIDS_Loader.get_registered_outstanding_count()} "
+                    f"loops={try_loops}"
+                )
+            if try_loops % 8 == 0:
+                self._service_prefetch_nonblocking()
+            ready_front = self.CIDS_Loader.get_registered_ready_front_request_id()
+            if request_id == expected_request_id or ready_front == expected_request_id:
+                self._debug_log(
+                    f"等待完成 expected={expected_request_id} "
+                    f"returned={request_id} ready_front={ready_front} loops={try_loops}"
+                )
                 return
 
     def __iter__(self):
@@ -141,11 +335,24 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
             raise StopIteration
 
         self._service_prefetch_nonblocking()
-        self._poll_front_prefetch()
-
         next_item = self.prefetch_queue.pop(0)
-        batch = self.CIDS_Loader.fetch_samples_get_registered(
-            next_item["batch"], self.CIDS_Loader.cids_device)
+        split_batches = []
+        for split_batch, request_id in zip(next_item["split_batches"], next_item["request_ids"]):
+            self._debug_log(f"准备消费 sub-request request_id={request_id}")
+            self._poll_request_ready(request_id)
+            with record_function("cids.registered.get"):
+                split_batches.append(
+                    self.CIDS_Loader.fetch_samples_get_registered(
+                        split_batch, self.CIDS_Loader.cids_device)
+                )
+                self._sync_for_profile_timing()
+            self._debug_log(f"完成消费 sub-request request_id={request_id}")
+            self._service_prefetch_nonblocking()
+            while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
+                if not self._submit_prefetch():
+                    break
+        with record_function("cids.registered.merge"):
+            batch = self._merge_return_batches(split_batches)
 
         while len(self.prefetch_queue) < self.prefetch_depth and not self.exhausted:
             if not self._submit_prefetch():
@@ -160,26 +367,36 @@ class _PrefetchingIter_sync_cids(object):
     def __init__(self, dataloader_it, CIDS_Loader=None):
         self.dataloader_it = dataloader_it
         self.CIDS_Loader = CIDS_Loader
+        self.profile_gpu_timing = os.environ.get(
+            "CIDS_PROFILE_GPU_TIMING", "0") not in ("0", "", "false", "False")
 
     def __iter__(self):
         return self
 
     def __next__(self):
         next_batch = next(self.dataloader_it)
-        return self.CIDS_Loader.fetch_samples_sync(
-            next_batch, self.CIDS_Loader.cids_device)
+        with record_function("cids.sync.read"):
+            batch = self.CIDS_Loader.fetch_samples_sync(
+                next_batch, self.CIDS_Loader.cids_device)
+            device = _get_device(self.CIDS_Loader.cids_device)
+            if self.profile_gpu_timing and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            return batch
 
 
 class CIDS_DataLoader(DataLoader):
     # 面向 CNN/image 训练的 DataLoader 包装器：
     # 底层 dataset 只需要提供 sample_id 和 label。
     def __init__(self, *args, CIDS_Loader=None, prefetch_depth=None, io_mode="registered",
+                 registered_split=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.CIDS_Loader = CIDS_Loader
         self.prefetch_depth = int(prefetch_depth or getattr(
             self.CIDS_Loader, "iter_prefetch_depth", 1))
         self.io_mode = io_mode
+        self.registered_split = int(registered_split or getattr(
+            self.CIDS_Loader, "registered_split", 1))
 
     def __iter__(self):
         # 目前只保留两个最小分支：
@@ -197,6 +414,7 @@ class CIDS_DataLoader(DataLoader):
             super().__iter__(),
             self.CIDS_Loader,
             prefetch_depth=self.prefetch_depth,
+            registered_split=self.registered_split,
         )
 
 
@@ -397,6 +615,7 @@ class CIDS(object):
         self.cids_device = "cuda:" + str(ctrl_idx)
 
         self.iter_prefetch_depth = 4
+        self.registered_split = int(os.environ.get("CIDS_REGISTERED_SPLIT", "1"))
         self.registered_try_window_size = int(os.environ.get(
             "CIDS_REGISTERED_TRY_WINDOW_SIZE", "2"))
         self.registered_enable_skip_front = os.environ.get(
@@ -442,6 +661,11 @@ class CIDS(object):
         )
         row_indices = sample_ids.unsqueeze(1) * self.sample_row_count + row_offsets.unsqueeze(0)
         return row_indices.reshape(-1).contiguous()
+
+    def _build_row_indices_from_batch(self, batch):
+        # 为一个 batch 构造 row index tensor，并把它保留给整个 request 生命周期使用。
+        sample_ids = self._sample_ids_from_batch(batch)
+        return self._expand_sample_ids_to_row_indices(sample_ids)
 
     def load_prepared_images_to_bam(self, prepared_root=None, sample_id_offset=0):
         # 把 prepared dataset 的 images.bin 线性写入当前 BaM 数组。
@@ -575,8 +799,7 @@ class CIDS(object):
     def fetch_samples_submit_registered(self, batch, device):
         # 提交一个图片 batch 的异步 SSD->GPU 读取请求。
         s_time = time.time()
-        sample_ids = self._sample_ids_from_batch(batch)
-        row_indices = self._expand_sample_ids_to_row_indices(sample_ids)
+        row_indices = self._build_row_indices_from_batch(batch)
         request_id = self.BAM_FS.read_feature_submit_async_registered_rowctx(
             row_indices.data_ptr(),
             len(row_indices),
@@ -585,7 +808,7 @@ class CIDS(object):
             0,
         )
         self.GIDS_submit_time += time.time() - s_time
-        return request_id
+        return request_id, row_indices
 
     def fetch_samples_sync(self, batch, device):
         # 最原始同步路径：直接按展开后的 row index 读取整个 batch。
@@ -659,3 +882,11 @@ class CIDS(object):
     def get_registered_ready_front_request_id(self):
         # 返回当前 ready_front 对应的 request_id。
         return self.BAM_FS.get_registered_ready_front_request_id()
+
+    def get_registered_request_id_at(self, offset):
+        # 查看 outstanding 队列中某个 offset 的 request_id。
+        return self.BAM_FS.get_registered_request_id_at(offset)
+
+    def get_registered_request_state_at(self, offset):
+        # 查看 outstanding 队列中某个 offset 的 request 状态。
+        return self.BAM_FS.get_registered_request_state_at(offset)

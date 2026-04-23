@@ -7,7 +7,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.profiler
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +57,7 @@ class _TorchPreparedDataset(Dataset):
 
 
 def _build_loader(prepared_root, batch_size, shuffle, cids_loader, prefetch_depth,
-                  start_sample_id=0, io_mode="registered"):
+                  start_sample_id=0, io_mode="registered", registered_split=1):
     # 基于 prepared dataset 构建最小 CIDS dataloader。
     dataset = CIDSPreparedDataset(prepared_root, start_sample_id=start_sample_id)
     dataloader = CIDS_DataLoader(
@@ -68,6 +70,7 @@ def _build_loader(prepared_root, batch_size, shuffle, cids_loader, prefetch_dept
         CIDS_Loader=cids_loader,
         prefetch_depth=prefetch_depth,
         io_mode=io_mode,
+        registered_split=registered_split,
     )
     return dataset, dataloader
 
@@ -93,14 +96,70 @@ def _move_labels_to_device(labels, device):
     return labels.to(device, non_blocking=True)
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device):
+def _start_profiler(enabled, output_dir):
+    # 轻量 profiler：重点看 CPU/CUDA 时间线与执行时间，不记录 shape/memory/stack。
+    if not enabled:
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    print("=== start_profiling called ===", flush=True)
+    profiler = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=3,
+            repeat=1,
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+    )
+    profiler.__enter__()
+    return profiler
+
+
+def _stop_profiler(profiler):
+    # 停止 profiler，并同时打印 CUDA 热点和 CPU 热点。
+    print(
+        f"=== stop_profiling called, profiler id: {id(profiler) if profiler else 'None'} ===",
+        flush=True,
+    )
+    if profiler is None:
+        return
+    profiler.__exit__(None, None, None)
+    try:
+        key_averages = profiler.key_averages()
+    except AssertionError:
+        print("=== profiler has no finalized events to summarize ===", flush=True)
+        return
+    print("=== profiler summary: cuda_time_total ===", flush=True)
+    print(
+        key_averages.table(
+            sort_by="cuda_time_total",
+            row_limit=20,
+        ),
+        flush=True,
+    )
+    print("=== profiler summary: cpu_time_total ===", flush=True)
+    print(
+        key_averages.table(
+            sort_by="cpu_time_total",
+            row_limit=100,
+        ),
+        flush=True,
+    )
+
+
+def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=None):
     # 最小训练循环：只做前向、反向、优化和简单精度统计。
     model.train()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
 
-    for images, labels in dataloader:
+    progress = tqdm(dataloader, desc="train", leave=False)
+    for images, labels in progress:
         images = images.to(device, non_blocking=True)
         labels = _move_labels_to_device(labels, device)
 
@@ -113,6 +172,12 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
         total_loss += loss.item() * images.size(0)
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
         total_samples += images.size(0)
+        progress.set_postfix(
+            loss=f"{(total_loss / max(1, total_samples)):.4f}",
+            acc=f"{(total_correct / max(1, total_samples)):.4f}",
+        )
+        if profiler is not None:
+            profiler.step()
 
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
@@ -127,7 +192,8 @@ def evaluate(model, dataloader, criterion, device):
     total_correct = 0
     total_samples = 0
 
-    for images, labels in dataloader:
+    progress = tqdm(dataloader, desc="val", leave=False)
+    for images, labels in progress:
         images = images.to(device, non_blocking=True)
         labels = _move_labels_to_device(labels, device)
 
@@ -137,7 +203,10 @@ def evaluate(model, dataloader, criterion, device):
         total_loss += loss.item() * images.size(0)
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
         total_samples += images.size(0)
-
+        progress.set_postfix(
+            loss=f"{(total_loss / max(1, total_samples)):.4f}",
+            acc=f"{(total_correct / max(1, total_samples)):.4f}",
+        )
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
     return avg_loss, avg_acc
@@ -152,6 +221,14 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="权重衰减")
     parser.add_argument("--prefetch-depth", type=int, default=4, help="CIDS 预取深度")
+    parser.add_argument("--cache-size", type=int, default=10, help="CIDS/BaM cache 大小，单位 MB")
+    parser.add_argument("--registered-split", type=int, default=1, help="registered 模式下一个训练 batch 拆成多少个 sub-request")
+    parser.add_argument(
+        "--registered-skip-front",
+        choices=["0", "1"],
+        default=None,
+        help="registered 模式是否开启 skip-front 预热；不显式传时沿用环境变量或默认值",
+    )
     parser.add_argument("--ctrl-idx", type=int, default=0, help="使用的 GPU/controller 索引")
     parser.add_argument("--pretrained", action="store_true", help="是否使用 torchvision 预训练权重")
     parser.add_argument(
@@ -166,6 +243,17 @@ def main():
         default=None,
         help="是否强制底层 read_feature 走 GIDS_FORCE_SYNC_READ，同步模式默认自动设为 1",
     )
+    parser.add_argument(
+        "--enable-profile",
+        choices=["0", "1"],
+        default=os.environ.get("CIDS_ENABLE_PROFILE", "0"),
+        help="是否开启和 GIDS 类似的 torch.profiler",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        default=os.environ.get("CIDS_PROFILE_DIR", "./cids_profile"),
+        help="profiler 输出目录",
+    )
     args = parser.parse_args()
 
     if args.force_sync_read is not None:
@@ -174,6 +262,16 @@ def main():
         os.environ["GIDS_FORCE_SYNC_READ"] = "1"
     else:
         os.environ.setdefault("GIDS_FORCE_SYNC_READ", "0")
+
+    if args.io_mode == "sync" and os.environ.get("GIDS_FORCE_SYNC_READ", "0") != "1":
+        raise ValueError(
+            "sync 模式必须配合 GIDS_FORCE_SYNC_READ=1，"
+            "否则底层会误走旧的 async read_feature 路径。"
+        )
+
+    if args.registered_skip_front is not None:
+        os.environ["CIDS_REGISTERED_ENABLE_SKIP_FRONT"] = args.registered_skip_front
+    os.environ["CIDS_REGISTERED_SPLIT"] = str(max(1, args.registered_split))
 
     device = torch.device(f"cuda:{args.ctrl_idx}" if torch.cuda.is_available() else "cpu")
 
@@ -200,6 +298,7 @@ def main():
         train_cids = CIDS.from_prepared_dataset(
             args.train_root,
             ctrl_idx=args.ctrl_idx,
+            cache_size=args.cache_size,
         )
 
         _, train_loader = _build_loader(
@@ -210,6 +309,7 @@ def main():
             prefetch_depth=args.prefetch_depth,
             start_sample_id=0,
             io_mode=args.io_mode,
+            registered_split=args.registered_split,
         )
 
         val_loader = None
@@ -223,6 +323,7 @@ def main():
                 prefetch_depth=args.prefetch_depth,
                 start_sample_id=val_start_sample_id,
                 io_mode=args.io_mode,
+                registered_split=args.registered_split,
             )
 
     model = build_resnet18(
@@ -242,7 +343,12 @@ def main():
         f"[CIDS_TRAIN] device={device} num_classes={num_classes} "
         f"shape={train_meta['shape']} dtype={train_meta['dtype']} "
         f"io_mode={args.io_mode} "
-        f"GIDS_FORCE_SYNC_READ={os.environ.get('GIDS_FORCE_SYNC_READ', '0')}",
+        f"GIDS_FORCE_SYNC_READ={os.environ.get('GIDS_FORCE_SYNC_READ', '0')} "
+        f"cache_size={args.cache_size}MB "
+        f"prefetch_depth={args.prefetch_depth} "
+        f"registered_split={args.registered_split} "
+        f"CIDS_REGISTERED_ENABLE_SKIP_FRONT={os.environ.get('CIDS_REGISTERED_ENABLE_SKIP_FRONT', '1')} "
+        f"CIDS_PROFILE_GPU_TIMING={os.environ.get('CIDS_PROFILE_GPU_TIMING', '0')}",
         flush=True,
     )
     if args.io_mode == "torch":
@@ -257,26 +363,33 @@ def main():
             flush=True,
         )
 
-    for epoch in range(args.epochs):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, criterion, device)
-        submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
-        wait_time = train_cids.GIDS_wait_time if train_cids is not None else 0.0
-        print(
-            f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-            f"submit_time={submit_time:.4f} "
-            f"wait_time={wait_time:.4f}",
-            flush=True,
-        )
-
-        if val_loader is not None:
-            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+    profiler = _start_profiler(
+        enabled=(args.enable_profile == "1"),
+        output_dir=args.profile_dir,
+    )
+    try:
+        for epoch in tqdm(range(args.epochs)):
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, optimizer, criterion, device, profiler=profiler)
+            submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
+            wait_time = train_cids.GIDS_wait_time if train_cids is not None else 0.0
             print(
                 f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
-                f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
+                f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+                f"submit_time={submit_time:.4f} "
+                f"wait_time={wait_time:.4f}",
                 flush=True,
             )
+
+            if val_loader is not None:
+                val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+                print(
+                    f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
+                    f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
+                    flush=True,
+                )
+    finally:
+        _stop_profiler(profiler)
 
 
 if __name__ == "__main__":

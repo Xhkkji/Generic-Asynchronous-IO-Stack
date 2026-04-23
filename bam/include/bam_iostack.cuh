@@ -26,6 +26,7 @@
 // 新增
 #include <atomic>  // std::atomic（如果支持）
 #include <cstdint> // 标准整数类型
+#include <cstdlib>
 #include <deque>
 // CUDA相关
 #include <cuda_runtime.h> // CUDA运行时
@@ -144,6 +145,9 @@ struct BaM_IOStack
                                 int64_t num_index, int dim, int cache_dim, uint64_t key_off,
                                 uint32_t ctx_stride = 32)
   {
+    const char *debug_env = std::getenv("CIDS_REGISTERED_POLL_DEBUG");
+    const bool debug_poll = debug_env != nullptr &&
+                            !(debug_env[0] == '0' && debug_env[1] == '\0');
     push_ctxs(ctxs, ctx_count);
 
     outstanding_meta_t meta;
@@ -157,6 +161,19 @@ struct BaM_IOStack
     meta.ctx_count = ctx_count;
     meta.ctx_stride = ctx_stride;
     outstanding_queue.push_back(meta);
+    if (debug_poll)
+    {
+      printf("[REGISTERED_IOSTACK] register request_id=%llu ctxs=%p ctx_count=%llu index_ptr=0x%llx num_index=%lld dim=%d cache_dim=%d ctx_stride=%u queue_size=%zu\n",
+             (unsigned long long)meta.request_id,
+             (void *)ctxs,
+             (unsigned long long)ctx_count,
+             (unsigned long long)index_ptr,
+             (long long)num_index,
+             dim,
+             cache_dim,
+             ctx_stride,
+             outstanding_queue.size());
+    }
     return meta.request_id;
   }
 

@@ -514,6 +514,7 @@ template <typename TYPE>
 uint64_t BAM_Feature_Store<TYPE>::read_feature_submit_async_registered_rowctx(uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off)
 {
+  const bool debug_poll = env_flag_enabled("CIDS_REGISTERED_POLL_DEBUG");
   int64_t *index_ptr = (int64_t *)i_index_ptr;
   constexpr uint64_t b_size = 256;
   const uint64_t n_warp = b_size / 32;
@@ -529,6 +530,18 @@ uint64_t BAM_Feature_Store<TYPE>::read_feature_submit_async_registered_rowctx(ui
   const uint64_t request_id =
       this->iostack.register_outstanding(d_row_ctxs, total_ctxs, i_index_ptr, num_index,
                                          dim, cache_dim, key_off, 1);
+  if (debug_poll)
+  {
+    printf("[REGISTERED_SUBMIT_ROWCTX] request_id=%llu d_row_ctxs=%p total_ctxs=%llu index_ptr=0x%llx num_index=%lld dim=%d cache_dim=%d g_size=%llu\n",
+           (unsigned long long)request_id,
+           (void *)d_row_ctxs,
+           (unsigned long long)total_ctxs,
+           (unsigned long long)i_index_ptr,
+           (long long)num_index,
+           dim,
+           cache_dim,
+           (unsigned long long)g_size);
+  }
 
   read_feature_kernel_submit_async_rowctx<TYPE><<<g_size, b_size>>>(
       a->d_array_ptr, index_ptr, dim, num_index, cache_dim, 0, d_row_ctxs);
@@ -578,6 +591,12 @@ uint64_t BAM_Feature_Store<TYPE>::read_feature_submit_async_registered_rowctx(ui
 
   kernel_time += ms_fractional;
   total_access += num_index;
+  if (debug_poll)
+  {
+    printf("[REGISTERED_SUBMIT_ROWCTX] done request_id=%llu outstanding=%llu\n",
+           (unsigned long long)request_id,
+           (unsigned long long)this->iostack.outstanding_count());
+  }
   return request_id;
 }
 
@@ -974,27 +993,89 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_poll()
 template <typename TYPE>
 uint64_t BAM_Feature_Store<TYPE>::service_registered_poll_compatible()
 {
+  const bool debug_poll = env_flag_enabled("CIDS_REGISTERED_POLL_DEBUG");
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] enter\n");
+  }
   const auto *outstanding = this->iostack.front_outstanding();
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] front_outstanding=%p\n", (const void *)outstanding);
+  }
   if (outstanding == nullptr)
   {
+    if (debug_poll)
+    {
+      printf("[REGISTERED_POLL_COMPAT] no outstanding request\n");
+    }
     return 0;
   }
-  if (outstanding->state == BaM_IOStack<TYPE>::READY)
+  if (debug_poll)
   {
-    return outstanding->request_id;
+    printf("[REGISTERED_POLL_COMPAT] about to read request_id\n");
   }
-
-  if (outstanding->ctx_stride != 1)
+  const uint64_t request_id = outstanding->request_id;
+  if (debug_poll)
   {
+    printf("[REGISTERED_POLL_COMPAT] request_id=%llu\n", (unsigned long long)request_id);
+    printf("[REGISTERED_POLL_COMPAT] about to read state\n");
+  }
+  const uint32_t request_state = static_cast<uint32_t>(outstanding->state);
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] state=%u\n", request_state);
+  }
+  if (request_state == static_cast<uint32_t>(BaM_IOStack<TYPE>::READY))
+  {
+    if (debug_poll)
+    {
+      printf("[REGISTERED_POLL_COMPAT] already ready request_id=%llu\n",
+             (unsigned long long)request_id);
+    }
+    return request_id;
+  }
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] about to read ctx_stride\n");
+  }
+  const uint32_t ctx_stride = outstanding->ctx_stride;
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] ctx_stride=%u\n", ctx_stride);
+  }
+  if (ctx_stride != 1)
+  {
+    if (debug_poll)
+    {
+      printf("[REGISTERED_POLL_COMPAT] fallback request_id=%llu ctx_stride=%u num_index=%lld\n",
+             (unsigned long long)request_id,
+             ctx_stride,
+             (long long)outstanding->num_index);
+    }
     return service_registered_poll();
   }
-
-  const uint64_t request_id = outstanding->request_id;
-  int64_t *index_ptr = reinterpret_cast<int64_t *>(outstanding->index_ptr);
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] about to read num_index/dim/cache_dim/index_ptr/front_ctxs\n");
+  }
   const int64_t num_index = outstanding->num_index;
   const int dim = outstanding->dim;
   const int cache_dim = outstanding->cache_dim;
+  int64_t *index_ptr = reinterpret_cast<int64_t *>(outstanding->index_ptr);
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] num_index=%lld dim=%d cache_dim=%d index_ptr=0x%llx\n",
+           (long long)num_index,
+           dim,
+           cache_dim,
+           (unsigned long long)outstanding->index_ptr);
+  }
   s_ctx *d_row_ctxs = this->iostack.front_ctxs();
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] front_ctxs=%p\n", (void *)d_row_ctxs);
+  }
   if (d_row_ctxs == nullptr)
   {
     throw std::runtime_error("No registered rowctx request to poll");
@@ -1002,13 +1083,47 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_poll_compatible()
 
   constexpr uint32_t b_size = 256;
   const uint32_t g_size = (static_cast<uint32_t>(num_index) + b_size - 1) / b_size;
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] before launch request_id=%llu\n",
+           (unsigned long long)request_id);
+    printf("[REGISTERED_POLL_COMPAT] launch request_id=%llu num_index=%lld dim=%d cache_dim=%d g_size=%u b_size=%u\n",
+           (unsigned long long)request_id,
+           (long long)num_index,
+           dim,
+           cache_dim,
+           g_size,
+           b_size);
+  }
   read_feature_kernel_single_page_single_thread_poll_rowctx<TYPE><<<g_size, b_size>>>(
       a->d_array_ptr, index_ptr, dim, num_index, cache_dim, 0, d_row_ctxs);
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] launched request_id=%llu\n",
+           (unsigned long long)request_id);
+  }
+  cudaError_t launch_err = cudaPeekAtLastError();
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] post-launch cudaPeekAtLastError=%d (%s)\n",
+           static_cast<int>(launch_err),
+           cudaGetErrorString(launch_err));
+  }
   cuda_err_chk(cudaDeviceSynchronize());
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] synchronized request_id=%llu\n",
+           (unsigned long long)request_id);
+  }
 
   if (!this->iostack.mark_front_ready(request_id))
   {
     throw std::runtime_error("Failed to mark registered rowctx request as ready");
+  }
+  if (debug_poll)
+  {
+    printf("[REGISTERED_POLL_COMPAT] marked ready request_id=%llu\n",
+           (unsigned long long)request_id);
   }
   return request_id;
 }
