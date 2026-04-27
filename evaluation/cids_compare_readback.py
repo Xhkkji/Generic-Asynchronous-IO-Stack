@@ -28,7 +28,15 @@ def _load_prepared_batch(prepared_root, sample_indices):
     sample_shape = tuple(meta["shape"])
     sample_dim = int(meta["sample_dim"])
     num_samples = int(meta["num_samples"])
-    dtype = np.float32
+    dtype_name = meta.get("dtype", "float32")
+    dtype_map = {
+        "float16": np.float16,
+        "float32": np.float32,
+        "uint8": np.uint8,
+    }
+    if dtype_name not in dtype_map:
+        raise ValueError(f"不支持的 prepared dtype: {dtype_name}")
+    dtype = dtype_map[dtype_name]
 
     labels = np.load(Path(prepared_root) / meta.get("labels_file", "labels.npy"))
     images = np.memmap(
@@ -40,6 +48,11 @@ def _load_prepared_batch(prepared_root, sample_indices):
 
     batch_images = np.stack([np.array(images[idx], copy=True) for idx in sample_indices], axis=0)
     batch_labels = np.array([labels[idx] for idx in sample_indices], dtype=np.int64)
+
+    if dtype_name == "uint8":
+        batch_images = batch_images.astype(np.float32, copy=False) / 255.0
+    elif batch_images.dtype != np.float32:
+        batch_images = batch_images.astype(np.float32, copy=False)
 
     batch_images = torch.from_numpy(batch_images).view(len(sample_indices), *sample_shape)
     batch_labels = torch.from_numpy(batch_labels)

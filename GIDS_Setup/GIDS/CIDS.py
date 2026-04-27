@@ -46,6 +46,24 @@ def _dtype_name_to_numpy_dtype(dtype_name):
     return mapping[dtype_name]
 
 
+def _prepared_array_to_training_float32(array, dtype_name):
+    # 把 prepared dataset 中的一条样本数据统一转换成训练语义的 float32：
+    # - uint8: 视为 0~255 像素，缩放到 0~1
+    # - float16/float32: 保持原值，仅转成 float32 便于后续统一处理
+    if dtype_name == "uint8":
+        return array.astype(np.float32, copy=False) / 255.0
+    if array.dtype != np.float32:
+        return array.astype(np.float32, copy=False)
+    return array
+
+
+def _images_to_training_tensor(images, dtype_name):
+    # 把底层读回的存储张量统一转成训练语义。
+    if dtype_name == "uint8":
+        return images.to(torch.float32).div_(255.0)
+    return images
+
+
 class _PrefetchingIter_async_registered_try_service_cids(object):
     # CIDS 的最小 registered try-service 迭代器：
     # 按 sample_id 提交图片读取，请求完成后再把图片 batch 返回给训练。
@@ -583,11 +601,15 @@ class CIDS(object):
         if long_type:
             self.BAM_FS = BAM_Feature_Store.BAM_Feature_Store_long()
             self.return_dtype = torch.long
+            self.storage_itemsize = 8
+        elif dtype_name == "uint8":
+            self.BAM_FS = BAM_Feature_Store.BAM_Feature_Store_byte()
+            self.return_dtype = torch.uint8
+            self.storage_itemsize = 1
         else:
             self.BAM_FS = BAM_Feature_Store.BAM_Feature_Store_float()
-            # 当前 CIDS 先统一按 float32 存入/读取 BaM 数组，减少和现有
-            # BAM_Feature_Store_float 路径的类型错位。
             self.return_dtype = torch.float32
+            self.storage_itemsize = 4
 
         self.images_path = None
         self.labels_path = None
@@ -601,9 +623,7 @@ class CIDS(object):
         self.sample_shape = tuple(sample_shape)
         self.sample_dtype_name = dtype_name
         self.sample_dim = int(math.prod(self.sample_shape))
-        # 当前先复用 BaM 现有的 float row 路径：
         # 1 张图片不会直接当成 1 行，而是拆成若干个连续 row。
-        self.storage_itemsize = 4
         self.row_dim = self.page_size // self.storage_itemsize
         self.sample_row_count = math.ceil(self.sample_dim / self.row_dim)
         self.storage_sample_dim = self.sample_row_count * self.row_dim
@@ -680,13 +700,15 @@ class CIDS(object):
             "num_samples": num_samples,
             "sample_id_offset": sample_id_offset,
             "offset_bytes": offset_bytes,
-            "dtype": "float32",
+            "dtype": self.sample_dtype_name,
             "sample_row_count": self.sample_row_count,
             "row_dim": self.row_dim,
         }
 
     def _load_prepared_storage_array(self, prepared_root=None):
-        # 读取 prepared dataset，并转换成适合 BaM row 写入的二维 float32 数组。
+        # 读取 prepared dataset，并转换成适合当前 BaM row 路径写入的二维数组。
+        # - uint8 prepared -> 直接按 uint8 写入 byte store
+        # - float16/float32 prepared -> 维持现有 float32 写入路径
         if prepared_root is None:
             prepared_root = self.prepared_root
         if prepared_root is None:
@@ -714,8 +736,13 @@ class CIDS(object):
             raise ValueError(
                 f"prepared images 元素数不匹配: got={host_array.size}, expected={expected_elems}")
 
-        if host_array.dtype != np.float32:
-            host_array = host_array.astype(np.float32, copy=False)
+        if self.sample_dtype_name == "uint8":
+            if host_array.dtype != np.uint8:
+                host_array = host_array.astype(np.uint8, copy=False)
+            storage_dtype = np.uint8
+        else:
+            host_array = _prepared_array_to_training_float32(host_array, dtype_name)
+            storage_dtype = np.float32
 
         host_array = host_array.reshape(num_samples, sample_dim)
         if self.storage_sample_dim == sample_dim:
@@ -723,7 +750,7 @@ class CIDS(object):
         else:
             storage_array = np.zeros(
                 (num_samples, self.storage_sample_dim),
-                dtype=np.float32,
+                dtype=storage_dtype,
             )
             storage_array[:, :sample_dim] = host_array
             storage_array = storage_array.reshape(num_samples * self.sample_row_count, self.row_dim)
@@ -748,7 +775,7 @@ class CIDS(object):
                 "prepared_root": prepared_root,
                 "num_samples": num_samples,
                 "sample_id_offset": sample_id_offset,
-                "dtype": "float32",
+                "dtype": self.sample_dtype_name,
                 "sample_row_count": self.sample_row_count,
                 "row_dim": self.row_dim,
             })
@@ -832,6 +859,7 @@ class CIDS(object):
         images = images.view(batch_size, self.storage_sample_dim)
         images = images[:, :self.sample_dim].contiguous()
         images = images.view(batch_size, *self.sample_shape)
+        images = _images_to_training_tensor(images, self.sample_dtype_name)
         self.GIDS_wait_time += time.time() - s_time
         return self._format_return_batch(batch, images)
 
@@ -850,6 +878,7 @@ class CIDS(object):
         images = images.view(batch_size, self.storage_sample_dim)
         images = images[:, :self.sample_dim].contiguous()
         images = images.view(batch_size, *self.sample_shape)
+        images = _images_to_training_tensor(images, self.sample_dtype_name)
         self.GIDS_wait_time += time.time() - s_time
         return self._format_return_batch(batch, images)
 

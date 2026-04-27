@@ -1839,6 +1839,51 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
 
       .def("print_stats", &BAM_Feature_Store<float>::print_stats);
 
+  py::class_<BAM_Feature_Store<uint8_t>>(m, "BAM_Feature_Store_byte")
+      .def(py::init<>())
+      .def("init_controllers", &BAM_Feature_Store<uint8_t>::init_controllers)
+      .def("read_feature", &BAM_Feature_Store<uint8_t>::read_feature)
+      // 异步函数绑定
+      .def("read_feature_submit_async", &BAM_Feature_Store<uint8_t>::read_feature_submit_async)
+      .def("read_feature_submit_async_registered", &BAM_Feature_Store<uint8_t>::read_feature_submit_async_registered)
+      .def("read_feature_submit_async_registered_rowctx", &BAM_Feature_Store<uint8_t>::read_feature_submit_async_registered_rowctx)
+      .def("read_feature_wait_async", &BAM_Feature_Store<uint8_t>::read_feature_wait_async)
+      .def("read_feature_single_page_single_thread_poll", &BAM_Feature_Store<uint8_t>::read_feature_single_page_single_thread_poll)
+      .def("service_registered_poll", &BAM_Feature_Store<uint8_t>::service_registered_poll)
+      .def("service_registered_poll_compatible", &BAM_Feature_Store<uint8_t>::service_registered_poll_compatible)
+      .def("service_registered_try_poll", &BAM_Feature_Store<uint8_t>::service_registered_try_poll)
+      .def("service_registered_try_poll_window_skip_front", &BAM_Feature_Store<uint8_t>::service_registered_try_poll_window_skip_front)
+      .def("read_feature_get_feature_light", &BAM_Feature_Store<uint8_t>::read_feature_get_feature_light)
+      .def("read_feature_get_feature_light_registered", &BAM_Feature_Store<uint8_t>::read_feature_get_feature_light_registered)
+      .def("read_feature_get_feature_light_registered_rowctx", &BAM_Feature_Store<uint8_t>::read_feature_get_feature_light_registered_rowctx)
+      .def("get_registered_outstanding_count", &BAM_Feature_Store<uint8_t>::get_registered_outstanding_count)
+      .def("get_registered_front_request_id", &BAM_Feature_Store<uint8_t>::get_registered_front_request_id)
+      .def("registered_front_ready", &BAM_Feature_Store<uint8_t>::registered_front_ready)
+      .def("get_registered_ready_front_request_id", &BAM_Feature_Store<uint8_t>::get_registered_ready_front_request_id)
+      .def("get_registered_front_state", &BAM_Feature_Store<uint8_t>::get_registered_front_state)
+      .def("get_registered_request_id_at", &BAM_Feature_Store<uint8_t>::get_registered_request_id_at)
+      .def("get_registered_request_state_at", &BAM_Feature_Store<uint8_t>::get_registered_request_state_at)
+      .def("get_registered_last_consumed_request_id", &BAM_Feature_Store<uint8_t>::get_registered_last_consumed_request_id)
+
+      .def("read_feature_hetero", &BAM_Feature_Store<uint8_t>::read_feature_hetero)
+      .def("read_feature_merged_hetero", &BAM_Feature_Store<uint8_t>::read_feature_merged_hetero)
+      .def("read_feature_merged", &BAM_Feature_Store<uint8_t>::read_feature_merged)
+      .def("set_window_buffering", &BAM_Feature_Store<uint8_t>::set_window_buffering)
+      .def("cpu_backing_buffer", &BAM_Feature_Store<uint8_t>::cpu_backing_buffer)
+      .def("set_cpu_buffer", &BAM_Feature_Store<uint8_t>::set_cpu_buffer)
+
+      .def("flush_cache", &BAM_Feature_Store<uint8_t>::flush_cache)
+      .def("store_tensor", &BAM_Feature_Store<uint8_t>::store_tensor)
+      .def("read_tensor", &BAM_Feature_Store<uint8_t>::read_tensor)
+
+      .def("get_array_ptr", &BAM_Feature_Store<uint8_t>::get_array_ptr)
+      .def("get_offset_array", &BAM_Feature_Store<uint8_t>::get_offset_array)
+      .def("set_offsets", &BAM_Feature_Store<uint8_t>::set_offsets)
+      .def("get_cpu_access_count", &BAM_Feature_Store<uint8_t>::get_cpu_access_count)
+      .def("flush_cpu_access_count", &BAM_Feature_Store<uint8_t>::flush_cpu_access_count)
+
+      .def("print_stats", &BAM_Feature_Store<uint8_t>::print_stats);
+
   py::class_<BAM_Feature_Store<int64_t>>(m, "BAM_Feature_Store_long")
       .def(py::init<>())
       .def("init_controllers", &BAM_Feature_Store<int64_t>::init_controllers)

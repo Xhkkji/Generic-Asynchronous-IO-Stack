@@ -23,10 +23,16 @@
 # --registered-split:
 #   把一个训练 batch 拆成多个 sub-request，再在 Python wait/get 阶段合并
 
+  # 旧的 float32 prepared dataset 路径保留作参考： \
+  # --train-root /home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_train_f32 \
+  # --val-root /home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_val_f32 \
+
 # 训练配置
 IO_MODE="registered"
 EPOCHS=5
-BATCH_SIZE=1024
+BATCH_SIZE=2048
+MAX_TRAIN_ITERS=0
+RUN_VAL=1
 CACHE_SIZE=1024
 PREFETCH_DEPTH=1
 REGISTERED_SPLIT=1
@@ -45,10 +51,12 @@ sudo env \
   CIDS_REGISTERED_POLL_DEBUG="${CIDS_REGISTERED_POLL_DEBUG:-0}" \
   CIDS_PROFILE_GPU_TIMING="${CIDS_PROFILE_GPU_TIMING:-0}" \
   /home/xhk/miniconda3/envs/pytorch/bin/python /home/xhk/hyperion/GIDS/evaluation/cids_train.py \
-  --train-root /home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_train_f32 \
-  --val-root /home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_val_f32 \
+  --train-root /home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_train_u8 \
+  --val-root /home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_val_u8 \
   --epochs "${EPOCHS}" \
   --batch-size "${BATCH_SIZE}" \
+  --max-train-iters "${MAX_TRAIN_ITERS}" \
+  --run-val "${RUN_VAL}" \
   --ctrl-idx 0 \
   --io-mode "${IO_MODE}" \
   --cache-size "${CACHE_SIZE}" \

@@ -38,7 +38,8 @@ class _TorchPreparedDataset(Dataset):
         self.shape = tuple(self.meta["shape"])
         self.sample_dim = int(self.meta["sample_dim"])
         self.num_samples = int(self.meta["num_samples"])
-        self.dtype = np.float32
+        self.dtype_name = self.meta.get("dtype", "float32")
+        self.dtype = self._numpy_dtype_from_name(self.dtype_name)
         self.labels = np.load(self.prepared_root / self.meta.get("labels_file", "labels.npy"))
         self.images = np.memmap(
             self.prepared_root / self.meta.get("images_file", "images.bin"),
@@ -47,11 +48,28 @@ class _TorchPreparedDataset(Dataset):
             shape=(self.num_samples, self.sample_dim),
         )
 
+    @staticmethod
+    def _numpy_dtype_from_name(dtype_name):
+        mapping = {
+            "float16": np.float16,
+            "float32": np.float32,
+            "uint8": np.uint8,
+            "int64": np.int64,
+        }
+        if dtype_name not in mapping:
+            raise ValueError(f"不支持的 prepared dtype: {dtype_name}")
+        return mapping[dtype_name]
+
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        image = torch.from_numpy(np.array(self.images[idx], copy=True)).view(*self.shape)
+        image_np = np.array(self.images[idx], copy=True)
+        image = torch.from_numpy(image_np).view(*self.shape)
+        if self.dtype_name == "uint8":
+            image = image.to(torch.float32).div_(255.0)
+        elif image.dtype != torch.float32:
+            image = image.to(torch.float32)
         label = int(self.labels[idx])
         return image, label
 
@@ -151,7 +169,7 @@ def _stop_profiler(profiler):
     )
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=None):
+def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=None, max_iters=None):
     # 最小训练循环：只做前向、反向、优化和简单精度统计。
     model.train()
     total_loss = 0.0
@@ -159,7 +177,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=No
     total_samples = 0
 
     progress = tqdm(dataloader, desc="train", leave=False)
-    for images, labels in progress:
+    for step_idx, (images, labels) in enumerate(progress, start=1):
         images = images.to(device, non_blocking=True)
         labels = _move_labels_to_device(labels, device)
 
@@ -178,6 +196,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=No
         )
         if profiler is not None:
             profiler.step()
+        if max_iters is not None and step_idx >= max_iters:
+            break
 
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
@@ -218,6 +238,8 @@ def main():
     parser.add_argument("--val-root", default=None, help="prepared val dataset 目录，可选")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch-size", type=int, default=64, help="batch size")
+    parser.add_argument("--max-train-iters", type=int, default=0, help="每个 epoch 最多跑多少个 train iter；0 表示不限制")
+    parser.add_argument("--run-val", choices=["0", "1"], default="1", help="是否在每个 epoch 后运行验证")
     parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="权重衰减")
     parser.add_argument("--prefetch-depth", type=int, default=4, help="CIDS 预取深度")
@@ -255,6 +277,8 @@ def main():
         help="profiler 输出目录",
     )
     args = parser.parse_args()
+    max_train_iters = args.max_train_iters if args.max_train_iters > 0 else None
+    run_val = args.run_val == "1"
 
     if args.force_sync_read is not None:
         os.environ["GIDS_FORCE_SYNC_READ"] = args.force_sync_read
@@ -288,7 +312,7 @@ def main():
             shuffle=True,
         )
         val_loader = None
-        if args.val_root is not None:
+        if run_val and args.val_root is not None:
             _, val_loader = _build_torch_loader(
                 prepared_root=args.val_root,
                 batch_size=args.batch_size,
@@ -313,7 +337,7 @@ def main():
         )
 
         val_loader = None
-        if args.val_root is not None:
+        if run_val and args.val_root is not None:
             val_start_sample_id = int(train_meta["num_samples"])
             _, val_loader = _build_loader(
                 prepared_root=args.val_root,
@@ -345,6 +369,8 @@ def main():
         f"io_mode={args.io_mode} "
         f"GIDS_FORCE_SYNC_READ={os.environ.get('GIDS_FORCE_SYNC_READ', '0')} "
         f"cache_size={args.cache_size}MB "
+        f"max_train_iters={max_train_iters if max_train_iters is not None else 'full'} "
+        f"run_val={run_val} "
         f"prefetch_depth={args.prefetch_depth} "
         f"registered_split={args.registered_split} "
         f"CIDS_REGISTERED_ENABLE_SKIP_FRONT={os.environ.get('CIDS_REGISTERED_ENABLE_SKIP_FRONT', '1')} "
@@ -370,7 +396,8 @@ def main():
     try:
         for epoch in tqdm(range(args.epochs)):
             train_loss, train_acc = train_one_epoch(
-                model, train_loader, optimizer, criterion, device, profiler=profiler)
+                model, train_loader, optimizer, criterion, device,
+                profiler=profiler, max_iters=max_train_iters)
             submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
             wait_time = train_cids.GIDS_wait_time if train_cids is not None else 0.0
             print(

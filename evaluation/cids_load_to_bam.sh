@@ -1,8 +1,11 @@
 # 使用 BaM 自带的 readwrite_stripe benchmark 直接把 prepared images.bin 写入 SSD。
 # 这样更贴近 README 推荐路径，也避免 Python store_tensor 大块写入不稳定的问题。
 
-TRAIN_ROOT=/home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_train_f32
-VAL_ROOT=/home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_val_f32
+# 旧的 float32 prepared dataset 路径保留作参考：
+# TRAIN_ROOT=/home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_train_f32
+# VAL_ROOT=/home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_val_f32
+TRAIN_ROOT=/home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_train_uint8
+VAL_ROOT=/home/xhk/hyperion/GIDS/dataset/imagenet/cids_tiny_imagenet_val_uint8
 BENCH=/home/xhk/hyperion/GIDS/bam/build/bin/nvm-readwrite_stripe-bench
 
 TRAIN_INPUT="${TRAIN_ROOT}/images.bin"
