@@ -4,9 +4,12 @@
 #   sync        使用 CIDS + BaM 的同步读取
 #   registered  使用 CIDS + BaM 的 registered 异步读取
 #   torch       使用 PyTorch 原生 DataLoader 直接读取 prepared dataset 文件
+# - --torch-read-mode:
+#   mmap        使用 np.memmap 直接映射 prepared 文件
+#   buffered    启动时整块读入内存，作为 torch 的非 mmap 对照
 #
 # 训练配置参数更适合直接通过命令行传给 cids_train.py：
-# - io-mode / epochs / batch-size / cache-size / prefetch-depth /
+# - io-mode / torch-read-mode / epochs / batch-size / cache-size / prefetch-depth /
 #   registered-split / enable-profile / profile-dir
 #
 # 只有偏底层、偏调试的系统开关继续保留为环境变量：
@@ -19,7 +22,8 @@
 # - CIDS_PROFILE_GPU_TIMING
 
 # 训练配置
-IO_MODE="registered"
+IO_MODE="torch"
+TORCH_READ_MODE="buffered"
 EPOCHS=1
 BATCH_SIZE=256
 MAX_TRAIN_ITERS=300
@@ -33,7 +37,7 @@ REGISTERED_SKIP_FRONT=0
 
 sudo env \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-  GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-0}" \
+  GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-1}" \
   GIDS_ASYNC_DEBUG_ROWS="${GIDS_ASYNC_DEBUG_ROWS:-0}" \
   GIDS_ASYNC_DEBUG_DIMS="${GIDS_ASYNC_DEBUG_DIMS:-16}" \
   GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
@@ -50,6 +54,7 @@ sudo env \
   --run-val "${RUN_VAL}" \
   --ctrl-idx 0 \
   --io-mode "${IO_MODE}" \
+  --torch-read-mode "${TORCH_READ_MODE}" \
   --cache-size "${CACHE_SIZE}" \
   --enable-profile "${ENABLE_PROFILE}" \
   --profile-dir "${PROFILE_DIR}" \

@@ -32,7 +32,7 @@ def _load_meta(prepared_root):
 
 class _TorchPreparedDataset(Dataset):
     # 使用 PyTorch 原生 Dataset/DataLoader 直接从 prepared 文件读取图片。
-    def __init__(self, prepared_root):
+    def __init__(self, prepared_root, torch_read_mode="mmap"):
         self.prepared_root = Path(prepared_root)
         self.meta = _load_meta(prepared_root)
         self.shape = tuple(self.meta["shape"])
@@ -40,13 +40,22 @@ class _TorchPreparedDataset(Dataset):
         self.num_samples = int(self.meta["num_samples"])
         self.dtype_name = self.meta.get("dtype", "float32")
         self.dtype = self._numpy_dtype_from_name(self.dtype_name)
+        self.torch_read_mode = str(torch_read_mode)
         self.labels = np.load(self.prepared_root / self.meta.get("labels_file", "labels.npy"))
-        self.images = np.memmap(
-            self.prepared_root / self.meta.get("images_file", "images.bin"),
-            dtype=self.dtype,
-            mode="r",
-            shape=(self.num_samples, self.sample_dim),
-        )
+        images_path = self.prepared_root / self.meta.get("images_file", "images.bin")
+        if self.torch_read_mode == "mmap":
+            self.images = np.memmap(
+                images_path,
+                dtype=self.dtype,
+                mode="r",
+                shape=(self.num_samples, self.sample_dim),
+            )
+        elif self.torch_read_mode == "buffered":
+            self.images = np.fromfile(images_path, dtype=self.dtype).reshape(
+                self.num_samples, self.sample_dim
+            )
+        else:
+            raise ValueError(f"不支持的 torch_read_mode: {self.torch_read_mode}")
 
     @staticmethod
     def _numpy_dtype_from_name(dtype_name):
@@ -93,9 +102,9 @@ def _build_loader(prepared_root, batch_size, shuffle, cids_loader, prefetch_dept
     return dataset, dataloader
 
 
-def _build_torch_loader(prepared_root, batch_size, shuffle):
+def _build_torch_loader(prepared_root, batch_size, shuffle, torch_read_mode="mmap"):
     # 基于 PyTorch 原生 DataLoader 构建 prepared dataset 读取路径。
-    dataset = _TorchPreparedDataset(prepared_root)
+    dataset = _TorchPreparedDataset(prepared_root, torch_read_mode=torch_read_mode)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -260,6 +269,12 @@ def main():
         help="读取模式：sync 为最原始同步读取，registered 为异步 registered try-service，torch 为 PyTorch 原生 DataLoader",
     )
     parser.add_argument(
+        "--torch-read-mode",
+        choices=["mmap", "buffered"],
+        default="mmap",
+        help="torch 分支的 prepared 文件读取方式：mmap 为内存映射，buffered 为整块读入内存",
+    )
+    parser.add_argument(
         "--force-sync-read",
         choices=["0", "1"],
         default=None,
@@ -310,6 +325,7 @@ def main():
             prepared_root=args.train_root,
             batch_size=args.batch_size,
             shuffle=True,
+            torch_read_mode=args.torch_read_mode,
         )
         val_loader = None
         if run_val and args.val_root is not None:
@@ -317,6 +333,7 @@ def main():
                 prepared_root=args.val_root,
                 batch_size=args.batch_size,
                 shuffle=False,
+                torch_read_mode=args.torch_read_mode,
             )
     else:
         train_cids = CIDS.from_prepared_dataset(
@@ -379,7 +396,8 @@ def main():
     )
     if args.io_mode == "torch":
         print(
-            "[CIDS_TRAIN] 当前使用 PyTorch 原生 DataLoader，直接读取 prepared dataset 文件。",
+            "[CIDS_TRAIN] 当前使用 PyTorch 原生 DataLoader，"
+            f"直接读取 prepared dataset 文件，torch_read_mode={args.torch_read_mode}。",
             flush=True,
         )
     else:
