@@ -245,6 +245,7 @@ def evaluate(model, dataloader, criterion, device):
 
 
 def main():
+    preprocess_time_start = time.perf_counter()
     parser = argparse.ArgumentParser(description="最小 CIDS + ResNet50 训练脚本")
     parser.add_argument("--train-root", required=True, help="prepared train dataset 目录")
     parser.add_argument("--val-root", default=None, help="prepared val dataset 目录，可选")
@@ -410,6 +411,12 @@ def main():
             flush=True,
         )
 
+    preprocess_time_sec = time.perf_counter() - preprocess_time_start
+    print(
+        f"[CIDS_PREPROCESS_SUMMARY] preprocess_time_sec={preprocess_time_sec:.4f}",
+        flush=True,
+    )
+
     profiler = _start_profiler(
         enabled=(args.enable_profile == "1"),
         output_dir=args.profile_dir,
@@ -443,8 +450,11 @@ def main():
     finally:
         _stop_profiler(profiler)
         total_train_time_sec = time.perf_counter() - train_time_start
+        total_end_to_end_time_sec = preprocess_time_sec + total_train_time_sec
         print(
-            f"[CIDS_TRAIN_SUMMARY] total_train_time_sec={total_train_time_sec:.4f} "
+            f"[CIDS_TRAIN_SUMMARY] preprocess_time_sec={preprocess_time_sec:.4f} "
+            f"total_train_time_sec={total_train_time_sec:.4f} "
+            f"total_end_to_end_time_sec={total_end_to_end_time_sec:.4f} "
             f"total_train_iters={total_train_iters}",
             flush=True,
         )
