@@ -318,12 +318,16 @@ def main():
 
     device = torch.device(f"cuda:{args.ctrl_idx}" if torch.cuda.is_available() else "cpu")
 
+    train_meta_time_start = time.perf_counter()
     train_meta = _load_meta(args.train_root)
     num_classes = len(train_meta.get("classes", []))
     if num_classes <= 0:
         raise ValueError("prepared train dataset 的 meta.json 中没有有效 classes 信息")
+    train_meta_time_sec = time.perf_counter() - train_meta_time_start
 
     train_cids = None
+    cids_init_time_sec = 0.0
+    loader_init_time_start = time.perf_counter()
     if args.io_mode == "torch":
         _, train_loader = _build_torch_loader(
             prepared_root=args.train_root,
@@ -340,11 +344,13 @@ def main():
                 torch_read_mode=args.torch_read_mode,
             )
     else:
+        cids_init_time_start = time.perf_counter()
         train_cids = CIDS.from_prepared_dataset(
             args.train_root,
             ctrl_idx=args.ctrl_idx,
             cache_size=args.cache_size,
         )
+        cids_init_time_sec = time.perf_counter() - cids_init_time_start
 
         _, train_loader = _build_loader(
             prepared_root=args.train_root,
@@ -370,7 +376,9 @@ def main():
                 io_mode=args.io_mode,
                 registered_split=args.registered_split,
             )
+    loader_init_time_sec = time.perf_counter() - loader_init_time_start
 
+    model_init_time_start = time.perf_counter()
     model = build_alexnet(
         num_classes=num_classes,
         pretrained=args.pretrained,
@@ -383,6 +391,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    model_init_time_sec = time.perf_counter() - model_init_time_start
 
     print(
         f"[CIDS_TRAIN] device={device} num_classes={num_classes} "
@@ -414,6 +423,22 @@ def main():
     preprocess_time_sec = time.perf_counter() - preprocess_time_start
     print(
         f"[CIDS_PREPROCESS_SUMMARY] preprocess_time_sec={preprocess_time_sec:.4f}",
+        flush=True,
+    )
+    preprocess_other_time_sec = max(
+        0.0,
+        preprocess_time_sec
+        - train_meta_time_sec
+        - cids_init_time_sec
+        - loader_init_time_sec
+        - model_init_time_sec,
+    )
+    print(
+        f"[CIDS_PREPROCESS_BREAKDOWN] meta_time_sec={train_meta_time_sec:.4f} "
+        f"cids_init_time_sec={cids_init_time_sec:.4f} "
+        f"loader_init_time_sec={loader_init_time_sec:.4f} "
+        f"model_init_time_sec={model_init_time_sec:.4f} "
+        f"other_time_sec={preprocess_other_time_sec:.4f}",
         flush=True,
     )
 
@@ -453,6 +478,11 @@ def main():
         total_end_to_end_time_sec = preprocess_time_sec + total_train_time_sec
         print(
             f"[CIDS_TRAIN_SUMMARY] preprocess_time_sec={preprocess_time_sec:.4f} "
+            f"meta_time_sec={train_meta_time_sec:.4f} "
+            f"cids_init_time_sec={cids_init_time_sec:.4f} "
+            f"loader_init_time_sec={loader_init_time_sec:.4f} "
+            f"model_init_time_sec={model_init_time_sec:.4f} "
+            f"other_time_sec={preprocess_other_time_sec:.4f} "
             f"total_train_time_sec={total_train_time_sec:.4f} "
             f"total_end_to_end_time_sec={total_end_to_end_time_sec:.4f} "
             f"total_train_iters={total_train_iters}",
