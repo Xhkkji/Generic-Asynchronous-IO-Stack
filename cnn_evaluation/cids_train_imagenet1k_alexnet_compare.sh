@@ -3,9 +3,11 @@
 set -euo pipefail
 
 REPO_ROOT=/home/xhk/hyperion/GIDS
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="${REPO_ROOT}/cnn_evaluation/cids_train_imagenet1k_alexnet.sh"
 LOG_DIR="${REPO_ROOT}/cnn_evaluation/logs_alexnet"
 SUMMARY_LOG="${LOG_DIR}/alexnet_compare_summary.log"
+PROFILE_ROOT="${SCRIPT_DIR}/profiles"
 
 mkdir -p "${LOG_DIR}"
 : > "${SUMMARY_LOG}"
@@ -13,23 +15,23 @@ mkdir -p "${LOG_DIR}"
 echo "[ALEXNET_COMPARE] 1/4 torch mmap"
 IO_MODE=torch \
 TORCH_READ_MODE=mmap \
-PROFILE_DIR="${REPO_ROOT}/cnn_evaluation/cids_profile_alexnet_torch_mmap" \
+PROFILE_DIR="${PROFILE_ROOT}/torch_mmap" \
 bash "${RUN_SCRIPT}" | tee "${LOG_DIR}/alexnet_torch_mmap.log"
 
 echo "[ALEXNET_COMPARE] 2/4 torch buffered"
 IO_MODE=torch \
 TORCH_READ_MODE=buffered \
-PROFILE_DIR="${REPO_ROOT}/cnn_evaluation/cids_profile_alexnet_torch_buffered" \
+PROFILE_DIR="${PROFILE_ROOT}/torch_buffered" \
 bash "${RUN_SCRIPT}" | tee "${LOG_DIR}/alexnet_torch_buffered.log"
 
 echo "[ALEXNET_COMPARE] 3/4 sync"
 IO_MODE=sync \
-PROFILE_DIR="${REPO_ROOT}/cnn_evaluation/cids_profile_alexnet_sync" \
+PROFILE_DIR="${PROFILE_ROOT}/sync" \
 bash "${RUN_SCRIPT}" | tee "${LOG_DIR}/alexnet_sync.log"
 
 echo "[ALEXNET_COMPARE] 4/4 registered"
 IO_MODE=registered \
-PROFILE_DIR="${REPO_ROOT}/cnn_evaluation/cids_profile_alexnet_registered" \
+PROFILE_DIR="${PROFILE_ROOT}/registered" \
 bash "${RUN_SCRIPT}" | tee "${LOG_DIR}/alexnet_registered.log"
 
 echo "[ALEXNET_COMPARE] done"

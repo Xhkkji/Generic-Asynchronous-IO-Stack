@@ -70,7 +70,37 @@ def _build_imagenet1k_samples(root, split):
     return samples, dataset.classes, dataset.class_to_idx
 
 
-def _build_transform(dataset_name):
+def _pil_to_chw_float32(image):
+    # 把 PIL 图片转成 CHW float32 tensor 语义的 numpy 数组，范围 0~1。
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    return np.transpose(array, (2, 0, 1))
+
+
+def _resize_to_canvas_with_padding(image, target_hw):
+    # 尽量保留原图信息：
+    # - 保持长宽比
+    # - 仅在原图超过目标画布时做等比例缩小
+    # - 最后居中 pad 到固定大小
+    target_h, target_w = target_hw
+    src_w, src_h = image.size
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError(f"非法图像尺寸: {(src_w, src_h)}")
+
+    scale = min(target_w / src_w, target_h / src_h, 1.0)
+    resized_w = max(1, int(round(src_w * scale)))
+    resized_h = max(1, int(round(src_h * scale)))
+
+    if resized_w != src_w or resized_h != src_h:
+        image = image.resize((resized_w, resized_h), Image.Resampling.BILINEAR)
+
+    canvas = Image.new("RGB", (target_w, target_h), color=(0, 0, 0))
+    pad_left = (target_w - resized_w) // 2
+    pad_top = (target_h - resized_h) // 2
+    canvas.paste(image, (pad_left, pad_top))
+    return canvas
+
+
+def _build_transform(dataset_name, preprocess_mode="legacy"):
     # 构建固定尺寸的确定性预处理。
     try:
         from torchvision import transforms
@@ -84,11 +114,19 @@ def _build_transform(dataset_name):
         ]), [3, 64, 64]
 
     if dataset_name == "imagenet1k":
-        return transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-        ]), [3, 224, 224]
+        if preprocess_mode == "legacy":
+            return transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+            ]), [3, 224, 224]
+        if preprocess_mode == "pad448":
+            def _transform(image):
+                padded = _resize_to_canvas_with_padding(image, (448, 448))
+                return _pil_to_chw_float32(padded)
+
+            return _transform, [3, 448, 448]
+        raise ValueError(f"imagenet1k 不支持的 preprocess_mode: {preprocess_mode}")
 
     raise ValueError(f"不支持的数据集类型: {dataset_name}")
 
@@ -106,7 +144,14 @@ def _tensor_to_storage_array(tensor, dtype_name):
     raise ValueError(f"不支持的 dtype: {dtype_name}")
 
 
-def prepare_cids_dataset(dataset_name, input_root, output_root, split, dtype_name):
+def prepare_cids_dataset(
+    dataset_name,
+    input_root,
+    output_root,
+    split,
+    dtype_name,
+    preprocess_mode="legacy",
+):
     # 把原始图片整理成固定尺寸 tensor，并按 sample_id 顺序线性写盘。
     dataset_name = dataset_name.lower()
     split = split.lower()
@@ -119,7 +164,7 @@ def prepare_cids_dataset(dataset_name, input_root, output_root, split, dtype_nam
     else:
         raise ValueError("dataset_name 只支持 tiny-imagenet 或 imagenet1k")
 
-    transform, sample_shape = _build_transform(dataset_name)
+    transform, sample_shape = _build_transform(dataset_name, preprocess_mode=preprocess_mode)
     images_path = os.path.join(output_root, "images.bin")
     labels_path = os.path.join(output_root, "labels.npy")
     meta_path = os.path.join(output_root, "meta.json")
@@ -130,7 +175,11 @@ def prepare_cids_dataset(dataset_name, input_root, output_root, split, dtype_nam
         for sample_id, (image_path, label) in enumerate(samples):
             with Image.open(image_path) as image:
                 image = _ensure_rgb(image)
-                tensor = transform(image).numpy()
+                transformed = transform(image)
+                if hasattr(transformed, "numpy"):
+                    tensor = transformed.numpy()
+                else:
+                    tensor = np.asarray(transformed, dtype=np.float32)
             array = _tensor_to_storage_array(tensor, dtype_name)
             array.tofile(f)
             labels[sample_id] = label
@@ -158,6 +207,7 @@ def prepare_cids_dataset(dataset_name, input_root, output_root, split, dtype_nam
         "num_samples": int(len(samples)),
         "shape": sample_shape,
         "dtype": dtype_name,
+        "preprocess_mode": preprocess_mode,
         "sample_dim": sample_dim,
         "sample_bytes": sample_bytes,
         "images_file": "images.bin",
@@ -170,7 +220,8 @@ def prepare_cids_dataset(dataset_name, input_root, output_root, split, dtype_nam
 
     print(
         f"[CIDS_PREP] 完成 dataset={dataset_name}, split={split}, "
-        f"num_samples={len(samples)}, shape={sample_shape}, dtype={dtype_name}",
+        f"num_samples={len(samples)}, shape={sample_shape}, dtype={dtype_name}, "
+        f"preprocess_mode={preprocess_mode}",
         flush=True,
     )
 
@@ -197,6 +248,12 @@ def main():
         default="float16",
         help="写盘数据类型，默认 float16",
     )
+    parser.add_argument(
+        "--preprocess-mode",
+        choices=["legacy", "pad448"],
+        default="legacy",
+        help="图片预处理分支：legacy 为原来的 Resize256+CenterCrop224；pad448 为等比例缩小到 448 画布内后居中 padding",
+    )
     args = parser.parse_args()
 
     prepare_cids_dataset(
@@ -205,6 +262,7 @@ def main():
         output_root=args.output_root,
         split=args.split,
         dtype_name=args.dtype,
+        preprocess_mode=args.preprocess_mode,
     )
 
 

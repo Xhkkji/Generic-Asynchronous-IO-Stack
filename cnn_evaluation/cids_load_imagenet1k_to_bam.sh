@@ -4,8 +4,6 @@ set -euo pipefail
 
 # 使用 BaM 自带的 readwrite_stripe benchmark 直接把已经准备好的
 # ImageNet-1K _bam 对齐版 images.bin 写入 SSD。
-# 注意：这个脚本不再负责生成 _bam 数据目录；
-# 请先单独运行 cids_prepare_dataset_imagenet1k.sh。
 
 BENCH=/home/xhk/hyperion/GIDS/bam/build/bin/nvm-readwrite_stripe-bench
 PYTHON_BIN=/home/xhk/miniconda3/envs/pytorch/bin/python
@@ -18,13 +16,13 @@ VAL_INPUT="${VAL_ROOT}/images.bin"
 
 if [[ ! -f "${TRAIN_INPUT}" ]]; then
   echo "[CIDS_LOAD_IMAGENET1K] 未找到 train _bam 文件: ${TRAIN_INPUT}" >&2
-  echo "[CIDS_LOAD_IMAGENET1K] 请先运行: bash /home/xhk/hyperion/GIDS/evaluation/cids_prepare_dataset_imagenet1k.sh" >&2
+  echo "[CIDS_LOAD_IMAGENET1K] 请先运行: bash /home/xhk/hyperion/GIDS/cnn_evaluation/cids_prepare_dataset_imagenet1k.sh" >&2
   exit 1
 fi
 
 if [[ ! -f "${VAL_INPUT}" ]]; then
   echo "[CIDS_LOAD_IMAGENET1K] 未找到 val _bam 文件: ${VAL_INPUT}" >&2
-  echo "[CIDS_LOAD_IMAGENET1K] 请先运行: bash /home/xhk/hyperion/GIDS/evaluation/cids_prepare_dataset_imagenet1k.sh" >&2
+  echo "[CIDS_LOAD_IMAGENET1K] 请先运行: bash /home/xhk/hyperion/GIDS/cnn_evaluation/cids_prepare_dataset_imagenet1k.sh" >&2
   exit 1
 fi
 

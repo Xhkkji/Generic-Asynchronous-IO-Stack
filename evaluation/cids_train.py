@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -18,9 +19,12 @@ if str(GIDS_SETUP_ROOT) not in sys.path:
     sys.path.insert(0, str(GIDS_SETUP_ROOT))
 if str(REPO_ROOT / "evaluation") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "evaluation"))
+if str(REPO_ROOT / "cnn_evaluation") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "cnn_evaluation"))
 
 from GIDS import CIDS, CIDSPreparedDataset, CIDS_DataLoader
 from cids_resnet18 import build_resnet18
+from cids_image_transforms import ImageNetBatchPreprocessor
 
 
 def _load_meta(prepared_root):
@@ -178,16 +182,28 @@ def _stop_profiler(profiler):
     )
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=None, max_iters=None):
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    image_preprocessor,
+    profiler=None,
+    max_iters=None,
+):
     # 最小训练循环：只做前向、反向、优化和简单精度统计。
     model.train()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
+    steps_ran = 0
 
     progress = tqdm(dataloader, desc="train", leave=False)
     for step_idx, (images, labels) in enumerate(progress, start=1):
+        steps_ran = step_idx
         images = images.to(device, non_blocking=True)
+        images = image_preprocessor.train(images)
         labels = _move_labels_to_device(labels, device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -210,11 +226,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=No
 
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
-    return avg_loss, avg_acc
+    return avg_loss, avg_acc, steps_ran
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, dataloader, criterion, device, image_preprocessor):
     # 最小验证循环：只统计 loss 和 top-1 accuracy。
     model.eval()
     total_loss = 0.0
@@ -224,6 +240,7 @@ def evaluate(model, dataloader, criterion, device):
     progress = tqdm(dataloader, desc="val", leave=False)
     for images, labels in progress:
         images = images.to(device, non_blocking=True)
+        images = image_preprocessor.eval(images)
         labels = _move_labels_to_device(labels, device)
 
         logits = model(images)
@@ -242,6 +259,7 @@ def evaluate(model, dataloader, criterion, device):
 
 
 def main():
+    preprocess_time_start = time.perf_counter()
     parser = argparse.ArgumentParser(description="最小 CIDS + ResNet18 训练脚本")
     parser.add_argument("--train-root", required=True, help="prepared train dataset 目录")
     parser.add_argument("--val-root", default=None, help="prepared val dataset 目录，可选")
@@ -314,12 +332,17 @@ def main():
 
     device = torch.device(f"cuda:{args.ctrl_idx}" if torch.cuda.is_available() else "cpu")
 
+    train_meta_time_start = time.perf_counter()
     train_meta = _load_meta(args.train_root)
     num_classes = len(train_meta.get("classes", []))
     if num_classes <= 0:
         raise ValueError("prepared train dataset 的 meta.json 中没有有效 classes 信息")
+    image_size = int(train_meta["shape"][-1])
+    train_meta_time_sec = time.perf_counter() - train_meta_time_start
 
     train_cids = None
+    cids_init_time_sec = 0.0
+    loader_init_time_start = time.perf_counter()
     if args.io_mode == "torch":
         _, train_loader = _build_torch_loader(
             prepared_root=args.train_root,
@@ -336,11 +359,13 @@ def main():
                 torch_read_mode=args.torch_read_mode,
             )
     else:
+        cids_init_time_start = time.perf_counter()
         train_cids = CIDS.from_prepared_dataset(
             args.train_root,
             ctrl_idx=args.ctrl_idx,
             cache_size=args.cache_size,
         )
+        cids_init_time_sec = time.perf_counter() - cids_init_time_start
 
         _, train_loader = _build_loader(
             prepared_root=args.train_root,
@@ -366,7 +391,9 @@ def main():
                 io_mode=args.io_mode,
                 registered_split=args.registered_split,
             )
+    loader_init_time_sec = time.perf_counter() - loader_init_time_start
 
+    model_init_time_start = time.perf_counter()
     model = build_resnet18(
         num_classes=num_classes,
         pretrained=args.pretrained,
@@ -379,6 +406,8 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    image_preprocessor = ImageNetBatchPreprocessor(source_image_size=image_size)
+    model_init_time_sec = time.perf_counter() - model_init_time_start
 
     print(
         f"[CIDS_TRAIN] device={device} num_classes={num_classes} "
@@ -407,27 +436,53 @@ def main():
             flush=True,
         )
 
+    preprocess_time_sec = time.perf_counter() - preprocess_time_start
+    preprocess_other_time_sec = max(
+        0.0,
+        preprocess_time_sec
+        - train_meta_time_sec
+        - cids_init_time_sec
+        - loader_init_time_sec
+        - model_init_time_sec,
+    )
+    print(
+        f"[CIDS_PREPROCESS_SUMMARY] preprocess_time_sec={preprocess_time_sec:.4f}",
+        flush=True,
+    )
+    print(
+        f"[CIDS_PREPROCESS_BREAKDOWN] meta_time_sec={train_meta_time_sec:.4f} "
+        f"cids_init_time_sec={cids_init_time_sec:.4f} "
+        f"loader_init_time_sec={loader_init_time_sec:.4f} "
+        f"model_init_time_sec={model_init_time_sec:.4f} "
+        f"other_time_sec={preprocess_other_time_sec:.4f}",
+        flush=True,
+    )
+
     profiler = _start_profiler(
         enabled=(args.enable_profile == "1"),
         output_dir=args.profile_dir,
     )
+    total_train_iters = 0
+    train_time_start = time.perf_counter()
     try:
         for epoch in tqdm(range(args.epochs)):
-            train_loss, train_acc = train_one_epoch(
-                model, train_loader, optimizer, criterion, device,
+            train_loss, train_acc, epoch_train_iters = train_one_epoch(
+                model, train_loader, optimizer, criterion, device, image_preprocessor,
                 profiler=profiler, max_iters=max_train_iters)
+            total_train_iters += epoch_train_iters
             submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
             wait_time = train_cids.GIDS_wait_time if train_cids is not None else 0.0
             print(
                 f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+                f"train_iters={epoch_train_iters} "
                 f"submit_time={submit_time:.4f} "
                 f"wait_time={wait_time:.4f}",
                 flush=True,
             )
 
             if val_loader is not None:
-                val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+                val_loss, val_acc = evaluate(model, val_loader, criterion, device, image_preprocessor)
                 print(
                     f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
@@ -435,6 +490,20 @@ def main():
                 )
     finally:
         _stop_profiler(profiler)
+        total_train_time_sec = time.perf_counter() - train_time_start
+        total_end_to_end_time_sec = preprocess_time_sec + total_train_time_sec
+        print(
+            f"[CIDS_TRAIN_SUMMARY] preprocess_time_sec={preprocess_time_sec:.4f} "
+            f"meta_time_sec={train_meta_time_sec:.4f} "
+            f"cids_init_time_sec={cids_init_time_sec:.4f} "
+            f"loader_init_time_sec={loader_init_time_sec:.4f} "
+            f"model_init_time_sec={model_init_time_sec:.4f} "
+            f"other_time_sec={preprocess_other_time_sec:.4f} "
+            f"total_train_time_sec={total_train_time_sec:.4f} "
+            f"total_end_to_end_time_sec={total_end_to_end_time_sec:.4f} "
+            f"total_train_iters={total_train_iters}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

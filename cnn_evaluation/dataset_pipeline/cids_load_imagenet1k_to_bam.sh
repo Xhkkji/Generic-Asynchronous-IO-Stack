@@ -2,11 +2,6 @@
 
 set -euo pipefail
 
-# 使用 BaM 自带的 readwrite_stripe benchmark 直接把已经准备好的
-# ImageNet-1K _bam 对齐版 images.bin 写入 SSD。
-# 注意：这个脚本不再负责生成 _bam 数据目录；
-# 请先单独运行 cids_prepare_dataset_imagenet1k.sh。
-
 BENCH=/home/xhk/hyperion/GIDS/bam/build/bin/nvm-readwrite_stripe-bench
 PYTHON_BIN=/home/xhk/miniconda3/envs/pytorch/bin/python
 
@@ -17,14 +12,14 @@ TRAIN_INPUT="${TRAIN_ROOT}/images.bin"
 VAL_INPUT="${VAL_ROOT}/images.bin"
 
 if [[ ! -f "${TRAIN_INPUT}" ]]; then
-  echo "[CIDS_LOAD_IMAGENET1K] 未找到 train _bam 文件: ${TRAIN_INPUT}" >&2
-  echo "[CIDS_LOAD_IMAGENET1K] 请先运行: bash /home/xhk/hyperion/GIDS/evaluation/cids_prepare_dataset_imagenet1k.sh" >&2
+  echo "[CIDS_LOAD_IMAGENET1K] missing train _bam file: ${TRAIN_INPUT}" >&2
+  echo "[CIDS_LOAD_IMAGENET1K] run prepare_imagenet1k_pad448_bam.sh first" >&2
   exit 1
 fi
 
 if [[ ! -f "${VAL_INPUT}" ]]; then
-  echo "[CIDS_LOAD_IMAGENET1K] 未找到 val _bam 文件: ${VAL_INPUT}" >&2
-  echo "[CIDS_LOAD_IMAGENET1K] 请先运行: bash /home/xhk/hyperion/GIDS/evaluation/cids_prepare_dataset_imagenet1k.sh" >&2
+  echo "[CIDS_LOAD_IMAGENET1K] missing val _bam file: ${VAL_INPUT}" >&2
+  echo "[CIDS_LOAD_IMAGENET1K] run prepare_imagenet1k_pad448_bam.sh first" >&2
   exit 1
 fi
 
@@ -32,8 +27,8 @@ TRAIN_BYTES=$(
   "${PYTHON_BIN}" -c 'import json; from pathlib import Path; meta=json.load(open(Path("'"${TRAIN_ROOT}"'")/"meta.json","r",encoding="utf-8")); print(int(meta["num_samples"])*int(meta["sample_bytes"]))'
 )
 
-echo "[CIDS_LOAD_IMAGENET1K] 使用 BaM benchmark 写入训练集: ${TRAIN_INPUT}"
-echo "[CIDS_LOAD_IMAGENET1K] 训练集总字节数=${TRAIN_BYTES}"
+echo "[CIDS_LOAD_IMAGENET1K] train input=${TRAIN_INPUT}"
+echo "[CIDS_LOAD_IMAGENET1K] train bytes=${TRAIN_BYTES}"
 sudo "${BENCH}" \
   --input "${TRAIN_INPUT}" \
   --queue_depth 1024 \
@@ -44,8 +39,8 @@ sudo "${BENCH}" \
   --ioffset 0 \
   --loffset 0
 
-echo "[CIDS_LOAD_IMAGENET1K] 使用 BaM benchmark 写入验证集: ${VAL_INPUT}"
-echo "[CIDS_LOAD_IMAGENET1K] 验证集 loffset(bytes)=${TRAIN_BYTES}"
+echo "[CIDS_LOAD_IMAGENET1K] val input=${VAL_INPUT}"
+echo "[CIDS_LOAD_IMAGENET1K] val loffset(bytes)=${TRAIN_BYTES}"
 sudo "${BENCH}" \
   --input "${VAL_INPUT}" \
   --queue_depth 1024 \

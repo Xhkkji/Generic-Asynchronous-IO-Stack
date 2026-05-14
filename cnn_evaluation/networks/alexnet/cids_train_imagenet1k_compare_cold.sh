@@ -1,0 +1,1 @@
+../../cids_train_imagenet1k_alexnet_compare_cold.sh

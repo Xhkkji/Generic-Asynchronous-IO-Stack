@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # AlexNet + ImageNet-1K 训练脚本：
 # - 默认使用已经写入 BaM 的 ImageNet-1K prepared dataset
 # - 为了更容易放大 CIDS 异步 IO 的优势，默认把 cache 调小、预取和 registered split 调高
@@ -16,18 +18,24 @@ set -euo pipefail
 
 IO_MODE="${IO_MODE:-registered}"
 TORCH_READ_MODE="${TORCH_READ_MODE:-buffered}"
-EPOCHS="${EPOCHS:-1}"
+EPOCHS="${EPOCHS:-2}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
-MAX_TRAIN_ITERS="${MAX_TRAIN_ITERS:-300}"
+MAX_TRAIN_ITERS="${MAX_TRAIN_ITERS:-6000}"
 RUN_VAL="${RUN_VAL:-0}"
 CACHE_SIZE="${CACHE_SIZE:-256}"
 PREFETCH_DEPTH="${PREFETCH_DEPTH:-1}"
 REGISTERED_SPLIT="${REGISTERED_SPLIT:-1}"
 ENABLE_PROFILE="${ENABLE_PROFILE:-1}"
-PROFILE_DIR="${PROFILE_DIR:-./cids_profile_alexnet}"
 REGISTERED_SKIP_FRONT="${REGISTERED_SKIP_FRONT:-0}"
 TRAIN_ROOT="${TRAIN_ROOT:-/home/xhk/hyperion/GIDS/dataset/imagenet/cids_imagenet1k_train_u8}"
 VAL_ROOT="${VAL_ROOT:-/home/xhk/hyperion/GIDS/dataset/imagenet/cids_imagenet1k_val_u8}"
+
+if [[ "${IO_MODE}" == "torch" ]]; then
+  PROFILE_MODE="torch_${TORCH_READ_MODE}"
+else
+  PROFILE_MODE="${IO_MODE}"
+fi
+PROFILE_DIR="${PROFILE_DIR:-${SCRIPT_DIR}/profiles/${PROFILE_MODE}}"
 
 if [[ -n "${GIDS_FORCE_SYNC_READ:-}" ]]; then
   FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ}"

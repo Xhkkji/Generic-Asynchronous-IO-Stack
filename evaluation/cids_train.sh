@@ -43,6 +43,25 @@ REGISTERED_SPLIT=1
 ENABLE_PROFILE=1
 PROFILE_DIR="./cids_profile"
 REGISTERED_SKIP_FRONT=0
+COLD_START="${COLD_START:-0}"
+AUTO_LOG="${AUTO_LOG:-1}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${AUTO_LOG}" == "1" ]]; then
+  if [[ "${IO_MODE}" == "torch" ]]; then
+    LOG_PATH="${SCRIPT_DIR}/output_torch_${TORCH_READ_MODE}.log"
+  else
+    LOG_PATH="${SCRIPT_DIR}/output_${IO_MODE}.log"
+  fi
+  exec > >(tee "${LOG_PATH}") 2>&1
+  echo "[CIDS_RESNET18_LEGACY] auto log -> ${LOG_PATH}"
+fi
+
+if [[ "${COLD_START}" == "1" ]]; then
+  echo "[CIDS_RESNET18_LEGACY] cold start: sync + drop_caches"
+  sync
+  echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+fi
 
 sudo env \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \

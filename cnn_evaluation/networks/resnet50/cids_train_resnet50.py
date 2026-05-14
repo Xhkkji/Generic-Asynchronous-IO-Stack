@@ -1,0 +1,1 @@
+../../cids_train_resnet50.py

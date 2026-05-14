@@ -3,9 +3,11 @@
 set -euo pipefail
 
 REPO_ROOT=/home/xhk/hyperion/GIDS
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="${REPO_ROOT}/cnn_evaluation/cids_train_imagenet1k_resnet50.sh"
 LOG_DIR="${REPO_ROOT}/cnn_evaluation/logs_resnet50"
 SUMMARY_LOG="${LOG_DIR}/resnet50_compare_summary.log"
+PROFILE_ROOT="${SCRIPT_DIR}/profiles"
 
 mkdir -p "${LOG_DIR}"
 : > "${SUMMARY_LOG}"
@@ -13,23 +15,23 @@ mkdir -p "${LOG_DIR}"
 echo "[RESNET50_COMPARE] 1/4 torch mmap"
 IO_MODE=torch \
 TORCH_READ_MODE=mmap \
-PROFILE_DIR="${REPO_ROOT}/cnn_evaluation/cids_profile_resnet50_torch_mmap" \
+PROFILE_DIR="${PROFILE_ROOT}/torch_mmap" \
 bash "${RUN_SCRIPT}" | tee "${LOG_DIR}/resnet50_torch_mmap.log"
 
 echo "[RESNET50_COMPARE] 2/4 torch buffered"
 IO_MODE=torch \
 TORCH_READ_MODE=buffered \
-PROFILE_DIR="${REPO_ROOT}/cnn_evaluation/cids_profile_resnet50_torch_buffered" \
+PROFILE_DIR="${PROFILE_ROOT}/torch_buffered" \
 bash "${RUN_SCRIPT}" | tee "${LOG_DIR}/resnet50_torch_buffered.log"
 
 echo "[RESNET50_COMPARE] 3/4 sync"
 IO_MODE=sync \
-PROFILE_DIR="${REPO_ROOT}/cnn_evaluation/cids_profile_resnet50_sync" \
+PROFILE_DIR="${PROFILE_ROOT}/sync" \
 bash "${RUN_SCRIPT}" | tee "${LOG_DIR}/resnet50_sync.log"
 
 echo "[RESNET50_COMPARE] 4/4 registered"
 IO_MODE=registered \
-PROFILE_DIR="${REPO_ROOT}/cnn_evaluation/cids_profile_resnet50_registered" \
+PROFILE_DIR="${PROFILE_ROOT}/registered" \
 bash "${RUN_SCRIPT}" | tee "${LOG_DIR}/resnet50_registered.log"
 
 echo "[RESNET50_COMPARE] done"

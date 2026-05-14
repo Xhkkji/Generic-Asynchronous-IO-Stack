@@ -22,11 +22,11 @@
 # - CIDS_PROFILE_GPU_TIMING
 
 # 训练配置
-IO_MODE="torch"
+IO_MODE="registered"
 TORCH_READ_MODE="buffered"
-EPOCHS=1
-BATCH_SIZE=256
-MAX_TRAIN_ITERS=300
+EPOCHS=2
+BATCH_SIZE=64
+MAX_TRAIN_ITERS=5000
 RUN_VAL=0
 CACHE_SIZE=1024
 PREFETCH_DEPTH=1
@@ -34,10 +34,17 @@ REGISTERED_SPLIT=1
 ENABLE_PROFILE=1
 PROFILE_DIR="./cids_profile"
 REGISTERED_SKIP_FRONT=0
+COLD_START="${COLD_START:-1}"
+
+if [[ "${COLD_START}" == "1" ]]; then
+  echo "[CIDS_RESNET18_LEGACY] cold start: sync + drop_caches"
+  sync
+  echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+fi
 
 sudo env \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-  GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-1}" \
+  GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-0}" \
   GIDS_ASYNC_DEBUG_ROWS="${GIDS_ASYNC_DEBUG_ROWS:-0}" \
   GIDS_ASYNC_DEBUG_DIMS="${GIDS_ASYNC_DEBUG_DIMS:-16}" \
   GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
@@ -46,8 +53,8 @@ sudo env \
   CIDS_REGISTERED_POLL_DEBUG="${CIDS_REGISTERED_POLL_DEBUG:-0}" \
   CIDS_PROFILE_GPU_TIMING="${CIDS_PROFILE_GPU_TIMING:-0}" \
   /home/xhk/miniconda3/envs/pytorch/bin/python /home/xhk/hyperion/GIDS/evaluation/cids_train.py \
-  --train-root /home/xhk/hyperion/GIDS/dataset/imagenet/cids_imagenet1k_train_u8 \
-  --val-root /home/xhk/hyperion/GIDS/dataset/imagenet/cids_imagenet1k_val_u8 \
+  --train-root /home/xhk/hyperion/GIDS/dataset/imagenet/imagenet1k_subset_190_20_pad448/cids_train_u8_pad448 \
+  --val-root /home/xhk/hyperion/GIDS/dataset/imagenet/imagenet1k_subset_190_20_pad448/cids_val_u8_pad448 \
   --epochs "${EPOCHS}" \
   --batch-size "${BATCH_SIZE}" \
   --max-train-iters "${MAX_TRAIN_ITERS}" \

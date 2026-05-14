@@ -3,31 +3,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT=/home/xhk/hyperion/GIDS
 
-# ResNet-50 + ImageNet-1K 训练脚本：
-# - 默认使用已经写入 BaM 的 ImageNet-1K prepared dataset
-# - 如果你准备了新的 prepared 目录，只需要覆盖 TRAIN_ROOT / VAL_ROOT 即可
-# - --io-mode 可选：
-#   sync        使用 CIDS + BaM 的同步读取
-#   registered  使用 CIDS + BaM 的 registered 异步读取
-#   torch       使用 PyTorch 原生 DataLoader 直接读取 prepared dataset 文件
-# - --torch-read-mode:
-#   mmap        使用 np.memmap 直接映射 prepared 文件
-#   buffered    启动时整块读入内存，作为 torch 的非 mmap 对照
-
-IO_MODE="${IO_MODE:-torch}"
-TORCH_READ_MODE="${TORCH_READ_MODE:-buffered}"
-EPOCHS="${EPOCHS:-1}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
-MAX_TRAIN_ITERS="${MAX_TRAIN_ITERS:-300}"
-RUN_VAL="${RUN_VAL:-0}"
+# 训练配置
+IO_MODE="${IO_MODE:-registered}"
+TORCH_READ_MODE="${TORCH_READ_MODE:-mmap}"
+EPOCHS="${EPOCHS:-5}"
+BATCH_SIZE="${BATCH_SIZE:-2048}"
+MAX_TRAIN_ITERS="${MAX_TRAIN_ITERS:-0}"
+RUN_VAL="${RUN_VAL:-1}"
 CACHE_SIZE="${CACHE_SIZE:-1024}"
 PREFETCH_DEPTH="${PREFETCH_DEPTH:-1}"
 REGISTERED_SPLIT="${REGISTERED_SPLIT:-1}"
 ENABLE_PROFILE="${ENABLE_PROFILE:-1}"
 REGISTERED_SKIP_FRONT="${REGISTERED_SKIP_FRONT:-0}"
-TRAIN_ROOT="${TRAIN_ROOT:-/home/xhk/hyperion/GIDS/dataset/imagenet/cids_imagenet1k_train_u8}"
-VAL_ROOT="${VAL_ROOT:-/home/xhk/hyperion/GIDS/dataset/imagenet/cids_imagenet1k_val_u8}"
+COLD_START="${COLD_START:-0}"
+AUTO_LOG="${AUTO_LOG:-1}"
 
 if [[ "${IO_MODE}" == "torch" ]]; then
   PROFILE_MODE="torch_${TORCH_READ_MODE}"
@@ -36,17 +27,25 @@ else
 fi
 PROFILE_DIR="${PROFILE_DIR:-${SCRIPT_DIR}/profiles/${PROFILE_MODE}}"
 
-if [[ -n "${GIDS_FORCE_SYNC_READ:-}" ]]; then
-  FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ}"
-elif [[ "${IO_MODE}" == "sync" ]]; then
-  FORCE_SYNC_READ="1"
-else
-  FORCE_SYNC_READ="0"
+if [[ "${AUTO_LOG}" == "1" ]]; then
+  if [[ "${IO_MODE}" == "torch" ]]; then
+    LOG_PATH="${SCRIPT_DIR}/output_torch_${TORCH_READ_MODE}.log"
+  else
+    LOG_PATH="${SCRIPT_DIR}/output_${IO_MODE}.log"
+  fi
+  exec > >(tee "${LOG_PATH}") 2>&1
+  echo "[CIDS_RESNET18_LEGACY] auto log -> ${LOG_PATH}"
+fi
+
+if [[ "${COLD_START}" == "1" ]]; then
+  echo "[CIDS_RESNET18_LEGACY] cold start: sync + drop_caches"
+  sync
+  echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 fi
 
 sudo env \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-  GIDS_FORCE_SYNC_READ="${FORCE_SYNC_READ}" \
+  GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-0}" \
   GIDS_ASYNC_DEBUG_ROWS="${GIDS_ASYNC_DEBUG_ROWS:-0}" \
   GIDS_ASYNC_DEBUG_DIMS="${GIDS_ASYNC_DEBUG_DIMS:-16}" \
   GIDS_WARP_CTX_DEBUG_SAMPLE="${GIDS_WARP_CTX_DEBUG_SAMPLE:-0}" \
@@ -54,9 +53,9 @@ sudo env \
   CIDS_REGISTERED_TRY_WINDOW_SIZE="${CIDS_REGISTERED_TRY_WINDOW_SIZE:-2}" \
   CIDS_REGISTERED_POLL_DEBUG="${CIDS_REGISTERED_POLL_DEBUG:-0}" \
   CIDS_PROFILE_GPU_TIMING="${CIDS_PROFILE_GPU_TIMING:-0}" \
-  /home/xhk/miniconda3/envs/pytorch/bin/python /home/xhk/hyperion/GIDS/cnn_evaluation/cids_train_resnet50.py \
-  --train-root "${TRAIN_ROOT}" \
-  --val-root "${VAL_ROOT}" \
+  /home/xhk/miniconda3/envs/pytorch/bin/python "${REPO_ROOT}/evaluation/cids_train.py" \
+  --train-root "${REPO_ROOT}/dataset/imagenet/cids_tiny_imagenet_train_u8" \
+  --val-root "${REPO_ROOT}/dataset/imagenet/cids_tiny_imagenet_val_u8" \
   --epochs "${EPOCHS}" \
   --batch-size "${BATCH_SIZE}" \
   --max-train-iters "${MAX_TRAIN_ITERS}" \

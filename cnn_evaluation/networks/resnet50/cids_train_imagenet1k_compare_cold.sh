@@ -1,0 +1,1 @@
+../../cids_train_imagenet1k_resnet50_compare_cold.sh

@@ -22,6 +22,7 @@ if str(REPO_ROOT / "cnn_evaluation") not in sys.path:
 
 from GIDS import CIDS, CIDSPreparedDataset, CIDS_DataLoader
 from cids_resnet50 import build_resnet50
+from cids_image_transforms import ImageNetBatchPreprocessor
 
 
 def _load_meta(prepared_root):
@@ -179,7 +180,16 @@ def _stop_profiler(profiler):
     )
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=None, max_iters=None):
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    image_preprocessor,
+    profiler=None,
+    max_iters=None,
+):
     # 最小训练循环：只做前向、反向、优化和简单精度统计。
     model.train()
     total_loss = 0.0
@@ -191,6 +201,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=No
     for step_idx, (images, labels) in enumerate(progress, start=1):
         steps_ran = step_idx
         images = images.to(device, non_blocking=True)
+        images = image_preprocessor.train(images)
         labels = _move_labels_to_device(labels, device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -217,7 +228,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, profiler=No
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, dataloader, criterion, device, image_preprocessor):
     # 最小验证循环：只统计 loss 和 top-1 accuracy。
     model.eval()
     total_loss = 0.0
@@ -227,6 +238,7 @@ def evaluate(model, dataloader, criterion, device):
     progress = tqdm(dataloader, desc="val", leave=False)
     for images, labels in progress:
         images = images.to(device, non_blocking=True)
+        images = image_preprocessor.eval(images)
         labels = _move_labels_to_device(labels, device)
 
         logits = model(images)
@@ -323,6 +335,7 @@ def main():
     num_classes = len(train_meta.get("classes", []))
     if num_classes <= 0:
         raise ValueError("prepared train dataset 的 meta.json 中没有有效 classes 信息")
+    image_size = int(train_meta["shape"][-1])
     train_meta_time_sec = time.perf_counter() - train_meta_time_start
 
     train_cids = None
@@ -391,6 +404,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    image_preprocessor = ImageNetBatchPreprocessor(source_image_size=image_size)
     model_init_time_sec = time.perf_counter() - model_init_time_start
 
     print(
@@ -451,7 +465,7 @@ def main():
     try:
         for epoch in tqdm(range(args.epochs)):
             train_loss, train_acc, epoch_train_iters = train_one_epoch(
-                model, train_loader, optimizer, criterion, device,
+                model, train_loader, optimizer, criterion, device, image_preprocessor,
                 profiler=profiler, max_iters=max_train_iters)
             total_train_iters += epoch_train_iters
             submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
@@ -466,7 +480,7 @@ def main():
             )
 
             if val_loader is not None:
-                val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+                val_loss, val_acc = evaluate(model, val_loader, criterion, device, image_preprocessor)
                 print(
                     f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
