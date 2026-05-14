@@ -24,7 +24,7 @@ def main():
     print(f"[CIDS_LOAD] val_root={val_root}", flush=True)
     print(f"[CIDS_LOAD] train_bytes={train_bytes}", flush=True)
     print(f"[CIDS_LOAD] val_loffset_bytes={train_bytes}", flush=True)
-    print("[CIDS_LOAD] 请直接运行: bash /home/xhk/hyperion/GIDS/evaluation/cids_load_to_bam.sh", flush=True)
+    print("[CIDS_LOAD] 请直接运行: bash /home/xhk/hyperion/GIDS/cnn_evaluation/common_tools/cids_load_to_bam.sh", flush=True)
 
 
 if __name__ == "__main__":

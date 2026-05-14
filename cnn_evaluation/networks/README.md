@@ -1,8 +1,10 @@
-Network-specific entrypoints for CIDS image training.
+Network-specific CNN CIDS entrypoints.
 
 - `alexnet/`
+  AlexNet model, training script, compare scripts, and unified profile folder
 - `resnet50/`
-- `resnet18_legacy/`
+  ResNet-50 model, training script, compare scripts, and unified profile folder
+- `resnet18/`
+  ResNet-18 line migrated from the old `evaluation/` path
 
-These folders provide a cleaner categorized view inside `cnn_evaluation`.
-Current top-level launchers are kept unchanged so existing commands do not break.
+Each network folder is intended to be runnable on its own.

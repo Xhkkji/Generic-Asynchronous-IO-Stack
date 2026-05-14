@@ -9,4 +9,4 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_ROOT="${SUBSET_ROOT}/cids_train_u8_pad448" \
 VAL_ROOT="${SUBSET_ROOT}/cids_val_u8_pad448" \
 PROFILE_DIR="${PROFILE_DIR:-${SCRIPT_DIR}/profiles_resnet50}" \
-bash "${REPO_ROOT}/cnn_evaluation/cids_train_imagenet1k_resnet50.sh"
+bash "${REPO_ROOT}/cnn_evaluation/networks/resnet50/cids_train_imagenet1k.sh"

@@ -1,4 +1,6 @@
-AlexNet-related CIDS files.
+AlexNet CIDS line.
+
+Files:
 
 - `cids_alexnet.py`
 - `cids_train_alexnet.py`
@@ -6,4 +8,10 @@ AlexNet-related CIDS files.
 - `cids_train_imagenet1k_compare.sh`
 - `cids_train_imagenet1k_compare_cold.sh`
 
-These entries point to the current maintained AlexNet implementation in `cnn_evaluation/`.
+Profiles are stored under:
+
+- `profiles/torch_mmap`
+- `profiles/torch_buffered`
+- `profiles/sync`
+- `profiles/registered`
+- `profiles/cold/...`
