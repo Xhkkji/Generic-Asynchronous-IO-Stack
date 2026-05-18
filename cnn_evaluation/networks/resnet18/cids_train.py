@@ -8,9 +8,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.profiler
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -23,6 +23,7 @@ if str(REPO_ROOT / "cnn_evaluation") not in sys.path:
 from GIDS import CIDS, CIDSPreparedDataset, CIDS_DataLoader
 from cids_resnet18 import build_resnet18
 from cids_image_transforms import ImageNetBatchPreprocessor
+from cache_runtime import CachedCIDSBatchLoader, LRUSampleCache, SampleImportanceTracker
 
 
 def _load_meta(prepared_root):
@@ -118,11 +119,74 @@ def _build_torch_loader(prepared_root, batch_size, shuffle, torch_read_mode="mma
     return dataset, dataloader
 
 
+def _build_index_loader(prepared_root, batch_size, shuffle, start_sample_id=0):
+    # 第一阶段 sample-cache 只需要最简单的索引 batch：
+    # DataLoader 返回 (sample_id, label)，真正图片仍然由 CIDS miss path 拉取。
+    dataset = CIDSPreparedDataset(prepared_root, start_sample_id=start_sample_id)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+    )
+    return dataset, dataloader
+
+
 def _move_labels_to_device(labels, device):
     # CIDS 当前返回的是 (images, labels) 形式，这里统一把 label 放到训练设备。
     if not torch.is_tensor(labels):
         labels = torch.as_tensor(labels)
     return labels.to(device, non_blocking=True)
+
+
+def _format_cache_summary(summary):
+    # 把 cache 统计整理成更容易读的一行。
+    hits = int(summary.get("hits", 0))
+    misses = int(summary.get("misses", 0))
+    total = hits + misses
+    hit_rate = (hits / total) if total > 0 else 0.0
+    return (
+        f"capacity={summary.get('capacity', 0)} "
+        f"size={summary.get('size', 0)} "
+        f"hits={hits} misses={misses} "
+        f"inserts={summary.get('inserts', 0)} "
+        f"evictions={summary.get('evictions', 0)} "
+        f"skipped_admissions={summary.get('skipped_admissions', 0)} "
+        f"hit_rate={hit_rate:.4f}"
+    )
+
+
+def _extract_sample_ids_from_raw_batch(raw_batch):
+    # 当前第一阶段 importance 只在“原始索引 batch”上工作，
+    # 即 raw_batch 里还保留了 sample_id。
+    if isinstance(raw_batch, dict):
+        sample_ids = raw_batch.get("sample_ids")
+    elif isinstance(raw_batch, (tuple, list)) and len(raw_batch) > 0:
+        sample_ids = raw_batch[0]
+    else:
+        sample_ids = None
+
+    if sample_ids is None:
+        return None
+    if not torch.is_tensor(sample_ids):
+        sample_ids = torch.as_tensor(sample_ids)
+    return sample_ids.detach().cpu()
+
+
+def _format_importance_summary(summary):
+    topk_items = summary.get("topk", [])
+    topk_str = ", ".join(
+        f"{item['sample_id']}:{item['ema_loss']:.4f}/{item['seen_count']}"
+        for item in topk_items
+    )
+    return (
+        f"tracked_samples={summary.get('tracked_samples', 0)} "
+        f"avg_ema_loss={summary.get('avg_ema_loss', 0.0):.4f} "
+        f"max_ema_loss={summary.get('max_ema_loss', 0.0):.4f} "
+        f"topk=[{topk_str}]"
+    )
 
 
 def _start_profiler(enabled, output_dir):
@@ -189,6 +253,10 @@ def train_one_epoch(
     image_preprocessor,
     profiler=None,
     max_iters=None,
+    cached_batch_loader=None,
+    log_interval=20,
+    importance_tracker=None,
+    global_step_offset=0,
 ):
     # 最小训练循环：只做前向、反向、优化和简单精度统计。
     model.train()
@@ -197,26 +265,44 @@ def train_one_epoch(
     total_samples = 0
     steps_ran = 0
 
-    progress = tqdm(dataloader, desc="train", leave=False)
-    for step_idx, (images, labels) in enumerate(progress, start=1):
+    for step_idx, raw_batch in enumerate(dataloader, start=1):
         steps_ran = step_idx
+        sample_ids = None
+        if importance_tracker is not None:
+            sample_ids = _extract_sample_ids_from_raw_batch(raw_batch)
+        if cached_batch_loader is not None:
+            images, labels = cached_batch_loader.fetch_batch(raw_batch)
+        else:
+            images, labels = raw_batch
         images = images.to(device, non_blocking=True)
         images = image_preprocessor.train(images)
         labels = _move_labels_to_device(labels, device)
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(images)
-        loss = criterion(logits, labels)
+        sample_losses = F.cross_entropy(logits, labels, reduction="none")
+        loss = sample_losses.mean()
+        if importance_tracker is not None and sample_ids is not None:
+            importance_tracker.update(
+                sample_ids=sample_ids,
+                sample_losses=sample_losses,
+                step=global_step_offset + step_idx,
+            )
+            if cached_batch_loader is not None:
+                cached_batch_loader.refresh_cached_scores(sample_ids)
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item() * images.size(0)
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
         total_samples += images.size(0)
-        progress.set_postfix(
-            loss=f"{(total_loss / max(1, total_samples)):.4f}",
-            acc=f"{(total_correct / max(1, total_samples)):.4f}",
-        )
+        if step_idx == 1 or step_idx % max(1, log_interval) == 0:
+            print(
+                f"[CIDS_TRAIN_STEP] step={step_idx} "
+                f"loss={(total_loss / max(1, total_samples)):.4f} "
+                f"acc={(total_correct / max(1, total_samples)):.4f}",
+                flush=True,
+            )
         if profiler is not None:
             profiler.step()
         if max_iters is not None and step_idx >= max_iters:
@@ -228,15 +314,18 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, criterion, device, image_preprocessor):
+def evaluate(model, dataloader, criterion, device, image_preprocessor, cached_batch_loader=None):
     # 最小验证循环：只统计 loss 和 top-1 accuracy。
     model.eval()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
 
-    progress = tqdm(dataloader, desc="val", leave=False)
-    for images, labels in progress:
+    for step_idx, raw_batch in enumerate(dataloader, start=1):
+        if cached_batch_loader is not None:
+            images, labels = cached_batch_loader.fetch_batch(raw_batch)
+        else:
+            images, labels = raw_batch
         images = images.to(device, non_blocking=True)
         images = image_preprocessor.eval(images)
         labels = _move_labels_to_device(labels, device)
@@ -247,10 +336,13 @@ def evaluate(model, dataloader, criterion, device, image_preprocessor):
         total_loss += loss.item() * images.size(0)
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
         total_samples += images.size(0)
-        progress.set_postfix(
-            loss=f"{(total_loss / max(1, total_samples)):.4f}",
-            acc=f"{(total_correct / max(1, total_samples)):.4f}",
-        )
+        if step_idx == 1 or step_idx % 20 == 0:
+            print(
+                f"[CIDS_VAL_STEP] step={step_idx} "
+                f"loss={(total_loss / max(1, total_samples)):.4f} "
+                f"acc={(total_correct / max(1, total_samples)):.4f}",
+                flush=True,
+            )
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
     return avg_loss, avg_acc
@@ -263,6 +355,7 @@ def main():
     parser.add_argument("--val-root", default=None, help="prepared val dataset 目录，可选")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch-size", type=int, default=64, help="batch size")
+    parser.add_argument("--shuffle", choices=["0", "1"], default="1", help="训练集是否 shuffle")
     parser.add_argument("--max-train-iters", type=int, default=0, help="每个 epoch 最多跑多少个 train iter；0 表示不限制")
     parser.add_argument("--run-val", choices=["0", "1"], default="1", help="是否在每个 epoch 后运行验证")
     parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
@@ -307,9 +400,59 @@ def main():
         default=os.environ.get("CIDS_PROFILE_DIR", "./cids_profile"),
         help="profiler 输出目录",
     )
+    parser.add_argument(
+        "--enable-sample-cache",
+        choices=["0", "1"],
+        default="0",
+        help="是否启用第一阶段 host sample cache；默认关闭，不影响原逻辑。",
+    )
+    parser.add_argument(
+        "--sample-cache-capacity",
+        type=int,
+        default=4096,
+        help="sample cache 最多缓存多少个 sample。",
+    )
+    parser.add_argument(
+        "--sample-cache-pin-memory",
+        choices=["0", "1"],
+        default="1",
+        help="sample cache 是否把 host tensor 放到 pinned memory。",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=20,
+        help="训练日志输出间隔（按 iter 计）。",
+    )
+    parser.add_argument(
+        "--enable-sample-importance",
+        choices=["0", "1"],
+        default="0",
+        help="是否记录第一阶段 per-sample importance；默认关闭。",
+    )
+    parser.add_argument(
+        "--importance-ema-alpha",
+        type=float,
+        default=0.9,
+        help="per-sample importance 的 EMA 系数。",
+    )
+    parser.add_argument(
+        "--importance-topk",
+        type=int,
+        default=5,
+        help="日志里输出多少个 top-k importance sample。",
+    )
     args = parser.parse_args()
     max_train_iters = args.max_train_iters if args.max_train_iters > 0 else None
     run_val = args.run_val == "1"
+    train_shuffle = args.shuffle == "1"
+    enable_sample_cache = args.enable_sample_cache == "1"
+    enable_sample_importance = args.enable_sample_importance == "1"
+
+    if enable_sample_cache and args.io_mode == "torch":
+        raise ValueError("第一阶段 sample cache 只支持 CIDS sync/registered，不支持 torch 分支")
+    if enable_sample_importance and not enable_sample_cache:
+        raise ValueError("当前简化实现里，sample importance 依赖保留 sample_id 的 cache/index 路径，请先开启 sample cache")
 
     if args.force_sync_read is not None:
         os.environ["GIDS_FORCE_SYNC_READ"] = args.force_sync_read
@@ -339,13 +482,18 @@ def main():
     train_meta_time_sec = time.perf_counter() - train_meta_time_start
 
     train_cids = None
+    cached_train_loader = None
+    cached_val_loader = None
+    importance_tracker = None
+    if enable_sample_importance:
+        importance_tracker = SampleImportanceTracker(ema_alpha=args.importance_ema_alpha)
     cids_init_time_sec = 0.0
     loader_init_time_start = time.perf_counter()
     if args.io_mode == "torch":
         _, train_loader = _build_torch_loader(
             prepared_root=args.train_root,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=train_shuffle,
             torch_read_mode=args.torch_read_mode,
         )
         val_loader = None
@@ -365,30 +513,65 @@ def main():
         )
         cids_init_time_sec = time.perf_counter() - cids_init_time_start
 
-        _, train_loader = _build_loader(
-            prepared_root=args.train_root,
-            batch_size=args.batch_size,
-            shuffle=True,
-            cids_loader=train_cids,
-            prefetch_depth=args.prefetch_depth,
-            start_sample_id=0,
-            io_mode=args.io_mode,
-            registered_split=args.registered_split,
-        )
-
-        val_loader = None
-        if run_val and args.val_root is not None:
-            val_start_sample_id = int(train_meta["num_samples"])
-            _, val_loader = _build_loader(
-                prepared_root=args.val_root,
+        if enable_sample_cache:
+            sample_cache = LRUSampleCache(
+                capacity=args.sample_cache_capacity,
+                pin_memory=(args.sample_cache_pin_memory == "1"),
+                importance_tracker=importance_tracker,
+            )
+            cached_train_loader = CachedCIDSBatchLoader(
+                cids_loader=train_cids,
+                sample_cache=sample_cache,
+                io_mode=args.io_mode,
+                device=device,
+            )
+            _, train_loader = _build_index_loader(
+                prepared_root=args.train_root,
                 batch_size=args.batch_size,
-                shuffle=False,
+                shuffle=train_shuffle,
+                start_sample_id=0,
+            )
+
+            val_loader = None
+            if run_val and args.val_root is not None:
+                val_start_sample_id = int(train_meta["num_samples"])
+                cached_val_loader = CachedCIDSBatchLoader(
+                    cids_loader=train_cids,
+                    sample_cache=sample_cache,
+                    io_mode=args.io_mode,
+                    device=device,
+                )
+                _, val_loader = _build_index_loader(
+                    prepared_root=args.val_root,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    start_sample_id=val_start_sample_id,
+                )
+        else:
+            _, train_loader = _build_loader(
+                prepared_root=args.train_root,
+                batch_size=args.batch_size,
+                shuffle=train_shuffle,
                 cids_loader=train_cids,
                 prefetch_depth=args.prefetch_depth,
-                start_sample_id=val_start_sample_id,
+                start_sample_id=0,
                 io_mode=args.io_mode,
                 registered_split=args.registered_split,
             )
+
+            val_loader = None
+            if run_val and args.val_root is not None:
+                val_start_sample_id = int(train_meta["num_samples"])
+                _, val_loader = _build_loader(
+                    prepared_root=args.val_root,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    cids_loader=train_cids,
+                    prefetch_depth=args.prefetch_depth,
+                    start_sample_id=val_start_sample_id,
+                    io_mode=args.io_mode,
+                    registered_split=args.registered_split,
+                )
     loader_init_time_sec = time.perf_counter() - loader_init_time_start
 
     model_init_time_start = time.perf_counter()
@@ -414,9 +597,13 @@ def main():
         f"GIDS_FORCE_SYNC_READ={os.environ.get('GIDS_FORCE_SYNC_READ', '0')} "
         f"cache_size={args.cache_size}MB "
         f"max_train_iters={max_train_iters if max_train_iters is not None else 'full'} "
+        f"shuffle={train_shuffle} "
         f"run_val={run_val} "
         f"prefetch_depth={args.prefetch_depth} "
         f"registered_split={args.registered_split} "
+        f"enable_sample_cache={enable_sample_cache} "
+        f"sample_cache_capacity={args.sample_cache_capacity} "
+        f"enable_sample_importance={enable_sample_importance} "
         f"CIDS_REGISTERED_ENABLE_SKIP_FRONT={os.environ.get('CIDS_REGISTERED_ENABLE_SKIP_FRONT', '1')} "
         f"CIDS_PROFILE_GPU_TIMING={os.environ.get('CIDS_PROFILE_GPU_TIMING', '0')}",
         flush=True,
@@ -433,6 +620,18 @@ def main():
             "训练阶段不再负责写入。",
             flush=True,
         )
+        if enable_sample_cache:
+            print(
+                f"[CIDS_CACHE] enabled=1 capacity={args.sample_cache_capacity} "
+                f"pin_memory={args.sample_cache_pin_memory}",
+                flush=True,
+            )
+        if enable_sample_importance:
+            print(
+                f"[CIDS_IMPORTANCE] enabled=1 ema_alpha={args.importance_ema_alpha} "
+                f"topk={args.importance_topk}",
+                flush=True,
+            )
 
     preprocess_time_sec = time.perf_counter() - preprocess_time_start
     preprocess_other_time_sec = max(
@@ -463,10 +662,15 @@ def main():
     total_train_iters = 0
     train_time_start = time.perf_counter()
     try:
-        for epoch in tqdm(range(args.epochs)):
+        for epoch in range(args.epochs):
             train_loss, train_acc, epoch_train_iters = train_one_epoch(
                 model, train_loader, optimizer, criterion, device, image_preprocessor,
-                profiler=profiler, max_iters=max_train_iters)
+                profiler=profiler, max_iters=max_train_iters,
+                cached_batch_loader=cached_train_loader,
+                log_interval=args.log_interval,
+                importance_tracker=importance_tracker,
+                global_step_offset=total_train_iters,
+            )
             total_train_iters += epoch_train_iters
             submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
             wait_time = train_cids.GIDS_wait_time if train_cids is not None else 0.0
@@ -478,9 +682,28 @@ def main():
                 f"wait_time={wait_time:.4f}",
                 flush=True,
             )
+            if cached_train_loader is not None:
+                print(
+                    f"[CIDS_CACHE] epoch={epoch + 1}/{args.epochs} "
+                    f"{_format_cache_summary(cached_train_loader.cache_summary())}",
+                    flush=True,
+                )
+            if importance_tracker is not None:
+                print(
+                    f"[CIDS_IMPORTANCE] epoch={epoch + 1}/{args.epochs} "
+                    f"{_format_importance_summary(importance_tracker.summary(args.importance_topk))}",
+                    flush=True,
+                )
 
             if val_loader is not None:
-                val_loss, val_acc = evaluate(model, val_loader, criterion, device, image_preprocessor)
+                val_loss, val_acc = evaluate(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    image_preprocessor,
+                    cached_batch_loader=cached_val_loader,
+                )
                 print(
                     f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
@@ -488,6 +711,17 @@ def main():
                 )
     finally:
         _stop_profiler(profiler)
+        if cached_train_loader is not None:
+            print(
+                f"[CIDS_CACHE_SUMMARY] {_format_cache_summary(cached_train_loader.cache_summary())}",
+                flush=True,
+            )
+        if importance_tracker is not None:
+            print(
+                f"[CIDS_IMPORTANCE_SUMMARY] "
+                f"{_format_importance_summary(importance_tracker.summary(args.importance_topk))}",
+                flush=True,
+            )
         total_train_time_sec = time.perf_counter() - train_time_start
         total_end_to_end_time_sec = preprocess_time_sec + total_train_time_sec
         print(

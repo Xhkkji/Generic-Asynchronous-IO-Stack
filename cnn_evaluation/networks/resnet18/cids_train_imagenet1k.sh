@@ -16,11 +16,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT=/home/xhk/hyperion/GIDS
 
 # 训练配置
-IO_MODE="${IO_MODE:-torch}"
+IO_MODE="${IO_MODE:-sync}"
 TORCH_READ_MODE="${TORCH_READ_MODE:-mmap}"
 EPOCHS="${EPOCHS:-2}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
-MAX_TRAIN_ITERS="${MAX_TRAIN_ITERS:-5000}"
+MAX_TRAIN_ITERS="${MAX_TRAIN_ITERS:-800}"
 RUN_VAL="${RUN_VAL:-0}"
 CACHE_SIZE="${CACHE_SIZE:-1024}"
 PREFETCH_DEPTH="${PREFETCH_DEPTH:-1}"
@@ -29,6 +29,14 @@ ENABLE_PROFILE="${ENABLE_PROFILE:-1}"
 REGISTERED_SKIP_FRONT="${REGISTERED_SKIP_FRONT:-0}"
 COLD_START="${COLD_START:-1}"
 AUTO_LOG="${AUTO_LOG:-1}"
+# shader cache相关
+SHUFFLE="${SHUFFLE:-0}"
+ENABLE_SAMPLE_CACHE="${ENABLE_SAMPLE_CACHE:-1}"
+SAMPLE_CACHE_CAPACITY="${SAMPLE_CACHE_CAPACITY:-24000}"
+SAMPLE_CACHE_PIN_MEMORY="${SAMPLE_CACHE_PIN_MEMORY:-0}"
+ENABLE_SAMPLE_IMPORTANCE="${ENABLE_SAMPLE_IMPORTANCE:-1}"
+IMPORTANCE_EMA_ALPHA="${IMPORTANCE_EMA_ALPHA:-0.9}"
+IMPORTANCE_TOPK="${IMPORTANCE_TOPK:-5}"
 
 if [[ "${IO_MODE}" == "torch" ]]; then
   PROFILE_MODE="torch_${TORCH_READ_MODE}"
@@ -42,7 +50,7 @@ if [[ "${AUTO_LOG}" == "1" ]]; then
   if [[ "${IO_MODE}" == "torch" ]]; then
     LOG_PATH="${SCRIPT_DIR}/output_torch_${TORCH_READ_MODE}.log"
   else
-    LOG_PATH="${SCRIPT_DIR}/output_${IO_MODE}.log"
+    LOG_PATH="${SCRIPT_DIR}/output_${IO_MODE}_nopin.log"
   fi
   exec > >(tee "${LOG_PATH}") 2>&1
   echo "[CIDS_RESNET18] auto log -> ${LOG_PATH}"
@@ -69,6 +77,7 @@ sudo env \
   --val-root "${REPO_ROOT}/dataset/imagenet/imagenet1k_subset_190_20_pad448/cids_val_u8_pad448" \
   --epochs "${EPOCHS}" \
   --batch-size "${BATCH_SIZE}" \
+  --shuffle "${SHUFFLE}" \
   --max-train-iters "${MAX_TRAIN_ITERS}" \
   --run-val "${RUN_VAL}" \
   --ctrl-idx 0 \
@@ -79,4 +88,10 @@ sudo env \
   --profile-dir "${PROFILE_DIR}" \
   --prefetch-depth "${PREFETCH_DEPTH}" \
   --registered-skip-front "${REGISTERED_SKIP_FRONT}" \
-  --registered-split "${REGISTERED_SPLIT}"
+  --registered-split "${REGISTERED_SPLIT}" \
+  --enable-sample-cache "${ENABLE_SAMPLE_CACHE}" \
+  --sample-cache-capacity "${SAMPLE_CACHE_CAPACITY}" \
+  --sample-cache-pin-memory "${SAMPLE_CACHE_PIN_MEMORY}" \
+  --enable-sample-importance "${ENABLE_SAMPLE_IMPORTANCE}" \
+  --importance-ema-alpha "${IMPORTANCE_EMA_ALPHA}" \
+  --importance-topk "${IMPORTANCE_TOPK}"
