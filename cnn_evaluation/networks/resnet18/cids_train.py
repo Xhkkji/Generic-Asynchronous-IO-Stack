@@ -1,6 +1,8 @@
 import argparse
 import json
+import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -86,6 +88,21 @@ class _TorchPreparedDataset(Dataset):
         return image, label
 
 
+class _PlannedIndexDataset(Dataset):
+    # 用显式 sample_id 顺序重建一个轻量 index dataset。
+    def __init__(self, sample_ids, labels):
+        if len(sample_ids) != len(labels):
+            raise ValueError("PlannedIndexDataset 需要等长的 sample_ids 和 labels")
+        self.sample_ids = torch.as_tensor(sample_ids, dtype=torch.long)
+        self.labels = torch.as_tensor(labels, dtype=torch.long)
+
+    def __len__(self):
+        return int(self.sample_ids.numel())
+
+    def __getitem__(self, idx):
+        return self.sample_ids[idx], self.labels[idx]
+
+
 def _build_loader(prepared_root, batch_size, shuffle, cids_loader, prefetch_depth,
                   start_sample_id=0, io_mode="registered", registered_split=1):
     # 基于 prepared dataset 构建最小 CIDS dataloader。
@@ -134,6 +151,21 @@ def _build_index_loader(prepared_root, batch_size, shuffle, start_sample_id=0):
     return dataset, dataloader
 
 
+def _build_planned_index_loader(epoch_pairs, batch_size):
+    sample_ids = [int(sample_id) for sample_id, _ in epoch_pairs]
+    labels = [int(label) for _, label in epoch_pairs]
+    dataset = _PlannedIndexDataset(sample_ids, labels)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+    )
+    return dataset, dataloader
+
+
 def _move_labels_to_device(labels, device):
     # CIDS 当前返回的是 (images, labels) 形式，这里统一把 label 放到训练设备。
     if not torch.is_tensor(labels):
@@ -150,10 +182,14 @@ def _format_cache_summary(summary):
     return (
         f"capacity={summary.get('capacity', 0)} "
         f"size={summary.get('size', 0)} "
+        f"ghost_size={summary.get('ghost_size', 0)} "
         f"hits={hits} misses={misses} "
         f"inserts={summary.get('inserts', 0)} "
         f"evictions={summary.get('evictions', 0)} "
         f"skipped_admissions={summary.get('skipped_admissions', 0)} "
+        f"ghost_candidates={summary.get('ghost_candidates', 0)} "
+        f"ghost_admissions={summary.get('ghost_admissions', 0)} "
+        f"ghost_rejections={summary.get('ghost_rejections', 0)} "
         f"hit_rate={hit_rate:.4f}"
     )
 
@@ -175,18 +211,173 @@ def _extract_sample_ids_from_raw_batch(raw_batch):
     return sample_ids.detach().cpu()
 
 
+def _extract_labels_from_raw_batch(raw_batch):
+    if isinstance(raw_batch, dict):
+        labels = raw_batch.get("labels")
+    elif isinstance(raw_batch, (tuple, list)) and len(raw_batch) > 1:
+        labels = raw_batch[1]
+    else:
+        labels = None
+
+    if labels is None:
+        return None
+    if not torch.is_tensor(labels):
+        labels = torch.as_tensor(labels)
+    return labels.detach().cpu()
+
+
+def _compute_batch_rank_scores(sample_losses):
+    sample_losses = sample_losses.detach().to(torch.float32).view(-1)
+    if sample_losses.numel() == 0:
+        return sample_losses
+
+    sorted_positions = torch.argsort(sample_losses, descending=False)
+    rank_values = torch.log(
+        torch.arange(sample_losses.numel(), device=sample_losses.device, dtype=torch.float32) + 10.0
+    )
+    rank_scores = torch.empty_like(sample_losses)
+    rank_scores[sorted_positions] = rank_values
+    return rank_scores
+
+
 def _format_importance_summary(summary):
     topk_items = summary.get("topk", [])
     topk_str = ", ".join(
-        f"{item['sample_id']}:{item['ema_loss']:.4f}/{item['seen_count']}"
+        f"{item['sample_id']}:{item['ema_score']:.4f}/{item['seen_count']}"
         for item in topk_items
     )
     return (
         f"tracked_samples={summary.get('tracked_samples', 0)} "
-        f"avg_ema_loss={summary.get('avg_ema_loss', 0.0):.4f} "
-        f"max_ema_loss={summary.get('max_ema_loss', 0.0):.4f} "
+        f"avg_ema_score={summary.get('avg_ema_score', 0.0):.4f} "
+        f"max_ema_score={summary.get('max_ema_score', 0.0):.4f} "
         f"topk=[{topk_str}]"
     )
+
+
+def _importance_score_for_sample(importance_tracker, sample_id):
+    if importance_tracker is None:
+        return 0.0
+    state = importance_tracker.get(sample_id)
+    if state is None:
+        return 0.0
+    return float(state.ema_score)
+
+
+def _build_pads_next_epoch_plan(
+    epoch_pairs,
+    sample_cache,
+    importance_tracker,
+    rep_factor=1.5,
+    shuffle_seed=0,
+):
+    if not epoch_pairs or sample_cache is None or importance_tracker is None:
+        return None, None
+
+    hit_pairs = []
+    miss_pairs = []
+    for sample_id, label in epoch_pairs:
+        pair = (int(sample_id), int(label))
+        if sample_cache.contains(sample_id):
+            hit_pairs.append(pair)
+        else:
+            miss_pairs.append(pair)
+
+    if not hit_pairs or not miss_pairs:
+        summary = {
+            "base_rep_factor": float(rep_factor),
+            "effective_rep_factor": float(rep_factor),
+            "mode": "base",
+            "hit_rate": 0.0,
+            "base_size": len(epoch_pairs),
+            "hit_count": len(hit_pairs),
+            "miss_count": len(miss_pairs),
+            "boosted_hits": 0,
+            "planned_size": len(epoch_pairs),
+        }
+        return list(epoch_pairs), summary
+
+    ranked_hits = sorted(
+        hit_pairs,
+        key=lambda pair: _importance_score_for_sample(importance_tracker, pair[0]),
+        reverse=True,
+    )
+    extra_hit_budget = min(
+        len(miss_pairs),
+        max(0, int(round(len(hit_pairs) * max(0.0, float(rep_factor) - 1.0)))),
+    )
+    boosted_hits = ranked_hits[:extra_hit_budget]
+    hit_schedule = list(ranked_hits) + list(boosted_hits)
+    kept_misses = miss_pairs[: max(0, len(miss_pairs) - extra_hit_budget)]
+
+    rng = random.Random(int(shuffle_seed))
+    rng.shuffle(hit_schedule)
+    rng.shuffle(kept_misses)
+
+    planned_pairs = hit_schedule + kept_misses
+    summary = {
+        "base_rep_factor": float(rep_factor),
+        "effective_rep_factor": float(rep_factor),
+        "mode": "base",
+        "hit_rate": len(hit_pairs) / max(1, len(epoch_pairs)),
+        "base_size": len(epoch_pairs),
+        "hit_count": len(hit_pairs),
+        "miss_count": len(miss_pairs),
+        "boosted_hits": len(boosted_hits),
+        "planned_size": len(planned_pairs),
+    }
+    return planned_pairs, summary
+
+
+def _format_pads_summary(summary):
+    return (
+        f"base_rep_factor={summary.get('base_rep_factor', 0.0):.2f} "
+        f"effective_rep_factor={summary.get('effective_rep_factor', 0.0):.2f} "
+        f"mode={summary.get('mode', 'base')} "
+        f"hit_rate={summary.get('hit_rate', 0.0):.4f} "
+        f"base_size={summary.get('base_size', 0)} "
+        f"hit_count={summary.get('hit_count', 0)} "
+        f"miss_count={summary.get('miss_count', 0)} "
+        f"boosted_hits={summary.get('boosted_hits', 0)} "
+        f"planned_size={summary.get('planned_size', 0)}"
+    )
+
+
+def _cache_hit_rate(summary):
+    if not summary:
+        return 0.0
+    hits = int(summary.get("hits", 0))
+    misses = int(summary.get("misses", 0))
+    total = hits + misses
+    return (hits / total) if total > 0 else 0.0
+
+
+def _choose_pads_rep_factor(base_rep_factor, adaptive_enabled, cache_summary, prev_train_loss, curr_train_loss):
+    base_rep_factor = max(1.0, float(base_rep_factor))
+    if not adaptive_enabled:
+        return base_rep_factor, "fixed"
+
+    hit_rate = _cache_hit_rate(cache_summary)
+    rep_factor = base_rep_factor
+    mode = "base"
+
+    loss_plateau = (
+        prev_train_loss is not None
+        and curr_train_loss >= prev_train_loss * 0.995
+    )
+    loss_improving = (
+        prev_train_loss is not None
+        and curr_train_loss <= prev_train_loss * 0.97
+    )
+
+    if hit_rate < 0.30 or loss_plateau:
+        rep_factor += 0.25
+        mode = "aggressive"
+    elif hit_rate > 0.45 and loss_improving:
+        rep_factor -= 0.25
+        mode = "relaxed"
+
+    rep_factor = min(2.0, max(1.0, rep_factor))
+    return rep_factor, mode
 
 
 def _start_profiler(enabled, output_dir):
@@ -257,6 +448,7 @@ def train_one_epoch(
     log_interval=20,
     importance_tracker=None,
     global_step_offset=0,
+    collect_epoch_pairs=False,
 ):
     # 最小训练循环：只做前向、反向、优化和简单精度统计。
     model.train()
@@ -264,12 +456,16 @@ def train_one_epoch(
     total_correct = 0
     total_samples = 0
     steps_ran = 0
+    epoch_pairs = [] if collect_epoch_pairs else None
 
     for step_idx, raw_batch in enumerate(dataloader, start=1):
         steps_ran = step_idx
         sample_ids = None
+        raw_labels = None
         if importance_tracker is not None:
             sample_ids = _extract_sample_ids_from_raw_batch(raw_batch)
+            if collect_epoch_pairs:
+                raw_labels = _extract_labels_from_raw_batch(raw_batch)
         if cached_batch_loader is not None:
             images, labels = cached_batch_loader.fetch_batch(raw_batch)
         else:
@@ -283,13 +479,22 @@ def train_one_epoch(
         sample_losses = F.cross_entropy(logits, labels, reduction="none")
         loss = sample_losses.mean()
         if importance_tracker is not None and sample_ids is not None:
+            sample_scores = _compute_batch_rank_scores(sample_losses)
             importance_tracker.update(
                 sample_ids=sample_ids,
-                sample_losses=sample_losses,
+                sample_scores=sample_scores,
                 step=global_step_offset + step_idx,
             )
             if cached_batch_loader is not None:
                 cached_batch_loader.refresh_cached_scores(sample_ids)
+            if collect_epoch_pairs and raw_labels is not None:
+                epoch_pairs.extend(
+                    (int(sample_id), int(label))
+                    for sample_id, label in zip(
+                        sample_ids.view(-1).tolist(),
+                        raw_labels.view(-1).tolist(),
+                    )
+                )
         loss.backward()
         optimizer.step()
 
@@ -310,7 +515,7 @@ def train_one_epoch(
 
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
-    return avg_loss, avg_acc, steps_ran
+    return avg_loss, avg_acc, steps_ran, epoch_pairs
 
 
 @torch.no_grad()
@@ -442,12 +647,25 @@ def main():
         default=5,
         help="日志里输出多少个 top-k importance sample。",
     )
+    parser.add_argument(
+        "--pads-rep-factor",
+        type=float,
+        default=1.5,
+        help="最小版 PADS 的基础 hit 重复因子。",
+    )
+    parser.add_argument(
+        "--pads-adaptive",
+        choices=["0", "1"],
+        default="1",
+        help="是否根据 hit_rate / train_loss 轻量自适应调整下一轮 PADS 重复强度。",
+    )
     args = parser.parse_args()
     max_train_iters = args.max_train_iters if args.max_train_iters > 0 else None
     run_val = args.run_val == "1"
     train_shuffle = args.shuffle == "1"
     enable_sample_cache = args.enable_sample_cache == "1"
     enable_sample_importance = args.enable_sample_importance == "1"
+    pads_adaptive = args.pads_adaptive == "1"
 
     if enable_sample_cache and args.io_mode == "torch":
         raise ValueError("第一阶段 sample cache 只支持 CIDS sync/registered，不支持 torch 分支")
@@ -482,9 +700,11 @@ def main():
     train_meta_time_sec = time.perf_counter() - train_meta_time_start
 
     train_cids = None
+    sample_cache = None
     cached_train_loader = None
     cached_val_loader = None
     importance_tracker = None
+    pads_rep_factor = max(1.0, float(args.pads_rep_factor))
     if enable_sample_importance:
         importance_tracker = SampleImportanceTracker(ema_alpha=args.importance_ema_alpha)
     cids_init_time_sec = 0.0
@@ -632,6 +852,11 @@ def main():
                 f"topk={args.importance_topk}",
                 flush=True,
             )
+            print(
+                f"[CIDS_PADS] enabled=1 base_rep_factor={pads_rep_factor:.2f} "
+                f"adaptive={int(pads_adaptive)}",
+                flush=True,
+            )
 
     preprocess_time_sec = time.perf_counter() - preprocess_time_start
     preprocess_other_time_sec = max(
@@ -660,16 +885,18 @@ def main():
         output_dir=args.profile_dir,
     )
     total_train_iters = 0
+    prev_train_loss = None
     train_time_start = time.perf_counter()
     try:
         for epoch in range(args.epochs):
-            train_loss, train_acc, epoch_train_iters = train_one_epoch(
+            train_loss, train_acc, epoch_train_iters, epoch_pairs = train_one_epoch(
                 model, train_loader, optimizer, criterion, device, image_preprocessor,
                 profiler=profiler, max_iters=max_train_iters,
                 cached_batch_loader=cached_train_loader,
                 log_interval=args.log_interval,
                 importance_tracker=importance_tracker,
                 global_step_offset=total_train_iters,
+                collect_epoch_pairs=(enable_sample_cache and enable_sample_importance),
             )
             total_train_iters += epoch_train_iters
             submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
@@ -709,6 +936,41 @@ def main():
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
                     flush=True,
                 )
+            if enable_sample_cache and enable_sample_importance and epoch + 1 < args.epochs:
+                cache_summary = (
+                    cached_train_loader.cache_summary()
+                    if cached_train_loader is not None
+                    else None
+                )
+                effective_rep_factor, pads_mode = _choose_pads_rep_factor(
+                    base_rep_factor=pads_rep_factor,
+                    adaptive_enabled=pads_adaptive,
+                    cache_summary=cache_summary,
+                    prev_train_loss=prev_train_loss,
+                    curr_train_loss=train_loss,
+                )
+                planned_pairs, pads_summary = _build_pads_next_epoch_plan(
+                    epoch_pairs=epoch_pairs,
+                    sample_cache=sample_cache,
+                    importance_tracker=importance_tracker,
+                    rep_factor=effective_rep_factor,
+                    shuffle_seed=epoch + 1,
+                )
+                if planned_pairs is not None and pads_summary is not None:
+                    pads_summary["base_rep_factor"] = float(pads_rep_factor)
+                    pads_summary["effective_rep_factor"] = float(effective_rep_factor)
+                    pads_summary["mode"] = pads_mode
+                    pads_summary["hit_rate"] = _cache_hit_rate(cache_summary)
+                    print(
+                        f"[CIDS_PADS] epoch={epoch + 1}/{args.epochs} "
+                        f"{_format_pads_summary(pads_summary)}",
+                        flush=True,
+                    )
+                    _, train_loader = _build_planned_index_loader(
+                        epoch_pairs=planned_pairs,
+                        batch_size=args.batch_size,
+                    )
+            prev_train_loss = train_loss
     finally:
         _stop_profiler(profiler)
         if cached_train_loader is not None:
