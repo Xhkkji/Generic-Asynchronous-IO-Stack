@@ -293,6 +293,7 @@ def _build_pads_next_epoch_plan(
             "miss_count": len(miss_pairs),
             "boosted_hits": 0,
             "planned_size": len(epoch_pairs),
+            "sampler": "basic",
         }
         return list(epoch_pairs), summary
 
@@ -324,12 +325,14 @@ def _build_pads_next_epoch_plan(
         "miss_count": len(miss_pairs),
         "boosted_hits": len(boosted_hits),
         "planned_size": len(planned_pairs),
+        "sampler": "basic",
     }
     return planned_pairs, summary
 
 
 def _format_pads_summary(summary):
     return (
+        f"sampler={summary.get('sampler', 'basic')} "
         f"base_rep_factor={summary.get('base_rep_factor', 0.0):.2f} "
         f"effective_rep_factor={summary.get('effective_rep_factor', 0.0):.2f} "
         f"mode={summary.get('mode', 'base')} "
@@ -351,7 +354,13 @@ def _cache_hit_rate(summary):
     return (hits / total) if total > 0 else 0.0
 
 
-def _choose_pads_rep_factor(base_rep_factor, adaptive_enabled, cache_summary, prev_train_loss, curr_train_loss):
+def _choose_pads_rep_factor(
+    base_rep_factor,
+    adaptive_enabled,
+    cache_summary,
+    prev_train_loss,
+    curr_train_loss,
+):
     base_rep_factor = max(1.0, float(base_rep_factor))
     if not adaptive_enabled:
         return base_rep_factor, "fixed"
