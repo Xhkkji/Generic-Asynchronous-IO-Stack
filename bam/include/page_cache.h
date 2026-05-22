@@ -1060,10 +1060,25 @@ struct page_cache_d_t
     uint64_t *cpu_agg_loc_queue;
     uint32_t cpu_agg_queue_depth;
     uint32_t *cpu_agg_queue_counter;
+    float *policy_scores;
+    uint64_t policy_scores_count;
+    uint64_t policy_group_pages;
+    bool policy_enabled;
+    simt::atomic<uint64_t, simt::thread_scope_device> *policy_skip_cnt;
+    simt::atomic<uint64_t, simt::thread_scope_device> *policy_replace_cnt;
+    simt::atomic<uint64_t, simt::thread_scope_device> *policy_free_fill_cnt;
 
     __forceinline__
         __device__ cache_page_t *
         get_cache_page(const uint32_t page) const;
+
+    __forceinline__
+        __device__ float
+        get_policy_score(uint64_t address) const;
+
+    __forceinline__
+        __device__ uint64_t
+        get_policy_slot(uint64_t address) const;
 
     __forceinline__
         __device__
@@ -1283,6 +1298,10 @@ struct page_cache_t
     BufferPtr q_tail_buf;
     BufferPtr q_lock_buf;
     BufferPtr extra_reads_buf;
+    BufferPtr policy_scores_buf;
+    BufferPtr policy_skip_cnt_buf;
+    BufferPtr policy_replace_cnt_buf;
+    BufferPtr policy_free_fill_cnt_buf;
 
     uint32_t wb_depth;
     uint64_t *h_cpu_agg_meta_queue;
@@ -1294,13 +1313,202 @@ struct page_cache_t
     uint32_t *cpu_agg_queue_counter;
 
     uint32_t cpu_agg_queue_depth;
+
+    void validate_large_page_transfer_size(const Controller &ctrl, const uint64_t ps) const
+    {
+        // 大页传输保护：
+        // - NVMe 控制器会声明最大单次传输大小（MDTS）
+        // - page_size 超过这个值时，直接读写通常不会可靠
+        if (ctrl.info.max_data_size != 0 && ps > ctrl.info.max_data_size)
+        {
+            throw error(string("page_cache_t: page_size exceeds controller max_data_size (MDTS): ")
+                        + std::to_string(ps) + " > " + std::to_string(ctrl.info.max_data_size));
+        }
+    }
+
+    void init_large_page_prps_simple(const Controller &ctrl, const uint64_t ps, const uint64_t np)
+    {
+        // 新的大页 PRP 初始化：
+        // - 只覆盖 ps > 2 * controller_page_size 的分支
+        // - 目标是让一个大页的 PRP2 指向一张标准 PRP list 页
+        // - 该实现优先服务当前的 512KiB/page 场景，逻辑尽量简单
+        const uint64_t ctrl_page_size = ctrl.ctrl->page_size;
+        const uint32_t uints_per_page = ctrl_page_size / sizeof(uint64_t);
+        const uint32_t pages_per_cache_page = ps / ctrl_page_size;
+        const uint32_t remaining_pages = pages_per_cache_page - 1;
+
+        // 单张 PRP list 页最多能容纳 uints_per_page 个条目。
+        // 当前简单实现不做多级链表，只支持“剩余页数能放进一张 list 页”。
+        if (remaining_pages > uints_per_page)
+        {
+            throw error(string("page_cache_t: simple large-page PRP path needs chained PRP lists, unsupported for page_size=")
+                        + std::to_string(ps));
+        }
+
+        this->prp1_buf = createBuffer(np * sizeof(uint64_t), cuda_device);
+        pdt.prp1 = (uint64_t *)this->prp1_buf.get();
+
+        const uint64_t prp_list_bytes = np * ctrl_page_size;
+        this->prp_list_dma = createDma(ctrl.ctrl, NVM_PAGE_ALIGN(prp_list_bytes, 1UL << 16), cuda_device);
+
+        this->prp2_buf = createBuffer(np * sizeof(uint64_t), cuda_device);
+        pdt.prp2 = (uint64_t *)this->prp2_buf.get();
+
+        std::vector<uint64_t> prp1_entries(np, 0);
+        std::vector<uint64_t> prp2_entries(np, 0);
+        std::vector<uint64_t> prp_list_entries(np * uints_per_page, 0);
+
+        for (size_t i = 0; i < np; ++i)
+        {
+            const size_t base_idx = i * pages_per_cache_page;
+            prp1_entries[i] = (uint64_t)this->pages_dma.get()->ioaddrs[base_idx];
+
+            if (remaining_pages == 0)
+            {
+                continue;
+            }
+
+            // PRP list 生成功能：
+            // - helper 会把地址写入一页 PRP list
+            // - 这里先在 host 临时 buffer 中生成，再整体拷到 device DMA buffer
+            // - 避免在 host 上直接解引用 device 侧 DMA 指针
+            nvm_prp_list_t list = NVM_PRP_LIST_INIT(
+                prp_list_entries.data() + i * uints_per_page,
+                false,
+                ctrl_page_size,
+                this->prp_list_dma.get()->ioaddrs[i]);
+            const uint64_t *remaining_ioaddrs = &this->pages_dma.get()->ioaddrs[base_idx + 1];
+            const size_t listed_pages = nvm_prp_list(&list, remaining_pages, remaining_ioaddrs);
+            if (listed_pages != remaining_pages)
+            {
+                throw error(string("page_cache_t: failed to populate full PRP list for large page, listed=")
+                            + std::to_string(listed_pages) + " remaining=" + std::to_string(remaining_pages));
+            }
+            prp2_entries[i] = list.ioaddr;
+        }
+
+        cuda_err_chk(cudaMemcpy(pdt.prp1, prp1_entries.data(), np * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        cuda_err_chk(cudaMemcpy(pdt.prp2, prp2_entries.data(), np * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        cuda_err_chk(cudaMemcpy(
+            this->prp_list_dma.get()->vaddr,
+            prp_list_entries.data(),
+            prp_list_entries.size() * sizeof(uint64_t),
+            cudaMemcpyHostToDevice));
+        pdt.prps = true;
+    }
+
+    void init_large_page_prps_legacy(const Controller &ctrl, const uint64_t ps, const uint64_t np)
+    {
+        // 旧的大页 PRP 初始化逻辑：
+        // - 保留原实现，便于对照和回退
+        // - 当前默认不再走这条路径
+        const uint32_t uints_per_page = ctrl.ctrl->page_size / sizeof(uint64_t);
+        this->prp1_buf = createBuffer(np * sizeof(uint64_t), cuda_device);
+        pdt.prp1 = (uint64_t *)this->prp1_buf.get();
+        uint32_t prp_list_size = ctrl.ctrl->page_size * np;
+        this->prp_list_dma = createDma(ctrl.ctrl, NVM_PAGE_ALIGN(prp_list_size, 1UL << 16), cuda_device);
+        this->prp2_buf = createBuffer(np * sizeof(uint64_t), cuda_device);
+        pdt.prp2 = (uint64_t *)this->prp2_buf.get();
+        uint64_t *temp1 = new uint64_t[np * sizeof(uint64_t)];
+        uint64_t *temp2 = new uint64_t[np * sizeof(uint64_t)];
+        uint64_t *temp3 = new uint64_t[prp_list_size];
+        std::memset(temp1, 0, np * sizeof(uint64_t));
+        std::memset(temp2, 0, np * sizeof(uint64_t));
+        std::memset(temp3, 0, prp_list_size);
+        uint32_t how_many_in_one = ps / ctrl.ctrl->page_size;
+        for (size_t i = 0; i < np; i++)
+        {
+            temp1[i] = ((uint64_t)this->pages_dma.get()->ioaddrs[i * how_many_in_one]);
+            temp2[i] = ((uint64_t)this->prp_list_dma.get()->ioaddrs[i]);
+            for (size_t j = 0; j < (how_many_in_one - 1); j++)
+            {
+                temp3[i * uints_per_page + j] = ((uint64_t)this->pages_dma.get()->ioaddrs[i * how_many_in_one + j + 1]);
+            }
+        }
+
+        std::cout << "Done creating PRP\n";
+        cuda_err_chk(cudaMemcpy(pdt.prp1, temp1, np * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        cuda_err_chk(cudaMemcpy(pdt.prp2, temp2, np * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        cuda_err_chk(cudaMemcpy(this->prp_list_dma.get()->vaddr, temp3, prp_list_size, cudaMemcpyHostToDevice));
+
+        delete temp1;
+        delete temp2;
+        delete temp3;
+        pdt.prps = true;
+    }
     bool cpu_agg;
+    uint32_t cuda_device = 0;
+    bool policy_enabled = false;
+    uint64_t policy_scores_count = 0;
+    uint64_t policy_group_pages = 1;
 
     void print_reset_stats(void)
     {
         uint64_t v = 0;
         cuda_err_chk(cudaMemcpy(&v, pdt.extra_reads, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaMemcpyDeviceToHost));
         cuda_err_chk(cudaMemset(pdt.extra_reads, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
+        if (policy_enabled)
+        {
+            uint64_t policy_skips = 0;
+            uint64_t policy_replaces = 0;
+            uint64_t policy_free_fills = 0;
+            cuda_err_chk(cudaMemcpy(&policy_skips, pdt.policy_skip_cnt, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaMemcpyDeviceToHost));
+            cuda_err_chk(cudaMemcpy(&policy_replaces, pdt.policy_replace_cnt, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaMemcpyDeviceToHost));
+            cuda_err_chk(cudaMemcpy(&policy_free_fills, pdt.policy_free_fill_cnt, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaMemcpyDeviceToHost));
+            std::cout << " policy_enabled=1"
+                      << "\tpolicy_skips=" << policy_skips
+                      << "\tpolicy_replaces=" << policy_replaces
+                      << "\tpolicy_free_fills=" << policy_free_fills
+                      << "\tpolicy_score_slots=" << policy_scores_count;
+            cuda_err_chk(cudaMemset(pdt.policy_skip_cnt, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
+            cuda_err_chk(cudaMemset(pdt.policy_replace_cnt, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
+            cuda_err_chk(cudaMemset(pdt.policy_free_fill_cnt, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
+        }
+    }
+
+    void enable_policy_cache(uint64_t score_slots)
+    {
+        enable_policy_cache_grouped(score_slots, 1);
+    }
+
+    void enable_policy_cache_grouped(uint64_t score_slots, uint64_t group_pages)
+    {
+        // BaM policy 元数据功能：
+        // - score_slots: 分数表槽位数，通常等于样本数
+        // - group_pages: 一个策略单元覆盖多少个连续物理页
+        // 当前用于“1 张图 = 4 个 128KiB row”场景，让 4 个 row 共用一条分数。
+        if (group_pages == 0)
+        {
+            throw error("enable_policy_cache_grouped: group_pages must be positive");
+        }
+        policy_enabled = true;
+        policy_scores_count = score_slots;
+        policy_group_pages = group_pages;
+        policy_scores_buf = createBuffer(score_slots * sizeof(float), cuda_device);
+        policy_skip_cnt_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cuda_device);
+        policy_replace_cnt_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cuda_device);
+        policy_free_fill_cnt_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cuda_device);
+        pdt.policy_scores = (float *)policy_scores_buf.get();
+        pdt.policy_scores_count = score_slots;
+        pdt.policy_group_pages = group_pages;
+        pdt.policy_enabled = true;
+        pdt.policy_skip_cnt = (simt::atomic<uint64_t, simt::thread_scope_device> *)policy_skip_cnt_buf.get();
+        pdt.policy_replace_cnt = (simt::atomic<uint64_t, simt::thread_scope_device> *)policy_replace_cnt_buf.get();
+        pdt.policy_free_fill_cnt = (simt::atomic<uint64_t, simt::thread_scope_device> *)policy_free_fill_cnt_buf.get();
+        cuda_err_chk(cudaMemset(pdt.policy_scores, 0, score_slots * sizeof(float)));
+        cuda_err_chk(cudaMemset(pdt.policy_skip_cnt, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
+        cuda_err_chk(cudaMemset(pdt.policy_replace_cnt, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
+        cuda_err_chk(cudaMemset(pdt.policy_free_fill_cnt, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
+        cuda_err_chk(cudaMemcpy(d_pc_ptr, &pdt, sizeof(page_cache_d_t), cudaMemcpyHostToDevice));
+    }
+
+    void update_policy_score(uint64_t page_id, float score)
+    {
+        if (!policy_enabled || page_id >= policy_scores_count)
+        {
+            return;
+        }
+        cuda_err_chk(cudaMemcpy(pdt.policy_scores + page_id, &score, sizeof(float), cudaMemcpyHostToDevice));
     }
 
     void flush_cache()
@@ -1327,6 +1535,7 @@ struct page_cache_t
     page_cache_t(const uint64_t ps, const uint64_t np, const uint32_t cudaDevice, const Controller &ctrl, const uint64_t max_range, const std::vector<Controller *> &ctrls,
                  uint32_t wb_depth = 256, bool cpu_agg_flag = false, uint32_t cpu_agg_q_depth = 0)
     {
+        cuda_device = cudaDevice;
 
         cpu_agg = cpu_agg_flag;
         if (cpu_agg_flag)
@@ -1348,6 +1557,13 @@ struct page_cache_t
         pdt.cpu_agg_queue_depth = cpu_agg_queue_depth;
         pdt.cpu_agg_queue_counter = cpu_agg_queue_counter;
         pdt.cpu_agg = cpu_agg;
+        pdt.policy_scores = nullptr;
+        pdt.policy_scores_count = 0;
+        pdt.policy_group_pages = 1;
+        pdt.policy_enabled = false;
+        pdt.policy_skip_cnt = nullptr;
+        pdt.policy_replace_cnt = nullptr;
+        pdt.policy_free_fill_cnt = nullptr;
 
         ctrl_counter_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaDevice);
         q_head_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaDevice);
@@ -1431,6 +1647,7 @@ struct page_cache_t
         const uint32_t uints_per_page = ctrl.ctrl->page_size / sizeof(uint64_t);
         if ((pdt.page_size > (ctrl.ctrl->page_size * uints_per_page)) || (np == 0) || (pdt.page_size < ctrl.ns.lba_data_size))
             throw error(string("page_cache_t: Can't have such page size or number of pages"));
+        validate_large_page_transfer_size(ctrl, ps);
         if (ps <= this->pages_dma.get()->page_size)
         {
             std::cout << "Cond1\n";
@@ -1486,48 +1703,7 @@ struct page_cache_t
         }
         else
         {
-            this->prp1_buf = createBuffer(np * sizeof(uint64_t), cudaDevice);
-            pdt.prp1 = (uint64_t *)this->prp1_buf.get();
-            uint32_t prp_list_size = ctrl.ctrl->page_size * np;
-            this->prp_list_dma = createDma(ctrl.ctrl, NVM_PAGE_ALIGN(prp_list_size, 1UL << 16), cudaDevice);
-            this->prp2_buf = createBuffer(np * sizeof(uint64_t), cudaDevice);
-            pdt.prp2 = (uint64_t *)this->prp2_buf.get();
-            uint64_t *temp1 = new uint64_t[np * sizeof(uint64_t)];
-            uint64_t *temp2 = new uint64_t[np * sizeof(uint64_t)];
-            uint64_t *temp3 = new uint64_t[prp_list_size];
-            std::memset(temp1, 0, np * sizeof(uint64_t));
-            std::memset(temp2, 0, np * sizeof(uint64_t));
-            std::memset(temp3, 0, prp_list_size);
-            uint32_t how_many_in_one = ps / ctrl.ctrl->page_size;
-            for (size_t i = 0; i < np; i++)
-            {
-                temp1[i] = ((uint64_t)this->pages_dma.get()->ioaddrs[i * how_many_in_one]);
-                temp2[i] = ((uint64_t)this->prp_list_dma.get()->ioaddrs[i]);
-                for (size_t j = 0; j < (how_many_in_one - 1); j++)
-                {
-                    temp3[i * uints_per_page + j] = ((uint64_t)this->pages_dma.get()->ioaddrs[i * how_many_in_one + j + 1]);
-                }
-            }
-            /*
-              for (size_t i = 0; i < this->pages_dma.get()->n_ioaddrs; i+=how_many_in_one) {
-              temp1[i/how_many_in_one] = ((uint64_t)this->pages_dma.get()->ioaddrs[i]);
-              temp2[i/how_many_in_one] = ((uint64_t)this->prp_list_dma.get()->ioaddrs[i]);
-              for (size_t j = 0; j < (how_many_in_one-1); j++) {
-
-              temp3[(i/how_many_in_one)*uints_per_page + j] = ((uint64_t)this->pages_dma.get()->ioaddrs[i+1+j]);
-              }
-              }
-            */
-
-            std::cout << "Done creating PRP\n";
-            cuda_err_chk(cudaMemcpy(pdt.prp1, temp1, np * sizeof(uint64_t), cudaMemcpyHostToDevice));
-            cuda_err_chk(cudaMemcpy(pdt.prp2, temp2, np * sizeof(uint64_t), cudaMemcpyHostToDevice));
-            cuda_err_chk(cudaMemcpy(this->prp_list_dma.get()->vaddr, temp3, prp_list_size, cudaMemcpyHostToDevice));
-
-            delete temp1;
-            delete temp2;
-            delete temp3;
-            pdt.prps = true;
+            init_large_page_prps_simple(ctrl, ps, np);
         }
 
         pc_buff = createBuffer(sizeof(page_cache_d_t), cudaDevice);
@@ -4235,6 +4411,33 @@ __forceinline__
 }
 
 __forceinline__
+    __device__ uint64_t
+    page_cache_d_t::get_policy_slot(uint64_t address) const
+{
+    // 分组映射功能：
+    // - policy_group_pages=1 时，行为和旧版一致：1 page -> 1 score slot
+    // - policy_group_pages>1 时，连续多个 page 共用一条 sample/group score
+    const uint64_t group_pages = (policy_group_pages == 0) ? 1 : policy_group_pages;
+    return address / group_pages;
+}
+
+__forceinline__
+    __device__ float
+    page_cache_d_t::get_policy_score(uint64_t address) const
+{
+    if (!policy_enabled || policy_scores == nullptr)
+    {
+        return 0.0f;
+    }
+    const uint64_t policy_slot = get_policy_slot(address);
+    if (policy_slot >= policy_scores_count)
+    {
+        return 0.0f;
+    }
+    return policy_scores[policy_slot];
+}
+
+__forceinline__
     __device__
         uint32_t
         page_cache_d_t::wb_find_slot(uint64_t address, uint64_t range_id, const uint32_t queue_, simt::atomic<uint64_t, simt::thread_scope_device> &access_cnt, uint64_t *evicted_p_array,
@@ -4245,6 +4448,7 @@ __forceinline__
     bool fail = true;
     uint64_t count = 0;
     uint64_t global_address = (uint64_t)((address << n_ranges_bits) | range_id); // not elegant. but hack
+    float incoming_score = this->get_policy_score(address);
     uint32_t page = 0;
     unsigned int ns = 8;
     uint64_t j = 0;
@@ -4408,6 +4612,7 @@ __forceinline__
     bool fail = true;
     uint64_t count = 0;
     uint64_t global_address = (uint64_t)((address << n_ranges_bits) | range_id); // not elegant. but hack
+    float incoming_score = this->get_policy_score(address);
     uint32_t page = 0;
     unsigned int ns = 8;
     uint64_t j = 0;
@@ -4597,6 +4802,7 @@ __forceinline__
     bool fail = true;
     uint64_t count = 0;
     uint64_t global_address = (uint64_t)((address << n_ranges_bits) | range_id); // not elegant. but hack
+    float incoming_score = this->get_policy_score(address);
     uint32_t page = 0;
     unsigned int ns = 8;
     uint64_t j = 0;
@@ -4625,6 +4831,10 @@ __forceinline__
                 // printf("page: %lu\tqueue: %lu\tv: free\n", (unsigned long) page, (unsigned) queue_);
                 this->cache_pages[page].page_translation = global_address;
                 this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
+                if (this->policy_enabled && this->policy_free_fill_cnt != nullptr)
+                {
+                    this->policy_free_fill_cnt->fetch_add(1, simt::memory_order_relaxed);
+                }
                 fail = false;
             }
         }
@@ -4637,16 +4847,23 @@ __forceinline__
             
             if (lock)
             {
-                // printf("进入lock逻辑\n");
-                // uint32_t previous_address = this->cache_pages[page].page_translation;
                 uint64_t previous_global_address = this->cache_pages[page].page_translation;
-                // uint8_t previous_range = this->cache_pages[page].range_id;
                 uint64_t previous_range = previous_global_address & n_ranges_mask;
                 uint64_t previous_address = previous_global_address >> n_ranges_bits;
-                // uint32_t new_state = BUSY;
-                // if ((previous_range >= range_cap) || (previous_address >= n_pages))
-                // printf("prev add:%llu\n",(unsigned long long) previous_address);
-                // printf("prev_ga: %llu\tprev_range: %llu\tprev_add: %llu\trange_cap: %llu\tn_pages: %llu\n", (unsigned long long) previous_global_address, (unsigned long long) previous_range, (unsigned long long) previous_address,           (unsigned long long) range_cap, (unsigned long long) n_pages);
+                if (this->policy_enabled && count < this->n_pages)
+                {
+                    const float resident_score = this->get_policy_score(previous_address);
+                    if (resident_score > incoming_score)
+                    {
+                        if (this->policy_skip_cnt != nullptr)
+                        {
+                            this->policy_skip_cnt->fetch_add(1, simt::memory_order_relaxed);
+                        }
+                        this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
+                        count++;
+                        continue;
+                    }
+                }
                 expected_state = this->ranges[previous_range][previous_address].state.load(simt::memory_order_relaxed);
                 // printf("full state: 0x%llx, raw: %llu\n", 
                     // (unsigned long long)expected_state,
@@ -4713,10 +4930,11 @@ __forceinline__
 
                 if (!fail)
                 {
-                    // this->cache_pages[page].page_translation = address;
-                    // this->cache_pages[page].range_id = range_id;
-                    //                    this->page_translation[page] = global_address;
                     this->cache_pages[page].page_translation = global_address;
+                    if (this->policy_enabled && this->policy_replace_cnt != nullptr)
+                    {
+                        this->policy_replace_cnt->fetch_add(1, simt::memory_order_relaxed);
+                    }
                 }
                 // this->page_translation[page].store(global_address, simt::memory_order_release);
                 this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
@@ -4757,6 +4975,7 @@ __forceinline__
     bool fail = true;
     uint64_t count = 0;
     uint64_t global_address = (uint64_t)((address << n_ranges_bits) | range_id); // not elegant. but hack
+    float incoming_score = this->get_policy_score(address);
     uint32_t page = 0;
     unsigned int ns = 8;
     uint64_t j = 0;
@@ -4782,9 +5001,12 @@ __forceinline__
             lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
             if (lock)
             {
-                // printf("page: %lu\tqueue: %lu\tv: free\n", (unsigned long) page, (unsigned) queue_);
                 this->cache_pages[page].page_translation = global_address;
                 this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
+                if (this->policy_enabled && this->policy_free_fill_cnt != nullptr)
+                {
+                    this->policy_free_fill_cnt->fetch_add(1, simt::memory_order_relaxed);
+                }
                 fail = false;
             }
         }
@@ -4797,16 +5019,23 @@ __forceinline__
             
             if (lock)
             {
-                // printf("进入lock逻辑\n");
-                // uint32_t previous_address = this->cache_pages[page].page_translation;
                 uint64_t previous_global_address = this->cache_pages[page].page_translation;
-                // uint8_t previous_range = this->cache_pages[page].range_id;
                 uint64_t previous_range = previous_global_address & n_ranges_mask;
                 uint64_t previous_address = previous_global_address >> n_ranges_bits;
-                // uint32_t new_state = BUSY;
-                // if ((previous_range >= range_cap) || (previous_address >= n_pages))
-                // printf("prev add:%llu\n",(unsigned long long) previous_address);
-                // printf("prev_ga: %llu\tprev_range: %llu\tprev_add: %llu\trange_cap: %llu\tn_pages: %llu\n", (unsigned long long) previous_global_address, (unsigned long long) previous_range, (unsigned long long) previous_address,           (unsigned long long) range_cap, (unsigned long long) n_pages);
+                if (this->policy_enabled && count < this->n_pages)
+                {
+                    const float resident_score = this->get_policy_score(previous_address);
+                    if (resident_score > incoming_score)
+                    {
+                        if (this->policy_skip_cnt != nullptr)
+                        {
+                            this->policy_skip_cnt->fetch_add(1, simt::memory_order_relaxed);
+                        }
+                        this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
+                        count++;
+                        continue;
+                    }
+                }
                 expected_state = this->ranges[previous_range][previous_address].state.load(simt::memory_order_relaxed);
                 uint32_t ref_count = expected_state = this->ranges[previous_range][previous_address].ref_count.load(simt::memory_order_relaxed);
                 // printf("full state: 0x%llx, raw: %llu\n", 
@@ -4875,10 +5104,11 @@ __forceinline__
 
                 if (!fail)
                 {
-                    // this->cache_pages[page].page_translation = address;
-                    // this->cache_pages[page].range_id = range_id;
-                    //                    this->page_translation[page] = global_address;
                     this->cache_pages[page].page_translation = global_address;
+                    if (this->policy_enabled && this->policy_replace_cnt != nullptr)
+                    {
+                        this->policy_replace_cnt->fetch_add(1, simt::memory_order_relaxed);
+                    }
                 }
                 // this->page_translation[page].store(global_address, simt::memory_order_release);
                 this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);

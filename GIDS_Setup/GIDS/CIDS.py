@@ -640,6 +640,7 @@ class CIDS(object):
             "CIDS_REGISTERED_TRY_WINDOW_SIZE", "2"))
         self.registered_enable_skip_front = os.environ.get(
             "CIDS_REGISTERED_ENABLE_SKIP_FRONT", "1") not in ("0", "", "false", "False")
+        self.return_sample_ids = False
 
         self.GIDS_submit_time = 0.0
         self.GIDS_wait_time = 0.0
@@ -669,6 +670,73 @@ class CIDS(object):
         # 把一个已经在 GPU 上的连续 tensor 写入 BaM 当前数组。
         num_e = len(in_ten)
         self.BAM_FS.store_tensor(in_ten.data_ptr(), num_e, offset)
+
+    def enable_bam_policy_cache(self):
+        # BaM policy 入口：
+        # - policy table 按 sample 建，长度等于 num_samples
+        # - 当 sample_row_count > 1 时，连续多个 row 共用同一条 sample score
+        if self.meta is None:
+            raise ValueError("enable_bam_policy_cache 需要 prepared dataset meta.json")
+        num_policy_pages = int(self.meta["num_samples"])
+        policy_group_pages = int(self.sample_row_count)
+        self.return_sample_ids = True
+        if policy_group_pages == 1:
+            self.BAM_FS.enable_bam_policy_cache(num_policy_pages)
+        else:
+            self.BAM_FS.enable_bam_policy_cache_grouped(
+                num_policy_pages,
+                policy_group_pages,
+            )
+        return num_policy_pages
+
+    def sync_bam_policy_scores(self, sample_ids, sample_scores):
+        if torch.is_tensor(sample_ids):
+            sample_ids = sample_ids.detach().cpu().view(-1).tolist()
+        else:
+            sample_ids = [int(sample_id) for sample_id in sample_ids]
+
+        if torch.is_tensor(sample_scores):
+            sample_scores = sample_scores.detach().cpu().view(-1).tolist()
+        else:
+            sample_scores = [float(score) for score in sample_scores]
+
+        if len(sample_ids) != len(sample_scores):
+            raise ValueError("sync_bam_policy_scores 需要等长的 sample_ids 和 sample_scores")
+        if not sample_ids:
+            return
+        self.BAM_FS.update_bam_policy_scores(sample_ids, sample_scores)
+
+    def sync_bam_policy_scores_device(self, policy_scores):
+        # BaM policy 同步功能：
+        # - 直接把 GPU 上的 sample/group 分数表 D2D 拷贝给 BaM
+        # - 多 row 样本时，BaM 侧会用 group_pages 做地址到 sample 的映射
+        if not torch.is_tensor(policy_scores):
+            raise ValueError("sync_bam_policy_scores_device 需要 torch tensor")
+        policy_scores = policy_scores.detach().to(device=self.cids_device, dtype=torch.float32).contiguous()
+        self.BAM_FS.update_bam_policy_scores_device(
+            policy_scores.data_ptr(),
+            int(policy_scores.numel()),
+        )
+
+    def query_sample_residency(self, sample_ids):
+        # 训练调度功能：
+        # - sample 可能对应多个连续 row/page
+        # - 只有这些 row/page 全部 resident，才把这个 sample 视为 resident
+        if not torch.is_tensor(sample_ids):
+            sample_ids = torch.as_tensor(sample_ids, dtype=torch.long)
+        sample_ids = sample_ids.detach().to(device=self.cids_device, dtype=torch.long).view(-1).contiguous()
+        resident_mask = torch.zeros(
+            sample_ids.numel(),
+            dtype=torch.uint8,
+            device=self.cids_device,
+        )
+        self.BAM_FS.query_sample_residency_device(
+            sample_ids.data_ptr(),
+            int(sample_ids.numel()),
+            int(self.sample_row_count),
+            resident_mask.data_ptr(),
+        )
+        return resident_mask.to(dtype=torch.bool).cpu()
 
     def _expand_sample_ids_to_row_indices(self, sample_ids):
         # 把 sample_id 展开成连续 row id：
@@ -729,30 +797,60 @@ class CIDS(object):
         sample_dim = int(meta["sample_dim"])
         num_samples = int(meta["num_samples"])
         images_path = os.path.join(prepared_root, meta.get("images_file", "images.bin"))
+        storage_sample_bytes = int(
+            meta.get("sample_bytes", sample_dim * np.dtype(np_dtype).itemsize)
+        )
+        if storage_sample_bytes % np.dtype(np_dtype).itemsize != 0:
+            raise ValueError(
+                f"prepared sample_bytes 不能整除 itemsize: sample_bytes={storage_sample_bytes}, "
+                f"itemsize={np.dtype(np_dtype).itemsize}"
+            )
+        storage_sample_dim = storage_sample_bytes // np.dtype(np_dtype).itemsize
 
         host_array = np.fromfile(images_path, dtype=np_dtype)
-        expected_elems = num_samples * sample_dim
+        expected_elems = num_samples * storage_sample_dim
         if host_array.size != expected_elems:
             raise ValueError(
                 f"prepared images 元素数不匹配: got={host_array.size}, expected={expected_elems}")
+        if storage_sample_dim < sample_dim:
+            raise ValueError(
+                f"prepared storage sample dim 过小: storage_sample_dim={storage_sample_dim}, "
+                f"sample_dim={sample_dim}"
+            )
 
         if self.sample_dtype_name == "uint8":
             if host_array.dtype != np.uint8:
                 host_array = host_array.astype(np.uint8, copy=False)
             storage_dtype = np.uint8
+            host_storage_array = host_array.reshape(num_samples, storage_sample_dim)
         else:
-            host_array = _prepared_array_to_training_float32(host_array, dtype_name)
+            host_storage_array = host_array.reshape(num_samples, storage_sample_dim)
+            logical_array = _prepared_array_to_training_float32(
+                host_storage_array[:, :sample_dim],
+                dtype_name,
+            )
             storage_dtype = np.float32
+            if storage_sample_dim == sample_dim:
+                host_storage_array = logical_array
+            else:
+                padded_storage = np.zeros(
+                    (num_samples, storage_sample_dim),
+                    dtype=storage_dtype,
+                )
+                padded_storage[:, :sample_dim] = logical_array
+                host_storage_array = padded_storage
 
-        host_array = host_array.reshape(num_samples, sample_dim)
-        if self.storage_sample_dim == sample_dim:
-            storage_array = host_array.reshape(num_samples * self.sample_row_count, self.row_dim)
+        if self.storage_sample_dim == storage_sample_dim:
+            storage_array = host_storage_array.reshape(
+                num_samples * self.sample_row_count,
+                self.row_dim,
+            )
         else:
             storage_array = np.zeros(
                 (num_samples, self.storage_sample_dim),
                 dtype=storage_dtype,
             )
-            storage_array[:, :sample_dim] = host_array
+            storage_array[:, :sample_dim] = host_storage_array[:, :sample_dim]
             storage_array = storage_array.reshape(num_samples * self.sample_row_count, self.row_dim)
 
         return storage_array, meta
@@ -805,6 +903,19 @@ class CIDS(object):
 
     def _format_return_batch(self, batch, images):
         # 尽量保持 CNN 训练常见接口：(images, labels, ...)
+        if self.return_sample_ids:
+            if isinstance(batch, Mapping):
+                result = dict(batch)
+                result["images"] = images
+                return result
+            if isinstance(batch, tuple):
+                labels = batch[1] if len(batch) > 1 else None
+                return {"sample_ids": batch[0], "labels": labels, "images": images}
+            if isinstance(batch, list):
+                labels = batch[1] if len(batch) > 1 else None
+                return {"sample_ids": batch[0], "labels": labels, "images": images}
+            return {"sample_ids": batch, "images": images}
+
         if isinstance(batch, Mapping):
             result = dict(batch)
             result.pop("sample_ids", None)

@@ -106,6 +106,8 @@ struct BAM_Feature_Store {
 
   
   float kernel_time = 0; 
+  bool bam_policy_enabled = false;
+  uint64_t bam_policy_pages = 0;
 
 
   void init_controllers(GIDS_Controllers GIDS_ctrl, uint32_t ps, uint64_t r_off, uint64_t num_ele, uint64_t cache_size, 
@@ -155,6 +157,11 @@ struct BAM_Feature_Store {
   void store_tensor(uint64_t tensor_ptr, uint64_t num, uint64_t offset);
   void read_tensor( uint64_t num, uint64_t offset);
   void flush_cache();
+  void enable_bam_policy_cache(uint64_t num_pages);
+  void enable_bam_policy_cache_grouped(uint64_t num_policy_slots, uint64_t group_pages);
+  void update_bam_policy_scores(const std::vector<uint64_t>& page_ids, const std::vector<float>& scores);
+  void update_bam_policy_scores_device(uint64_t scores_ptr, uint64_t num_pages);
+  void query_sample_residency_device(uint64_t sample_ids_ptr, uint64_t num_samples, uint64_t pages_per_sample, uint64_t out_ptr);
   unsigned int get_cpu_access_count();
   void flush_cpu_access_count();
 

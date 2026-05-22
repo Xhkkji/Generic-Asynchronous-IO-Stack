@@ -25,7 +25,17 @@ if str(REPO_ROOT / "cnn_evaluation") not in sys.path:
 from GIDS import CIDS, CIDSPreparedDataset, CIDS_DataLoader
 from cids_resnet18 import build_resnet18
 from cids_image_transforms import ImageNetBatchPreprocessor
-from cache_runtime import CachedCIDSBatchLoader, LRUSampleCache, SampleImportanceTracker
+from cache_runtime import (
+    BAMPADSPlanner,
+    ShadePADSPlanner,
+    GPUBAMPolicy,
+    CachedCIDSBatchLoader,
+    LRUSampleCache,
+    SampleImportanceTracker,
+)
+
+
+RESNET18_SAMPLE_PAGE_SIZE = 1 << 17
 
 
 def _load_meta(prepared_root):
@@ -33,6 +43,35 @@ def _load_meta(prepared_root):
     meta_path = Path(prepared_root) / "meta.json"
     with open(meta_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _dtype_name_to_itemsize(dtype_name):
+    mapping = {
+        "float16": 2,
+        "float32": 4,
+        "uint8": 1,
+        "int64": 8,
+    }
+    if dtype_name not in mapping:
+        raise ValueError(f"不支持的 prepared dtype: {dtype_name}")
+    return mapping[dtype_name]
+
+
+def _resnet18_sample_page_size(meta):
+    # resnet18 的 BaM 粒度：
+    # - 物理页固定回到 128KiB，满足当前设备的 MDTS 限制
+    # - 单张 416 图像在 prepared 数据里按 524288B 对齐，对应 4 个连续 row/page
+    logical_sample_bytes = int(meta["sample_dim"]) * _dtype_name_to_itemsize(meta.get("dtype", "float32"))
+    storage_sample_bytes = int(meta.get("sample_bytes", logical_sample_bytes))
+    if storage_sample_bytes % RESNET18_SAMPLE_PAGE_SIZE != 0:
+        raise ValueError(
+            f"prepared sample_bytes={storage_sample_bytes}B 不能被固定 page_size={RESNET18_SAMPLE_PAGE_SIZE}B 整除"
+        )
+    if storage_sample_bytes < logical_sample_bytes:
+        raise ValueError(
+            f"prepared sample_bytes={storage_sample_bytes}B 小于 logical sample bytes={logical_sample_bytes}B"
+        )
+    return RESNET18_SAMPLE_PAGE_SIZE, logical_sample_bytes
 
 
 class _TorchPreparedDataset(Dataset):
@@ -45,6 +84,17 @@ class _TorchPreparedDataset(Dataset):
         self.num_samples = int(self.meta["num_samples"])
         self.dtype_name = self.meta.get("dtype", "float32")
         self.dtype = self._numpy_dtype_from_name(self.dtype_name)
+        self.itemsize = np.dtype(self.dtype).itemsize
+        self.sample_bytes = int(self.meta.get("sample_bytes", self.sample_dim * self.itemsize))
+        if self.sample_bytes % self.itemsize != 0:
+            raise ValueError(
+                f"prepared sample_bytes={self.sample_bytes} 不能整除 dtype itemsize={self.itemsize}"
+            )
+        self.storage_sample_dim = self.sample_bytes // self.itemsize
+        if self.storage_sample_dim < self.sample_dim:
+            raise ValueError(
+                f"prepared storage_sample_dim={self.storage_sample_dim} 小于 sample_dim={self.sample_dim}"
+            )
         self.torch_read_mode = str(torch_read_mode)
         self.labels = np.load(self.prepared_root / self.meta.get("labels_file", "labels.npy"))
         images_path = self.prepared_root / self.meta.get("images_file", "images.bin")
@@ -53,11 +103,11 @@ class _TorchPreparedDataset(Dataset):
                 images_path,
                 dtype=self.dtype,
                 mode="r",
-                shape=(self.num_samples, self.sample_dim),
+                shape=(self.num_samples, self.storage_sample_dim),
             )
         elif self.torch_read_mode == "buffered":
             self.images = np.fromfile(images_path, dtype=self.dtype).reshape(
-                self.num_samples, self.sample_dim
+                self.num_samples, self.storage_sample_dim
             )
         else:
             raise ValueError(f"不支持的 torch_read_mode: {self.torch_read_mode}")
@@ -78,7 +128,7 @@ class _TorchPreparedDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        image_np = np.array(self.images[idx], copy=True)
+        image_np = np.array(self.images[idx, :self.sample_dim], copy=True)
         image = torch.from_numpy(image_np).view(*self.shape)
         if self.dtype_name == "uint8":
             image = image.to(torch.float32).div_(255.0)
@@ -166,6 +216,28 @@ def _build_planned_index_loader(epoch_pairs, batch_size):
     return dataset, dataloader
 
 
+def _build_planned_cids_loader(epoch_pairs, batch_size, cids_loader, prefetch_depth, io_mode, registered_split):
+    # PADS 调度功能：
+    # - 下一轮仍然走原有 CIDS sync/registered 读取
+    # - 这里只替换 sample_id 顺序，不改底层 IO 逻辑
+    sample_ids = [int(sample_id) for sample_id, _ in epoch_pairs]
+    labels = [int(label) for _, label in epoch_pairs]
+    dataset = _PlannedIndexDataset(sample_ids, labels)
+    dataloader = CIDS_DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        CIDS_Loader=cids_loader,
+        prefetch_depth=prefetch_depth,
+        io_mode=io_mode,
+        registered_split=registered_split,
+    )
+    return dataset, dataloader
+
+
 def _move_labels_to_device(labels, device):
     # CIDS 当前返回的是 (images, labels) 形式，这里统一把 label 放到训练设备。
     if not torch.is_tensor(labels):
@@ -208,7 +280,7 @@ def _extract_sample_ids_from_raw_batch(raw_batch):
         return None
     if not torch.is_tensor(sample_ids):
         sample_ids = torch.as_tensor(sample_ids)
-    return sample_ids.detach().cpu()
+    return sample_ids.detach()
 
 
 def _extract_labels_from_raw_batch(raw_batch):
@@ -223,7 +295,25 @@ def _extract_labels_from_raw_batch(raw_batch):
         return None
     if not torch.is_tensor(labels):
         labels = torch.as_tensor(labels)
-    return labels.detach().cpu()
+    return labels.detach()
+
+
+def _extract_images_and_labels_from_raw_batch(raw_batch):
+    # 训练/验证功能：
+    # - 统一处理 tuple/list 和带 sample_ids 的 dict batch
+    if isinstance(raw_batch, dict):
+        if "images" not in raw_batch:
+            raise KeyError("batch 字典必须包含 images")
+        if "labels" not in raw_batch:
+            raise KeyError("batch 字典必须包含 labels")
+        return raw_batch["images"], raw_batch["labels"]
+
+    if isinstance(raw_batch, (tuple, list)):
+        if len(raw_batch) < 2:
+            raise ValueError("batch 至少需要包含 images 和 labels")
+        return raw_batch[0], raw_batch[1]
+
+    raise ValueError("不支持的 batch 类型，无法提取 images 和 labels")
 
 
 def _compute_batch_rank_scores(sample_losses):
@@ -254,6 +344,17 @@ def _format_importance_summary(summary):
     )
 
 
+def _format_bam_policy_summary(summary):
+    if not summary:
+        return "update_calls=0 sync_calls=0 tracked_pages=0 last_batch_pages=0"
+    return (
+        f"update_calls={summary.get('update_calls', 0)} "
+        f"sync_calls={summary.get('sync_calls', 0)} "
+        f"tracked_pages={summary.get('tracked_pages', 0)} "
+        f"last_batch_pages={summary.get('last_batch_pages', 0)}"
+    )
+
+
 def _importance_score_for_sample(importance_tracker, sample_id):
     if importance_tracker is None:
         return 0.0
@@ -263,84 +364,126 @@ def _importance_score_for_sample(importance_tracker, sample_id):
     return float(state.ema_score)
 
 
+def _build_sample_cache_resident_lookup(epoch_pairs, sample_cache):
+    if not epoch_pairs or sample_cache is None:
+        return None
+    resident_lookup = {}
+    for sample_id, _ in epoch_pairs:
+        sample_id = int(sample_id)
+        if sample_id not in resident_lookup:
+            resident_lookup[sample_id] = bool(sample_cache.contains(sample_id))
+    return resident_lookup
+
+
+def _build_bam_resident_lookup(epoch_pairs, cids_loader):
+    if not epoch_pairs or cids_loader is None:
+        return None
+    unique_sample_ids = list(dict.fromkeys(int(sample_id) for sample_id, _ in epoch_pairs))
+    resident_mask = cids_loader.query_sample_residency(unique_sample_ids)
+    return {
+        sample_id: bool(is_resident)
+        for sample_id, is_resident in zip(unique_sample_ids, resident_mask.view(-1).tolist())
+    }
+
+
+def _resident_rate(epoch_pairs, resident_lookup):
+    if not epoch_pairs or not resident_lookup:
+        return 0.0
+    resident_count = sum(1 for sample_id, _ in epoch_pairs if resident_lookup.get(int(sample_id), False))
+    return resident_count / max(1, len(epoch_pairs))
+
+
 def _build_pads_next_epoch_plan(
     epoch_pairs,
-    sample_cache,
+    resident_lookup,
     importance_tracker,
     rep_factor=1.5,
     shuffle_seed=0,
+    sampler_name="resident",
 ):
-    if not epoch_pairs or sample_cache is None or importance_tracker is None:
+    if not epoch_pairs or resident_lookup is None or importance_tracker is None:
         return None, None
 
-    hit_pairs = []
-    miss_pairs = []
+    resident_pairs = []
+    nonresident_pairs = []
     for sample_id, label in epoch_pairs:
         pair = (int(sample_id), int(label))
-        if sample_cache.contains(sample_id):
-            hit_pairs.append(pair)
+        if resident_lookup.get(int(sample_id), False):
+            resident_pairs.append(pair)
         else:
-            miss_pairs.append(pair)
+            nonresident_pairs.append(pair)
 
-    if not hit_pairs or not miss_pairs:
+    if not resident_pairs or not nonresident_pairs:
         summary = {
             "base_rep_factor": float(rep_factor),
             "effective_rep_factor": float(rep_factor),
             "mode": "base",
-            "hit_rate": 0.0,
+            "resident_rate": _resident_rate(epoch_pairs, resident_lookup),
             "base_size": len(epoch_pairs),
-            "hit_count": len(hit_pairs),
-            "miss_count": len(miss_pairs),
-            "boosted_hits": 0,
+            "resident_count": len(resident_pairs),
+            "nonresident_count": len(nonresident_pairs),
+            "boosted_resident": 0,
             "planned_size": len(epoch_pairs),
-            "sampler": "basic",
+            "sampler": sampler_name,
         }
         return list(epoch_pairs), summary
 
-    ranked_hits = sorted(
-        hit_pairs,
+    ranked_resident = sorted(
+        resident_pairs,
         key=lambda pair: _importance_score_for_sample(importance_tracker, pair[0]),
         reverse=True,
     )
-    extra_hit_budget = min(
-        len(miss_pairs),
-        max(0, int(round(len(hit_pairs) * max(0.0, float(rep_factor) - 1.0)))),
+    extra_resident_budget = min(
+        len(nonresident_pairs),
+        max(0, int(round(len(resident_pairs) * max(0.0, float(rep_factor) - 1.0)))),
     )
-    boosted_hits = ranked_hits[:extra_hit_budget]
-    hit_schedule = list(ranked_hits) + list(boosted_hits)
-    kept_misses = miss_pairs[: max(0, len(miss_pairs) - extra_hit_budget)]
+    boosted_resident = ranked_resident[:extra_resident_budget]
+    resident_schedule = list(ranked_resident) + list(boosted_resident)
+    kept_nonresident = nonresident_pairs[: max(0, len(nonresident_pairs) - extra_resident_budget)]
 
     rng = random.Random(int(shuffle_seed))
-    rng.shuffle(hit_schedule)
-    rng.shuffle(kept_misses)
+    rng.shuffle(resident_schedule)
+    rng.shuffle(kept_nonresident)
 
-    planned_pairs = hit_schedule + kept_misses
+    planned_pairs = resident_schedule + kept_nonresident
     summary = {
         "base_rep_factor": float(rep_factor),
         "effective_rep_factor": float(rep_factor),
         "mode": "base",
-        "hit_rate": len(hit_pairs) / max(1, len(epoch_pairs)),
+        "resident_rate": len(resident_pairs) / max(1, len(epoch_pairs)),
         "base_size": len(epoch_pairs),
-        "hit_count": len(hit_pairs),
-        "miss_count": len(miss_pairs),
-        "boosted_hits": len(boosted_hits),
+        "resident_count": len(resident_pairs),
+        "nonresident_count": len(nonresident_pairs),
+        "boosted_resident": len(boosted_resident),
         "planned_size": len(planned_pairs),
-        "sampler": "basic",
+        "sampler": sampler_name,
     }
     return planned_pairs, summary
 
 
 def _format_pads_summary(summary):
     return (
+        f"strategy={summary.get('strategy', 'replace')} "
         f"sampler={summary.get('sampler', 'basic')} "
         f"base_rep_factor={summary.get('base_rep_factor', 0.0):.2f} "
         f"effective_rep_factor={summary.get('effective_rep_factor', 0.0):.2f} "
         f"mode={summary.get('mode', 'base')} "
-        f"hit_rate={summary.get('hit_rate', 0.0):.4f} "
+        f"resident_rate={summary.get('resident_rate', 0.0):.4f} "
         f"base_size={summary.get('base_size', 0)} "
-        f"hit_count={summary.get('hit_count', 0)} "
-        f"miss_count={summary.get('miss_count', 0)} "
-        f"boosted_hits={summary.get('boosted_hits', 0)} "
+        f"resident_count={summary.get('resident_count', 0)} "
+        f"nonresident_count={summary.get('nonresident_count', 0)} "
+        f"resident_unique={summary.get('resident_unique', 0)} "
+        f"nonresident_unique={summary.get('nonresident_unique', 0)} "
+        f"boosted_resident={summary.get('boosted_resident', 0)} "
+        f"resident_duplicates={summary.get('resident_duplicates', 0)} "
+        f"weighted_resident_draws={summary.get('weighted_resident_draws', 0)} "
+        f"replaced_nonresident={summary.get('replaced_nonresident', 0)} "
+        f"batch_resident_fraction={summary.get('batch_resident_fraction', 0.0):.4f} "
+        f"batch_resident_quota={summary.get('batch_resident_quota', 0)} "
+        f"ghost_size={summary.get('ghost_size', 0)} "
+        f"ghost_candidates={summary.get('ghost_candidates', 0)} "
+        f"ghost_admissions={summary.get('ghost_admissions', 0)} "
+        f"ghost_rejections={summary.get('ghost_rejections', 0)} "
         f"planned_size={summary.get('planned_size', 0)}"
     )
 
@@ -354,18 +497,11 @@ def _cache_hit_rate(summary):
     return (hits / total) if total > 0 else 0.0
 
 
-def _choose_pads_rep_factor(
-    base_rep_factor,
-    adaptive_enabled,
-    cache_summary,
-    prev_train_loss,
-    curr_train_loss,
-):
+def _choose_pads_rep_factor(base_rep_factor, adaptive_enabled, observed_rate, prev_train_loss, curr_train_loss):
     base_rep_factor = max(1.0, float(base_rep_factor))
     if not adaptive_enabled:
         return base_rep_factor, "fixed"
 
-    hit_rate = _cache_hit_rate(cache_summary)
     rep_factor = base_rep_factor
     mode = "base"
 
@@ -378,10 +514,10 @@ def _choose_pads_rep_factor(
         and curr_train_loss <= prev_train_loss * 0.97
     )
 
-    if hit_rate < 0.30 or loss_plateau:
+    if observed_rate < 0.30 or loss_plateau:
         rep_factor += 0.25
         mode = "aggressive"
-    elif hit_rate > 0.45 and loss_improving:
+    elif observed_rate > 0.45 and loss_improving:
         rep_factor -= 0.25
         mode = "relaxed"
 
@@ -456,13 +592,18 @@ def train_one_epoch(
     cached_batch_loader=None,
     log_interval=20,
     importance_tracker=None,
+    bam_policy=None,
+    bam_policy_cids=None,
     global_step_offset=0,
     collect_epoch_pairs=False,
 ):
     # 最小训练循环：只做前向、反向、优化和简单精度统计。
     model.train()
-    total_loss = 0.0
-    total_correct = 0
+    # 统计功能：
+    # - 把聚合值保留在 GPU 上，按日志点再转成 Python 标量
+    # - 避免每个 step 都触发 .item() 同步
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    total_correct = torch.zeros((), device=device, dtype=torch.float32)
     total_samples = 0
     steps_ran = 0
     epoch_pairs = [] if collect_epoch_pairs else None
@@ -471,14 +612,14 @@ def train_one_epoch(
         steps_ran = step_idx
         sample_ids = None
         raw_labels = None
-        if importance_tracker is not None:
+        if importance_tracker is not None or bam_policy is not None:
             sample_ids = _extract_sample_ids_from_raw_batch(raw_batch)
             if collect_epoch_pairs:
                 raw_labels = _extract_labels_from_raw_batch(raw_batch)
         if cached_batch_loader is not None:
             images, labels = cached_batch_loader.fetch_batch(raw_batch)
         else:
-            images, labels = raw_batch
+            images, labels = _extract_images_and_labels_from_raw_batch(raw_batch)
         images = images.to(device, non_blocking=True)
         images = image_preprocessor.train(images)
         labels = _move_labels_to_device(labels, device)
@@ -487,8 +628,10 @@ def train_one_epoch(
         logits = model(images)
         sample_losses = F.cross_entropy(logits, labels, reduction="none")
         loss = sample_losses.mean()
-        if importance_tracker is not None and sample_ids is not None:
+        sample_scores = None
+        if sample_ids is not None and (importance_tracker is not None or bam_policy is not None):
             sample_scores = _compute_batch_rank_scores(sample_losses)
+        if importance_tracker is not None and sample_ids is not None:
             importance_tracker.update(
                 sample_ids=sample_ids,
                 sample_scores=sample_scores,
@@ -500,10 +643,14 @@ def train_one_epoch(
                 epoch_pairs.extend(
                     (int(sample_id), int(label))
                     for sample_id, label in zip(
-                        sample_ids.view(-1).tolist(),
-                        raw_labels.view(-1).tolist(),
+                        sample_ids.detach().cpu().view(-1).tolist(),
+                        raw_labels.detach().cpu().view(-1).tolist(),
                     )
                 )
+        if bam_policy is not None and sample_ids is not None:
+            bam_policy.update_from_batch(sample_ids, sample_scores)
+            if bam_policy_cids is not None:
+                bam_policy.sync_to_bam(bam_policy_cids)
         loss.backward()
         optimizer.step()
 
@@ -511,10 +658,12 @@ def train_one_epoch(
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
         total_samples += images.size(0)
         if step_idx == 1 or step_idx % max(1, log_interval) == 0:
+            running_loss = total_loss / max(1, total_samples)
+            running_acc = total_correct / max(1, total_samples)
             print(
                 f"[CIDS_TRAIN_STEP] step={step_idx} "
-                f"loss={(total_loss / max(1, total_samples)):.4f} "
-                f"acc={(total_correct / max(1, total_samples)):.4f}",
+                f"loss={running_loss:.4f} "
+                f"acc={running_acc:.4f}",
                 flush=True,
             )
         if profiler is not None:
@@ -539,7 +688,7 @@ def evaluate(model, dataloader, criterion, device, image_preprocessor, cached_ba
         if cached_batch_loader is not None:
             images, labels = cached_batch_loader.fetch_batch(raw_batch)
         else:
-            images, labels = raw_batch
+            images, labels = _extract_images_and_labels_from_raw_batch(raw_batch)
         images = images.to(device, non_blocking=True)
         images = image_preprocessor.eval(images)
         labels = _move_labels_to_device(labels, device)
@@ -551,10 +700,12 @@ def evaluate(model, dataloader, criterion, device, image_preprocessor, cached_ba
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
         total_samples += images.size(0)
         if step_idx == 1 or step_idx % 20 == 0:
+            running_loss = total_loss / max(1, total_samples)
+            running_acc = total_correct / max(1, total_samples)
             print(
                 f"[CIDS_VAL_STEP] step={step_idx} "
-                f"loss={(total_loss / max(1, total_samples)):.4f} "
-                f"acc={(total_correct / max(1, total_samples)):.4f}",
+                f"loss={running_loss:.4f} "
+                f"acc={running_acc:.4f}",
                 flush=True,
             )
     avg_loss = total_loss / max(1, total_samples)
@@ -598,12 +749,6 @@ def main():
         help="torch 分支的 prepared 文件读取方式：mmap 为内存映射，buffered 为整块读入内存",
     )
     parser.add_argument(
-        "--force-sync-read",
-        choices=["0", "1"],
-        default=None,
-        help="是否强制底层 read_feature 走 GIDS_FORCE_SYNC_READ，同步模式默认自动设为 1",
-    )
-    parser.add_argument(
         "--enable-profile",
         choices=["0", "1"],
         default=os.environ.get("CIDS_ENABLE_PROFILE", "0"),
@@ -645,6 +790,12 @@ def main():
         help="是否记录第一阶段 per-sample importance；默认关闭。",
     )
     parser.add_argument(
+        "--enable-bam-policy-cache",
+        choices=["0", "1"],
+        default="0",
+        help="是否启用独立的 BaM score-aware cache policy；不使用 CPU sample cache。",
+    )
+    parser.add_argument(
         "--importance-ema-alpha",
         type=float,
         default=0.9,
@@ -668,31 +819,44 @@ def main():
         default="1",
         help="是否根据 hit_rate / train_loss 轻量自适应调整下一轮 PADS 重复强度。",
     )
+    parser.add_argument(
+        "--pads-strategy",
+        choices=["replace", "shade"],
+        default="replace",
+        help="PADS resident 调度策略：replace 为轻量替换，shade 为按 locality 聚簇的 resident replay。",
+    )
+    parser.add_argument(
+        "--pads-bias-scale",
+        type=float,
+        default=-1.0,
+        help="PADS 控制参数；replace 下表示轻偏置缩放，shade 下表示 replay 缩放因子。",
+    )
+    parser.add_argument(
+        "--pads-max-replace-fraction",
+        type=float,
+        default=-1.0,
+        help="PADS 替换上限；小于 0 时按策略和 io-mode 选择默认值。",
+    )
     args = parser.parse_args()
     max_train_iters = args.max_train_iters if args.max_train_iters > 0 else None
     run_val = args.run_val == "1"
     train_shuffle = args.shuffle == "1"
     enable_sample_cache = args.enable_sample_cache == "1"
     enable_sample_importance = args.enable_sample_importance == "1"
+    enable_bam_policy_cache = args.enable_bam_policy_cache == "1"
     pads_adaptive = args.pads_adaptive == "1"
+    enable_pads = enable_sample_importance and (enable_sample_cache or enable_bam_policy_cache)
 
     if enable_sample_cache and args.io_mode == "torch":
         raise ValueError("第一阶段 sample cache 只支持 CIDS sync/registered，不支持 torch 分支")
-    if enable_sample_importance and not enable_sample_cache:
-        raise ValueError("当前简化实现里，sample importance 依赖保留 sample_id 的 cache/index 路径，请先开启 sample cache")
-
-    if args.force_sync_read is not None:
-        os.environ["GIDS_FORCE_SYNC_READ"] = args.force_sync_read
-    elif args.io_mode == "sync":
-        os.environ["GIDS_FORCE_SYNC_READ"] = "1"
-    else:
-        os.environ.setdefault("GIDS_FORCE_SYNC_READ", "0")
-
-    if args.io_mode == "sync" and os.environ.get("GIDS_FORCE_SYNC_READ", "0") != "1":
+    if enable_sample_cache and enable_bam_policy_cache:
         raise ValueError(
-            "sync 模式必须配合 GIDS_FORCE_SYNC_READ=1，"
-            "否则底层会误走旧的 async read_feature 路径。"
+            "当前简化实现里，CPU sample cache 和 BaM policy cache 先保持互斥，避免两套策略混用"
         )
+    if enable_sample_importance and not (enable_sample_cache or enable_bam_policy_cache):
+        raise ValueError("开启 sample importance 时，需要配合 sample cache 或 BaM policy cache")
+    if enable_bam_policy_cache and args.io_mode == "torch":
+        raise ValueError("BaM policy 只支持 CIDS sync/registered，不支持 torch 分支")
 
     if args.registered_skip_front is not None:
         os.environ["CIDS_REGISTERED_ENABLE_SKIP_FRONT"] = args.registered_skip_front
@@ -706,6 +870,7 @@ def main():
     if num_classes <= 0:
         raise ValueError("prepared train dataset 的 meta.json 中没有有效 classes 信息")
     image_size = int(train_meta["shape"][-1])
+    cids_page_size, sample_bytes = _resnet18_sample_page_size(train_meta)
     train_meta_time_sec = time.perf_counter() - train_meta_time_start
 
     train_cids = None
@@ -713,9 +878,45 @@ def main():
     cached_train_loader = None
     cached_val_loader = None
     importance_tracker = None
+    bam_policy = None
+    pads_planner = None
     pads_rep_factor = max(1.0, float(args.pads_rep_factor))
+    pads_strategy = str(args.pads_strategy)
+    # planner 参数：
+    # - replace: 旧的 epoch 级轻替换
+    # - shade: 更接近 SHADE 的 resident replay + locality 聚簇
+    if args.pads_bias_scale >= 0.0:
+        pads_bias_scale = float(args.pads_bias_scale)
+    elif pads_strategy == "shade":
+        pads_bias_scale = 0.35
+    else:
+        pads_bias_scale = 0.15 if args.io_mode == "registered" else 0.25
+    if args.pads_max_replace_fraction >= 0.0:
+        pads_max_replace_fraction = float(args.pads_max_replace_fraction)
+    elif pads_strategy == "shade":
+        pads_max_replace_fraction = 0.008 if args.io_mode == "registered" else 0.03
+    else:
+        pads_max_replace_fraction = 0.005 if args.io_mode == "registered" else 0.01
     if enable_sample_importance:
         importance_tracker = SampleImportanceTracker(ema_alpha=args.importance_ema_alpha)
+    if enable_bam_policy_cache:
+        bam_policy = GPUBAMPolicy(
+            num_pages=int(train_meta["num_samples"]),
+            device=device,
+            ema_alpha=args.importance_ema_alpha,
+        )
+    if enable_pads:
+        if pads_strategy == "shade":
+            pads_planner = ShadePADSPlanner(
+                replay_bias_scale=pads_bias_scale,
+                max_replace_fraction=pads_max_replace_fraction,
+                locality_window=32 if args.io_mode == "registered" else 16,
+            )
+        else:
+            pads_planner = BAMPADSPlanner(
+                replacement_bias_scale=pads_bias_scale,
+                max_replace_fraction=pads_max_replace_fraction,
+            )
     cids_init_time_sec = 0.0
     loader_init_time_start = time.perf_counter()
     if args.io_mode == "torch":
@@ -739,7 +940,10 @@ def main():
             args.train_root,
             ctrl_idx=args.ctrl_idx,
             cache_size=args.cache_size,
+            page_size=cids_page_size,
         )
+        if enable_bam_policy_cache:
+            train_cids.enable_bam_policy_cache()
         cids_init_time_sec = time.perf_counter() - cids_init_time_start
 
         if enable_sample_cache:
@@ -823,7 +1027,8 @@ def main():
         f"[CIDS_TRAIN] device={device} num_classes={num_classes} "
         f"shape={train_meta['shape']} dtype={train_meta['dtype']} "
         f"io_mode={args.io_mode} "
-        f"GIDS_FORCE_SYNC_READ={os.environ.get('GIDS_FORCE_SYNC_READ', '0')} "
+        f"page_size={cids_page_size}B "
+        f"sample_bytes={sample_bytes}B "
         f"cache_size={args.cache_size}MB "
         f"max_train_iters={max_train_iters if max_train_iters is not None else 'full'} "
         f"shuffle={train_shuffle} "
@@ -833,6 +1038,7 @@ def main():
         f"enable_sample_cache={enable_sample_cache} "
         f"sample_cache_capacity={args.sample_cache_capacity} "
         f"enable_sample_importance={enable_sample_importance} "
+        f"enable_bam_policy_cache={enable_bam_policy_cache} "
         f"CIDS_REGISTERED_ENABLE_SKIP_FRONT={os.environ.get('CIDS_REGISTERED_ENABLE_SKIP_FRONT', '1')} "
         f"CIDS_PROFILE_GPU_TIMING={os.environ.get('CIDS_PROFILE_GPU_TIMING', '0')}",
         flush=True,
@@ -861,11 +1067,18 @@ def main():
                 f"topk={args.importance_topk}",
                 flush=True,
             )
+        if enable_pads:
+            pads_sampler = "bam_resident" if enable_bam_policy_cache else "sample_cache"
             print(
-                f"[CIDS_PADS] enabled=1 base_rep_factor={pads_rep_factor:.2f} "
-                f"adaptive={int(pads_adaptive)}",
+                f"[CIDS_PADS] enabled=1 sampler={pads_sampler} base_rep_factor={pads_rep_factor:.2f} "
+                f"strategy={pads_strategy} "
+                f"adaptive={int(pads_adaptive)} "
+                f"bias_scale={pads_bias_scale:.3f} "
+                f"max_replace_fraction={pads_max_replace_fraction:.4f}",
                 flush=True,
             )
+        if enable_bam_policy_cache:
+            print("[CIDS_BAM_POLICY] enabled=1 mode=score-aware-eviction", flush=True)
 
     preprocess_time_sec = time.perf_counter() - preprocess_time_start
     preprocess_other_time_sec = max(
@@ -904,8 +1117,10 @@ def main():
                 cached_batch_loader=cached_train_loader,
                 log_interval=args.log_interval,
                 importance_tracker=importance_tracker,
+                bam_policy=bam_policy,
+                bam_policy_cids=train_cids,
                 global_step_offset=total_train_iters,
-                collect_epoch_pairs=(enable_sample_cache and enable_sample_importance),
+                collect_epoch_pairs=enable_pads,
             )
             total_train_iters += epoch_train_iters
             submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
@@ -930,6 +1145,12 @@ def main():
                     f"{_format_importance_summary(importance_tracker.summary(args.importance_topk))}",
                     flush=True,
                 )
+            if bam_policy is not None:
+                print(
+                    f"[CIDS_BAM_POLICY] epoch={epoch + 1}/{args.epochs} "
+                    f"{_format_bam_policy_summary(bam_policy.summary())}",
+                    flush=True,
+                )
 
             if val_loader is not None:
                 val_loss, val_acc = evaluate(
@@ -945,40 +1166,84 @@ def main():
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
                     flush=True,
                 )
-            if enable_sample_cache and enable_sample_importance and epoch + 1 < args.epochs:
-                cache_summary = (
-                    cached_train_loader.cache_summary()
-                    if cached_train_loader is not None
-                    else None
+            if train_cids is not None:
+                print(
+                    f"[CIDS_BAM_CACHE] epoch={epoch + 1}/{args.epochs} begin",
+                    flush=True,
                 )
+                train_cids.BAM_FS.print_stats()
+                print(
+                    f"[CIDS_BAM_CACHE] epoch={epoch + 1}/{args.epochs} end",
+                    flush=True,
+                )
+            if enable_pads and epoch + 1 < args.epochs:
+                resident_lookup = None
+                if enable_bam_policy_cache:
+                    resident_lookup = _build_bam_resident_lookup(
+                        epoch_pairs=epoch_pairs,
+                        cids_loader=train_cids,
+                    )
+                elif enable_sample_cache:
+                    resident_lookup = _build_sample_cache_resident_lookup(
+                        epoch_pairs=epoch_pairs,
+                        sample_cache=sample_cache,
+                    )
+
+                observed_rate = _resident_rate(epoch_pairs, resident_lookup)
                 effective_rep_factor, pads_mode = _choose_pads_rep_factor(
                     base_rep_factor=pads_rep_factor,
                     adaptive_enabled=pads_adaptive,
-                    cache_summary=cache_summary,
+                    observed_rate=observed_rate,
                     prev_train_loss=prev_train_loss,
                     curr_train_loss=train_loss,
                 )
-                planned_pairs, pads_summary = _build_pads_next_epoch_plan(
-                    epoch_pairs=epoch_pairs,
-                    sample_cache=sample_cache,
-                    importance_tracker=importance_tracker,
-                    rep_factor=effective_rep_factor,
-                    shuffle_seed=epoch + 1,
-                )
+                if enable_bam_policy_cache and pads_planner is not None:
+                    planner_kwargs = dict(
+                        epoch_pairs=epoch_pairs,
+                        resident_lookup=resident_lookup,
+                        importance_tracker=importance_tracker,
+                        rep_factor=effective_rep_factor,
+                        shuffle_seed=epoch + 1,
+                        epoch_index=epoch + 1,
+                    )
+                    planned_pairs, pads_summary = pads_planner.build_next_epoch_plan(
+                        **planner_kwargs
+                    )
+                else:
+                    planned_pairs, pads_summary = _build_pads_next_epoch_plan(
+                        epoch_pairs=epoch_pairs,
+                        resident_lookup=resident_lookup,
+                        importance_tracker=importance_tracker,
+                        rep_factor=effective_rep_factor,
+                        shuffle_seed=epoch + 1,
+                        sampler_name=("bam_resident" if enable_bam_policy_cache else "sample_cache"),
+                    )
                 if planned_pairs is not None and pads_summary is not None:
                     pads_summary["base_rep_factor"] = float(pads_rep_factor)
                     pads_summary["effective_rep_factor"] = float(effective_rep_factor)
                     pads_summary["mode"] = pads_mode
-                    pads_summary["hit_rate"] = _cache_hit_rate(cache_summary)
+                    pads_summary["strategy"] = pads_strategy
+                    pads_summary["resident_rate"] = float(observed_rate)
+                    pads_summary["base_size"] = len(epoch_pairs) if epoch_pairs is not None else 0
                     print(
                         f"[CIDS_PADS] epoch={epoch + 1}/{args.epochs} "
                         f"{_format_pads_summary(pads_summary)}",
                         flush=True,
                     )
-                    _, train_loader = _build_planned_index_loader(
-                        epoch_pairs=planned_pairs,
-                        batch_size=args.batch_size,
-                    )
+                    if enable_bam_policy_cache:
+                        _, train_loader = _build_planned_cids_loader(
+                            epoch_pairs=planned_pairs,
+                            batch_size=args.batch_size,
+                            cids_loader=train_cids,
+                            prefetch_depth=args.prefetch_depth,
+                            io_mode=args.io_mode,
+                            registered_split=args.registered_split,
+                        )
+                    else:
+                        _, train_loader = _build_planned_index_loader(
+                            epoch_pairs=planned_pairs,
+                            batch_size=args.batch_size,
+                        )
             prev_train_loss = train_loss
     finally:
         _stop_profiler(profiler)
@@ -991,6 +1256,12 @@ def main():
             print(
                 f"[CIDS_IMPORTANCE_SUMMARY] "
                 f"{_format_importance_summary(importance_tracker.summary(args.importance_topk))}",
+                flush=True,
+            )
+        if bam_policy is not None:
+            print(
+                f"[CIDS_BAM_POLICY_SUMMARY] "
+                f"{_format_bam_policy_summary(bam_policy.summary())}",
                 flush=True,
             )
         total_train_time_sec = time.perf_counter() - train_time_start

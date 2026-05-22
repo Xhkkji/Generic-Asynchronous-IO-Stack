@@ -51,7 +51,9 @@ class ImageNetBatchPreprocessor:
                 interpolation=InterpolationMode.BILINEAR,
                 antialias=True,
             )
-            if torch.rand(1, device=image.device).item() < self.hflip_prob:
+            # 训练预处理功能：
+            # - 保持逐图随机翻转行为，registered 路径目前更依赖这类隐式节流
+            if self.hflip_prob > 0.0 and torch.rand(1, device=image.device).item() < self.hflip_prob:
                 image = torch.flip(image, dims=[2])
             processed.append(image)
         return self._normalize(torch.stack(processed, dim=0))

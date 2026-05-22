@@ -126,6 +126,12 @@ def _build_transform(dataset_name, preprocess_mode="legacy"):
                 return _pil_to_chw_float32(padded)
 
             return _transform, [3, 448, 448]
+        if preprocess_mode == "pad416":
+            def _transform(image):
+                padded = _resize_to_canvas_with_padding(image, (416, 416))
+                return _pil_to_chw_float32(padded)
+
+            return _transform, [3, 416, 416]
         raise ValueError(f"imagenet1k 不支持的 preprocess_mode: {preprocess_mode}")
 
     raise ValueError(f"不支持的数据集类型: {dataset_name}")
@@ -151,6 +157,7 @@ def prepare_cids_dataset(
     split,
     dtype_name,
     preprocess_mode="legacy",
+    align_page_size=0,
 ):
     # 把原始图片整理成固定尺寸 tensor，并按 sample_id 顺序线性写盘。
     dataset_name = dataset_name.lower()
@@ -170,6 +177,35 @@ def prepare_cids_dataset(
     meta_path = os.path.join(output_root, "meta.json")
 
     labels = np.empty(len(samples), dtype=np.int64)
+    dtype_to_itemsize = {
+        "uint8": 1,
+        "float16": 2,
+        "float32": 4,
+    }
+    itemsize = dtype_to_itemsize[dtype_name]
+    sample_dim = int(np.prod(sample_shape))
+    sample_bytes = sample_dim * itemsize
+    align_page_size = int(align_page_size)
+    if align_page_size < 0:
+        raise ValueError("align_page_size 不能小于 0")
+    if align_page_size and align_page_size % itemsize != 0:
+        raise ValueError(
+            f"align_page_size={align_page_size} 必须能整除 dtype itemsize={itemsize}"
+        )
+    storage_sample_bytes = sample_bytes
+    if align_page_size:
+        storage_sample_bytes = ((sample_bytes + align_page_size - 1) // align_page_size) * align_page_size
+    storage_sample_dim = storage_sample_bytes // itemsize
+    pad_dim = storage_sample_dim - sample_dim
+    pad_array = None
+    if pad_dim > 0:
+        if dtype_name == "uint8":
+            pad_dtype = np.uint8
+        elif dtype_name == "float16":
+            pad_dtype = np.float16
+        else:
+            pad_dtype = np.float32
+        pad_array = np.zeros((pad_dim,), dtype=pad_dtype)
 
     with open(images_path, "wb") as f:
         for sample_id, (image_path, label) in enumerate(samples):
@@ -182,6 +218,8 @@ def prepare_cids_dataset(
                     tensor = np.asarray(transformed, dtype=np.float32)
             array = _tensor_to_storage_array(tensor, dtype_name)
             array.tofile(f)
+            if pad_array is not None:
+                pad_array.tofile(f)
             labels[sample_id] = label
 
             if sample_id % 1000 == 0:
@@ -193,14 +231,6 @@ def prepare_cids_dataset(
 
     np.save(labels_path, labels)
 
-    dtype_to_itemsize = {
-        "uint8": 1,
-        "float16": 2,
-        "float32": 4,
-    }
-    sample_dim = int(np.prod(sample_shape))
-    sample_bytes = sample_dim * dtype_to_itemsize[dtype_name]
-
     meta = {
         "dataset": dataset_name,
         "split": split,
@@ -209,19 +239,23 @@ def prepare_cids_dataset(
         "dtype": dtype_name,
         "preprocess_mode": preprocess_mode,
         "sample_dim": sample_dim,
-        "sample_bytes": sample_bytes,
+        "sample_bytes": storage_sample_bytes,
         "images_file": "images.bin",
         "labels_file": "labels.npy",
         "classes": classes,
         "class_to_idx": class_to_idx,
     }
+    if align_page_size:
+        meta["logical_sample_bytes"] = sample_bytes
+        meta["aligned_page_size"] = align_page_size
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     print(
         f"[CIDS_PREP] 完成 dataset={dataset_name}, split={split}, "
         f"num_samples={len(samples)}, shape={sample_shape}, dtype={dtype_name}, "
-        f"preprocess_mode={preprocess_mode}",
+        f"preprocess_mode={preprocess_mode}, sample_bytes={sample_bytes}, "
+        f"storage_sample_bytes={storage_sample_bytes}",
         flush=True,
     )
 
@@ -250,9 +284,15 @@ def main():
     )
     parser.add_argument(
         "--preprocess-mode",
-        choices=["legacy", "pad448"],
+        choices=["legacy", "pad448", "pad416"],
         default="legacy",
-        help="图片预处理分支：legacy 为原来的 Resize256+CenterCrop224；pad448 为等比例缩小到 448 画布内后居中 padding",
+        help="图片预处理分支：legacy 为原来的 Resize256+CenterCrop224；pad448/pad416 为等比例缩小到固定画布内后居中 padding",
+    )
+    parser.add_argument(
+        "--align-page-size",
+        type=int,
+        default=0,
+        help="如果大于 0，则把每个 sample 在写盘时按该 page size 向上补齐。",
     )
     args = parser.parse_args()
 
@@ -263,6 +303,7 @@ def main():
         split=args.split,
         dtype_name=args.dtype,
         preprocess_mode=args.preprocess_mode,
+        align_page_size=args.align_page_size,
     )
 
 

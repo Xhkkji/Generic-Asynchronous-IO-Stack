@@ -257,6 +257,136 @@ void BAM_Feature_Store<TYPE>::print_stats()
 }
 
 template <typename TYPE>
+void BAM_Feature_Store<TYPE>::enable_bam_policy_cache(uint64_t num_pages)
+{
+  enable_bam_policy_cache_grouped(num_pages, 1);
+}
+
+template <typename TYPE>
+void BAM_Feature_Store<TYPE>::enable_bam_policy_cache_grouped(uint64_t num_policy_slots, uint64_t group_pages)
+{
+  if (h_pc == nullptr)
+  {
+    throw std::runtime_error("enable_bam_policy_cache_grouped 需要先完成 init_controllers");
+  }
+  if (num_policy_slots == 0)
+  {
+    throw std::runtime_error("enable_bam_policy_cache_grouped 需要正数 num_policy_slots");
+  }
+  if (group_pages == 0)
+  {
+    throw std::runtime_error("enable_bam_policy_cache_grouped 需要正数 group_pages");
+  }
+  h_pc->enable_policy_cache_grouped(num_policy_slots, group_pages);
+  bam_policy_enabled = true;
+  bam_policy_pages = num_policy_slots;
+}
+
+template <typename TYPE>
+void BAM_Feature_Store<TYPE>::update_bam_policy_scores(const std::vector<uint64_t> &page_ids, const std::vector<float> &scores)
+{
+  if (!bam_policy_enabled || h_pc == nullptr)
+  {
+    return;
+  }
+  if (page_ids.size() != scores.size())
+  {
+    throw std::runtime_error("update_bam_policy_scores 需要等长的 page_ids 和 scores");
+  }
+  for (size_t i = 0; i < page_ids.size(); ++i)
+  {
+    const uint64_t page_id = page_ids[i];
+    if (page_id >= bam_policy_pages)
+    {
+      continue;
+    }
+    h_pc->update_policy_score(page_id, scores[i]);
+  }
+}
+
+template <typename TYPE>
+void BAM_Feature_Store<TYPE>::update_bam_policy_scores_device(uint64_t scores_ptr, uint64_t num_pages)
+{
+  if (!bam_policy_enabled || h_pc == nullptr)
+  {
+    return;
+  }
+  const uint64_t copy_pages = num_pages < bam_policy_pages ? num_pages : bam_policy_pages;
+  if (copy_pages == 0)
+  {
+    return;
+  }
+  float *src_scores = reinterpret_cast<float *>(scores_ptr);
+  cuda_err_chk(cudaMemcpy(
+      h_pc->pdt.policy_scores,
+      src_scores,
+      copy_pages * sizeof(float),
+      cudaMemcpyDeviceToDevice));
+}
+
+template <typename TYPE>
+__global__ void query_sample_residency_kernel(
+    range_d_t<TYPE> *range,
+    const int64_t *sample_ids,
+    uint8_t *out_resident,
+    uint64_t num_samples,
+    uint64_t pages_per_sample)
+{
+  const uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= num_samples)
+  {
+    return;
+  }
+
+  const uint64_t sample_id = static_cast<uint64_t>(sample_ids[idx]);
+  const uint64_t base_page = sample_id * pages_per_sample;
+  bool resident = true;
+
+  // 训练调度功能：
+  // - 把一个 sample 视为一组连续 row/page
+  // - 只有整组都 valid，才把这个 sample 当成 resident
+  for (uint64_t page_idx = 0; page_idx < pages_per_sample; ++page_idx)
+  {
+    const uint64_t read_state =
+        range->pages[base_page + page_idx].state.load(simt::memory_order_acquire);
+    const uint64_t state = (read_state >> (CNT_SHIFT + 1)) & 0x03;
+    if (state != V_NB)
+    {
+      resident = false;
+      break;
+    }
+  }
+
+  out_resident[idx] = resident ? 1 : 0;
+}
+
+template <typename TYPE>
+void BAM_Feature_Store<TYPE>::query_sample_residency_device(
+    uint64_t sample_ids_ptr,
+    uint64_t num_samples,
+    uint64_t pages_per_sample,
+    uint64_t out_ptr)
+{
+  if (d_range == nullptr || num_samples == 0 || pages_per_sample == 0)
+  {
+    return;
+  }
+
+  const auto *sample_ids = reinterpret_cast<const int64_t *>(sample_ids_ptr);
+  auto *out_resident = reinterpret_cast<uint8_t *>(out_ptr);
+  constexpr uint64_t kBlockSize = 256;
+  const uint64_t grid_size = (num_samples + kBlockSize - 1) / kBlockSize;
+
+  query_sample_residency_kernel<<<grid_size, kBlockSize>>>(
+      d_range,
+      sample_ids,
+      out_resident,
+      num_samples,
+      pages_per_sample);
+  cuda_err_chk(cudaDeviceSynchronize());
+}
+
+template <typename TYPE>
 void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
                                            int64_t num_index, int dim, int cache_dim, uint64_t key_off = 0)
 {
@@ -272,137 +402,17 @@ void BAM_Feature_Store<TYPE>::read_feature(uint64_t i_ptr, uint64_t i_index_ptr,
   if (cpu_buffer_flag == false)
   {
     static bool logged_sync_mode = false;
-    if (env_flag_enabled("GIDS_FORCE_SYNC_READ"))
+    // sync 读取功能：
+    // - read_feature 固定代表同步读取
+    // - async/registered 读取走独立的 submit/poll/get 接口
+    if (!logged_sync_mode)
     {
-      // printf("read_feature..\n");
-      if (!logged_sync_mode)
-      {
-        printf("read_feature mode: sync baseline via read_feature_kernel\n");
-        logged_sync_mode = true;
-      }
-
-      read_feature_kernel<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-                                                    index_ptr, dim, num_index, cache_dim, key_off);
-      cuda_err_chk(cudaDeviceSynchronize());
+      printf("read_feature mode: sync baseline via read_feature_kernel\n");
+      logged_sync_mode = true;
     }
-    else
-    {
-      printf("read_feature async kernel..\n");
-      s_ctx *d_warp_ctxs; // 设备端的全局warp上下文数组,一个warp持有一个上下文ctx
-
-      // 计算总warp数
-      uint64_t warps_per_block = b_size / 32;
-      uint64_t total_warps = g_size * warps_per_block; // 43337 * 4 = 173348
-      // 分配设备内存
-      cudaMalloc(&d_warp_ctxs, total_warps * sizeof(s_ctx));
-      cudaMemset(d_warp_ctxs, 0, total_warps * sizeof(s_ctx));
-
-      read_feature_kernel_submit_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr,
-                                                                 index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
-      // 等待submit完成
-      cudaDeviceSynchronize();
-      dump_warp_ctxs("submit", d_warp_ctxs, total_warps);
-
-      read_feature_kernel_wait_async<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
-                                                               index_ptr, dim, num_index, cache_dim, 0, d_warp_ctxs);
-      cuda_err_chk(cudaDeviceSynchronize());
-      dump_warp_ctxs("wait", d_warp_ctxs, total_warps);
-
-      const int64_t requested_debug_rows = static_cast<int64_t>(env_u64("GIDS_ASYNC_DEBUG_ROWS", kAsyncDebugRows));
-      const int requested_debug_dims = static_cast<int>(env_u64("GIDS_ASYNC_DEBUG_DIMS", kAsyncDebugDims));
-      const int64_t debug_rows = num_index < requested_debug_rows ? num_index : requested_debug_rows;
-      const int debug_dims = dim < requested_debug_dims ? dim : requested_debug_dims;
-      if (debug_rows > 0 && debug_dims > 0)
-      {
-        TYPE *ref_tensor_ptr = nullptr;
-        const size_t debug_elems = static_cast<size_t>(debug_rows) * static_cast<size_t>(dim);
-        cuda_err_chk(cudaMalloc(&ref_tensor_ptr, sizeof(TYPE) * debug_elems));
-
-        const uint64_t debug_g_size = (debug_rows + n_warp - 1) / n_warp;
-        read_feature_kernel<TYPE><<<debug_g_size, b_size>>>(a->d_array_ptr, ref_tensor_ptr,
-                                                            index_ptr, dim, debug_rows, cache_dim, key_off);
-        cuda_err_chk(cudaDeviceSynchronize());
-
-        std::vector<TYPE> h_async(debug_elems);
-        std::vector<TYPE> h_ref(debug_elems);
-        cuda_err_chk(cudaMemcpy(h_async.data(), tensor_ptr, sizeof(TYPE) * debug_elems, cudaMemcpyDeviceToHost));
-        cuda_err_chk(cudaMemcpy(h_ref.data(), ref_tensor_ptr, sizeof(TYPE) * debug_elems, cudaMemcpyDeviceToHost));
-
-        int mismatch_count = 0;
-        std::vector<int> row_mismatch_counts(static_cast<size_t>(debug_rows), 0);
-        for (size_t idx = 0; idx < debug_elems; ++idx)
-        {
-          if (!debug_values_equal(h_async[idx], h_ref[idx]))
-          {
-            ++mismatch_count;
-            const size_t row = idx / static_cast<size_t>(dim);
-            ++row_mismatch_counts[row];
-          }
-        }
-
-        int mismatch_rows = 0;
-        for (int row_mismatch_count : row_mismatch_counts)
-        {
-          if (row_mismatch_count != 0)
-          {
-            ++mismatch_rows;
-          }
-        }
-
-        printf("async debug: rows=%lld dims=%d mismatches=%d/%zu mismatch_rows=%d\n",
-               (long long)debug_rows,
-               debug_dims,
-               mismatch_count,
-               debug_elems,
-               mismatch_rows);
-        if (mismatch_count != 0)
-        {
-          for (int64_t row = 0; row < debug_rows; ++row)
-          {
-            const int row_mismatches = row_mismatch_counts[static_cast<size_t>(row)];
-            if (row_mismatches == 0)
-            {
-              continue;
-            }
-
-            printf("  row %lld async (mismatches=%d):",
-                   (long long)row,
-                   row_mismatches);
-            for (int col = 0; col < debug_dims; ++col)
-            {
-              const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col);
-              debug_print_value(h_async[offset]);
-            }
-            printf("\n");
-
-            printf("  row %lld  ref:", (long long)row);
-            for (int col = 0; col < debug_dims; ++col)
-            {
-              const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col);
-              debug_print_value(h_ref[offset]);
-            }
-            printf("\n");
-          }
-        }
-
-        cudaFree(ref_tensor_ptr);
-      }
-
-      // clear_cache_kernel<TYPE><<<1, 1>>>(h_pc->d_pc_ptr);
-      // {
-        // constexpr uint64_t clear_pages_block_size = 256;
-        // const uint64_t clear_pages_count = h_range->rdt.page_count;
-        // const uint64_t clear_pages_grid_size =
-        //     (clear_pages_count + clear_pages_block_size - 1) / clear_pages_block_size;
-        
-        // print_pages_ref_count_kernel<<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
-        // clear_range_pages_kernel<TYPE><<<clear_pages_grid_size, clear_pages_block_size>>>(d_range);
-      // }
-      // const uint64_t clear_pages_count = h_range->rdt.page_count;
-
-      if (d_warp_ctxs != nullptr)
-        cudaFree(d_warp_ctxs);
-    }
+    read_feature_kernel<TYPE><<<g_size, b_size>>>(a->d_array_ptr, tensor_ptr,
+                                                  index_ptr, dim, num_index, cache_dim, key_off);
+    cuda_err_chk(cudaDeviceSynchronize());
   }
   else
   {
@@ -1828,6 +1838,11 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("set_cpu_buffer", &BAM_Feature_Store<float>::set_cpu_buffer)
 
       .def("flush_cache", &BAM_Feature_Store<float>::flush_cache)
+      .def("enable_bam_policy_cache", &BAM_Feature_Store<float>::enable_bam_policy_cache)
+      .def("enable_bam_policy_cache_grouped", &BAM_Feature_Store<float>::enable_bam_policy_cache_grouped)
+      .def("update_bam_policy_scores", &BAM_Feature_Store<float>::update_bam_policy_scores)
+      .def("update_bam_policy_scores_device", &BAM_Feature_Store<float>::update_bam_policy_scores_device)
+      .def("query_sample_residency_device", &BAM_Feature_Store<float>::query_sample_residency_device)
       .def("store_tensor", &BAM_Feature_Store<float>::store_tensor)
       .def("read_tensor", &BAM_Feature_Store<float>::read_tensor)
 
@@ -1873,6 +1888,11 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("set_cpu_buffer", &BAM_Feature_Store<uint8_t>::set_cpu_buffer)
 
       .def("flush_cache", &BAM_Feature_Store<uint8_t>::flush_cache)
+      .def("enable_bam_policy_cache", &BAM_Feature_Store<uint8_t>::enable_bam_policy_cache)
+      .def("enable_bam_policy_cache_grouped", &BAM_Feature_Store<uint8_t>::enable_bam_policy_cache_grouped)
+      .def("update_bam_policy_scores", &BAM_Feature_Store<uint8_t>::update_bam_policy_scores)
+      .def("update_bam_policy_scores_device", &BAM_Feature_Store<uint8_t>::update_bam_policy_scores_device)
+      .def("query_sample_residency_device", &BAM_Feature_Store<uint8_t>::query_sample_residency_device)
       .def("store_tensor", &BAM_Feature_Store<uint8_t>::store_tensor)
       .def("read_tensor", &BAM_Feature_Store<uint8_t>::read_tensor)
 
@@ -1917,6 +1937,11 @@ PYBIND11_MODULE(BAM_Feature_Store, m)
       .def("set_cpu_buffer", &BAM_Feature_Store<int64_t>::set_cpu_buffer)
 
       .def("flush_cache", &BAM_Feature_Store<int64_t>::flush_cache)
+      .def("enable_bam_policy_cache", &BAM_Feature_Store<int64_t>::enable_bam_policy_cache)
+      .def("enable_bam_policy_cache_grouped", &BAM_Feature_Store<int64_t>::enable_bam_policy_cache_grouped)
+      .def("update_bam_policy_scores", &BAM_Feature_Store<int64_t>::update_bam_policy_scores)
+      .def("update_bam_policy_scores_device", &BAM_Feature_Store<int64_t>::update_bam_policy_scores_device)
+      .def("query_sample_residency_device", &BAM_Feature_Store<int64_t>::query_sample_residency_device)
       .def("store_tensor", &BAM_Feature_Store<int64_t>::store_tensor)
       .def("read_tensor", &BAM_Feature_Store<int64_t>::read_tensor)
 
