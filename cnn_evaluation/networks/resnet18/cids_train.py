@@ -27,6 +27,7 @@ from cids_resnet18 import build_resnet18
 from cids_image_transforms import ImageNetBatchPreprocessor
 from cache_runtime import (
     BAMPADSPlanner,
+    LogicalHotsetPADSPlanner,
     ShadePADSPlanner,
     GPUBAMPolicy,
     CachedCIDSBatchLoader,
@@ -355,6 +356,38 @@ def _format_bam_policy_summary(summary):
     )
 
 
+def _zero_stage_times():
+    # Stage 口径：
+    # - route: 策略/调度，包括 request submit 与 epoch 末重排
+    # - extract: 数据取回、4-row 组装、to(device)、预处理
+    # - compute: forward/backward/update 主训练计算
+    # - apply: step 结果落账、分数/importance/policy/reuse 元数据更新
+    # - io_stall: registered/sync 路径显式暴露出来的等待时间
+    return {
+        "route_time_sec": 0.0,
+        "extract_time_sec": 0.0,
+        "compute_time_sec": 0.0,
+        "apply_time_sec": 0.0,
+        "io_stall_time_sec": 0.0,
+    }
+
+
+def _merge_stage_times(dst, src):
+    for key in dst.keys():
+        dst[key] += float(src.get(key, 0.0))
+    return dst
+
+
+def _format_stage_times(stage_times):
+    return (
+        f"Route={stage_times['route_time_sec']:.4f}s "
+        f"Extract={stage_times['extract_time_sec']:.4f}s "
+        f"Compute={stage_times['compute_time_sec']:.4f}s "
+        f"Apply={stage_times['apply_time_sec']:.4f}s "
+        f"IOStall={stage_times['io_stall_time_sec']:.4f}s"
+    )
+
+
 def _importance_score_for_sample(importance_tracker, sample_id):
     if importance_tracker is None:
         return 0.0
@@ -484,6 +517,13 @@ def _format_pads_summary(summary):
         f"ghost_candidates={summary.get('ghost_candidates', 0)} "
         f"ghost_admissions={summary.get('ghost_admissions', 0)} "
         f"ghost_rejections={summary.get('ghost_rejections', 0)} "
+        f"hotset_size={summary.get('hotset_size', 0)} "
+        f"hotset_target_size={summary.get('hotset_target_size', 0)} "
+        f"hotset_retained={summary.get('hotset_retained', 0)} "
+        f"hotset_newcomers={summary.get('hotset_newcomers', 0)} "
+        f"hotset_resident_overlap={summary.get('hotset_resident_overlap', 0)} "
+        f"locality_window_batches={summary.get('locality_window_batches', 0)} "
+        f"locality_hot_draws={summary.get('locality_hot_draws', 0)} "
         f"planned_size={summary.get('planned_size', 0)}"
     )
 
@@ -599,17 +639,25 @@ def train_one_epoch(
 ):
     # 最小训练循环：只做前向、反向、优化和简单精度统计。
     model.train()
-    # 统计功能：
-    # - 把聚合值保留在 GPU 上，按日志点再转成 Python 标量
-    # - 避免每个 step 都触发 .item() 同步
     total_loss = torch.zeros((), device=device, dtype=torch.float32)
     total_correct = torch.zeros((), device=device, dtype=torch.float32)
     total_samples = 0
     steps_ran = 0
     epoch_pairs = [] if collect_epoch_pairs else None
+    stage_times = _zero_stage_times()
+    data_iter = iter(dataloader)
 
-    for step_idx, raw_batch in enumerate(dataloader, start=1):
+    while True:
+        fetch_start_time = time.perf_counter()
+        try:
+            raw_batch = next(data_iter)
+        except StopIteration:
+            break
+        stage_times["extract_time_sec"] += time.perf_counter() - fetch_start_time
+        step_idx = steps_ran + 1
         steps_ran = step_idx
+
+        extract_start_time = time.perf_counter()
         sample_ids = None
         raw_labels = None
         if importance_tracker is not None or bam_policy is not None:
@@ -623,12 +671,17 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         images = image_preprocessor.train(images)
         labels = _move_labels_to_device(labels, device)
+        stage_times["extract_time_sec"] += time.perf_counter() - extract_start_time
 
+        compute_start_time = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         logits = model(images)
         sample_losses = F.cross_entropy(logits, labels, reduction="none")
         loss = sample_losses.mean()
+        compute_prefix_time = time.perf_counter() - compute_start_time
+
         sample_scores = None
+        apply_start_time = time.perf_counter()
         if sample_ids is not None and (importance_tracker is not None or bam_policy is not None):
             sample_scores = _compute_batch_rank_scores(sample_losses)
         if importance_tracker is not None and sample_ids is not None:
@@ -651,9 +704,14 @@ def train_one_epoch(
             bam_policy.update_from_batch(sample_ids, sample_scores)
             if bam_policy_cids is not None:
                 bam_policy.sync_to_bam(bam_policy_cids)
+        stage_times["apply_time_sec"] += time.perf_counter() - apply_start_time
+
+        compute_suffix_start_time = time.perf_counter()
         loss.backward()
         optimizer.step()
+        stage_times["compute_time_sec"] += compute_prefix_time + (time.perf_counter() - compute_suffix_start_time)
 
+        apply_tail_start_time = time.perf_counter()
         total_loss += loss.item() * images.size(0)
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
         total_samples += images.size(0)
@@ -668,12 +726,18 @@ def train_one_epoch(
             )
         if profiler is not None:
             profiler.step()
+        # 这部分属于所有分支共有的“结果落账/状态应用”：
+        # - 从本 step 结果提取标量
+        # - 更新运行期指标
+        # - profiler 结算当前 step
+        # 有 policy 的分支会在前面的 apply 块上再叠加 importance/bam policy 成本。
+        stage_times["apply_time_sec"] += time.perf_counter() - apply_tail_start_time
         if max_iters is not None and step_idx >= max_iters:
             break
 
     avg_loss = total_loss / max(1, total_samples)
     avg_acc = total_correct / max(1, total_samples)
-    return avg_loss, avg_acc, steps_ran, epoch_pairs
+    return avg_loss, avg_acc, steps_ran, epoch_pairs, stage_times
 
 
 @torch.no_grad()
@@ -821,9 +885,9 @@ def main():
     )
     parser.add_argument(
         "--pads-strategy",
-        choices=["replace", "shade"],
+        choices=["replace", "shade", "hotset"],
         default="replace",
-        help="PADS resident 调度策略：replace 为轻量替换，shade 为按 locality 聚簇的 resident replay。",
+        help="PADS resident 调度策略：replace 为轻量替换，shade 为 locality replay，hotset 为逻辑热集混合采样。",
     )
     parser.add_argument(
         "--pads-bias-scale",
@@ -885,14 +949,19 @@ def main():
     # planner 参数：
     # - replace: 旧的 epoch 级轻替换
     # - shade: 更接近 SHADE 的 resident replay + locality 聚簇
+    # - hotset: 逻辑 importance/hotset 主导，resident 只做低频校准
     if args.pads_bias_scale >= 0.0:
         pads_bias_scale = float(args.pads_bias_scale)
+    elif pads_strategy == "hotset":
+        pads_bias_scale = 0.0625 if args.io_mode == "registered" else 0.10
     elif pads_strategy == "shade":
         pads_bias_scale = 0.35
     else:
         pads_bias_scale = 0.15 if args.io_mode == "registered" else 0.25
     if args.pads_max_replace_fraction >= 0.0:
         pads_max_replace_fraction = float(args.pads_max_replace_fraction)
+    elif pads_strategy == "hotset":
+        pads_max_replace_fraction = 0.008 if args.io_mode == "registered" else 0.015
     elif pads_strategy == "shade":
         pads_max_replace_fraction = 0.008 if args.io_mode == "registered" else 0.03
     else:
@@ -906,7 +975,14 @@ def main():
             ema_alpha=args.importance_ema_alpha,
         )
     if enable_pads:
-        if pads_strategy == "shade":
+        if pads_strategy == "hotset":
+            pads_planner = LogicalHotsetPADSPlanner(
+                hot_fraction=pads_bias_scale,
+                max_replace_fraction=pads_max_replace_fraction,
+                hotset_size_scale=1.0,
+                locality_window_batches=4 if args.io_mode == "registered" else 2,
+            )
+        elif pads_strategy == "shade":
             pads_planner = ShadePADSPlanner(
                 replay_bias_scale=pads_bias_scale,
                 max_replace_fraction=pads_max_replace_fraction,
@@ -1108,10 +1184,14 @@ def main():
     )
     total_train_iters = 0
     prev_train_loss = None
+    total_stage_times = _zero_stage_times()
     train_time_start = time.perf_counter()
     try:
         for epoch in range(args.epochs):
-            train_loss, train_acc, epoch_train_iters, epoch_pairs = train_one_epoch(
+            epoch_stage_times = _zero_stage_times()
+            submit_time_before = train_cids.GIDS_submit_time if train_cids is not None else 0.0
+            wait_time_before = train_cids.GIDS_wait_time if train_cids is not None else 0.0
+            train_loss, train_acc, epoch_train_iters, epoch_pairs, train_stage_times = train_one_epoch(
                 model, train_loader, optimizer, criterion, device, image_preprocessor,
                 profiler=profiler, max_iters=max_train_iters,
                 cached_batch_loader=cached_train_loader,
@@ -1125,6 +1205,16 @@ def main():
             total_train_iters += epoch_train_iters
             submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
             wait_time = train_cids.GIDS_wait_time if train_cids is not None else 0.0
+            submit_time_delta = max(0.0, submit_time - submit_time_before)
+            wait_time_delta = max(0.0, wait_time - wait_time_before)
+            epoch_stage_times["route_time_sec"] += submit_time_delta
+            epoch_stage_times["io_stall_time_sec"] += wait_time_delta
+            epoch_stage_times["extract_time_sec"] += max(
+                0.0,
+                train_stage_times["extract_time_sec"] - submit_time_delta - wait_time_delta,
+            )
+            epoch_stage_times["compute_time_sec"] += train_stage_times["compute_time_sec"]
+            epoch_stage_times["apply_time_sec"] += train_stage_times["apply_time_sec"]
             print(
                 f"[CIDS_TRAIN] epoch={epoch + 1}/{args.epochs} "
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
@@ -1177,6 +1267,7 @@ def main():
                     flush=True,
                 )
             if enable_pads and epoch + 1 < args.epochs:
+                pads_stage_start_time = time.perf_counter()
                 resident_lookup = None
                 if enable_bam_policy_cache:
                     resident_lookup = _build_bam_resident_lookup(
@@ -1206,9 +1297,15 @@ def main():
                         shuffle_seed=epoch + 1,
                         epoch_index=epoch + 1,
                     )
-                    planned_pairs, pads_summary = pads_planner.build_next_epoch_plan(
-                        **planner_kwargs
-                    )
+                    if pads_strategy == "hotset":
+                        planned_pairs, pads_summary = pads_planner.build_next_epoch_plan(
+                            batch_size=args.batch_size,
+                            **planner_kwargs,
+                        )
+                    else:
+                        planned_pairs, pads_summary = pads_planner.build_next_epoch_plan(
+                            **planner_kwargs
+                        )
                 else:
                     planned_pairs, pads_summary = _build_pads_next_epoch_plan(
                         epoch_pairs=epoch_pairs,
@@ -1244,6 +1341,13 @@ def main():
                             epoch_pairs=planned_pairs,
                             batch_size=args.batch_size,
                         )
+                epoch_stage_times["route_time_sec"] += time.perf_counter() - pads_stage_start_time
+            print(
+                f"[CIDS_STAGE] epoch={epoch + 1}/{args.epochs} "
+                f"{_format_stage_times(epoch_stage_times)}",
+                flush=True,
+            )
+            _merge_stage_times(total_stage_times, epoch_stage_times)
             prev_train_loss = train_loss
     finally:
         _stop_profiler(profiler)
@@ -1276,6 +1380,10 @@ def main():
             f"total_train_time_sec={total_train_time_sec:.4f} "
             f"total_end_to_end_time_sec={total_end_to_end_time_sec:.4f} "
             f"total_train_iters={total_train_iters}",
+            flush=True,
+        )
+        print(
+            f"[CIDS_STAGE_SUMMARY] {_format_stage_times(total_stage_times)}",
             flush=True,
         )
 

@@ -431,3 +431,306 @@ class ShadePADSPlanner(BAMPADSPlanner):
             "locality_clusters": int(locality_clusters),
             "locality_window": int(self.locality_window),
         }
+
+
+class LogicalHotsetPADSPlanner:
+    # 逻辑 hotset 调度：
+    # - 主策略来源是 sample-level importance 表，而不是瞬时物理 resident 集
+    # - resident lookup 只在 epoch 边界做一次低频校准，用来估计 hotset 容量
+    # - 每个 batch 混入少量逻辑 hot sample，其余仍然保留随机/原始覆盖
+    def __init__(
+        self,
+        hot_fraction=0.0625,
+        max_replace_fraction=0.008,
+        hotset_size_scale=1.0,
+        locality_window_batches=4,
+    ):
+        self.hot_fraction = max(0.0, float(hot_fraction))
+        self.max_replace_fraction = max(0.0, float(max_replace_fraction))
+        self.hotset_size_scale = max(0.1, float(hotset_size_scale))
+        self.locality_window_batches = max(0, int(locality_window_batches))
+        self._hotset_ids = []
+
+    def _target_hotset_size(self, epoch_pairs, resident_lookup):
+        unique_epoch_ids = {int(sample_id) for sample_id, _ in epoch_pairs}
+        resident_unique = 0
+        if resident_lookup is not None:
+            resident_unique = sum(
+                1 for sample_id in unique_epoch_ids
+                if resident_lookup.get(int(sample_id), False)
+            )
+        if resident_unique > 0:
+            base_size = resident_unique
+        elif self._hotset_ids:
+            base_size = len(self._hotset_ids)
+        else:
+            base_size = min(len(unique_epoch_ids), 8192)
+        target_size = min(
+            len(unique_epoch_ids),
+            max(1, int(round(base_size * self.hotset_size_scale))),
+        )
+        return int(target_size), int(resident_unique)
+
+    def _rebuild_hotset(self, importance_tracker, target_size):
+        if importance_tracker is None or target_size <= 0:
+            self._hotset_ids = []
+            return [], 0, 0
+        prev_hotset = set(int(sample_id) for sample_id in self._hotset_ids)
+        top_items = importance_tracker.topk(target_size)
+        hotset_ids = [int(sample_id) for sample_id, _ in top_items]
+        retained = sum(1 for sample_id in hotset_ids if sample_id in prev_hotset)
+        newcomers = max(0, len(hotset_ids) - retained)
+        self._hotset_ids = list(hotset_ids)
+        return list(hotset_ids), int(retained), int(newcomers)
+
+    def _epoch_budget(self, epoch_size, hot_count, batch_size, rep_factor):
+        if epoch_size <= 0 or hot_count <= 0 or batch_size <= 0:
+            return 0, 0, 0
+        num_batches = (int(epoch_size) + int(batch_size) - 1) // int(batch_size)
+        batch_hot_quota = max(0, int(round(int(batch_size) * self.hot_fraction)))
+        quota_budget = num_batches * batch_hot_quota
+        scaled_budget = int(round(quota_budget * max(0.0, float(rep_factor) - 1.0)))
+        capped_budget = int(round(int(epoch_size) * self.max_replace_fraction))
+        total_budget = min(int(hot_count), int(capped_budget), int(scaled_budget))
+        return int(total_budget), int(batch_hot_quota), int(num_batches)
+
+    def _select_replace_positions(self, batch_pairs, importance_tracker, hotset_ids, quota):
+        if quota <= 0:
+            return []
+        hotset_ids = set(int(sample_id) for sample_id in hotset_ids)
+        ranked_positions = []
+        for local_idx, (sample_id, _label) in enumerate(batch_pairs):
+            sample_id = int(sample_id)
+            score = _importance_score(importance_tracker, sample_id)
+            ranked_positions.append(
+                (
+                    0 if sample_id not in hotset_ids else 1,
+                    float(score),
+                    int(local_idx),
+                )
+            )
+        ranked_positions.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [int(local_idx) for _hot_flag, _score, local_idx in ranked_positions[:quota]]
+
+    def _draw_bonus_pairs(self, candidate_entries, excluded_ids, quota, generator):
+        if quota <= 0:
+            return [], 0
+        filtered = [
+            entry for entry in candidate_entries
+            if not entry["used"] and entry["sample_id"] not in excluded_ids
+        ]
+        if not filtered:
+            return [], 0
+        sample_count = min(int(quota), len(filtered))
+        weights = torch.as_tensor(
+            [max(1e-6, float(entry["score"])) for entry in filtered],
+            dtype=torch.float32,
+        )
+        sampled_idx = torch.multinomial(
+            weights,
+            sample_count,
+            replacement=False,
+            generator=generator,
+        ).view(-1).tolist()
+        selected = [filtered[int(idx)] for idx in sampled_idx]
+        for entry in selected:
+            entry["used"] = True
+        return [entry["pair"] for entry in selected], int(sample_count)
+
+    def build_next_epoch_plan(
+        self,
+        epoch_pairs,
+        resident_lookup,
+        importance_tracker,
+        rep_factor,
+        shuffle_seed,
+        epoch_index,
+        batch_size,
+    ):
+        if not epoch_pairs or importance_tracker is None:
+            return None, None
+
+        target_hotset_size, resident_unique = self._target_hotset_size(epoch_pairs, resident_lookup)
+        hotset_ids, hotset_retained, hotset_newcomers = self._rebuild_hotset(
+            importance_tracker=importance_tracker,
+            target_size=target_hotset_size,
+        )
+        if not hotset_ids:
+            return list(epoch_pairs), {
+                "sampler": "logical_hotset",
+                "resident_rate": 0.0 if resident_lookup is None else 0.0,
+                "resident_count": 0,
+                "nonresident_count": len(epoch_pairs),
+                "resident_unique": 0,
+                "nonresident_unique": len({int(sample_id) for sample_id, _ in epoch_pairs}),
+                "boosted_resident": 0,
+                "resident_duplicates": 0,
+                "weighted_resident_draws": 0,
+                "replaced_nonresident": 0,
+                "batch_resident_fraction": float(self.hot_fraction),
+                "batch_resident_quota": 0,
+                "planned_size": len(epoch_pairs),
+                "hotset_size": 0,
+                "hotset_target_size": int(target_hotset_size),
+                "hotset_retained": int(hotset_retained),
+                "hotset_newcomers": int(hotset_newcomers),
+                "hotset_resident_overlap": 0,
+                "locality_window_batches": int(self.locality_window_batches),
+                "locality_hot_draws": 0,
+                "ghost_size": 0,
+                "ghost_candidates": 0,
+                "ghost_admissions": 0,
+                "ghost_rejections": 0,
+            }
+
+        hotset_id_set = set(int(sample_id) for sample_id in hotset_ids)
+        resident_count = sum(
+            1 for sample_id, _label in epoch_pairs
+            if resident_lookup is not None and resident_lookup.get(int(sample_id), False)
+        )
+        nonresident_count = len(epoch_pairs) - resident_count
+        hot_entries = []
+        for entry_idx, (sample_id, label) in enumerate(epoch_pairs):
+            sample_id = int(sample_id)
+            if sample_id not in hotset_id_set:
+                continue
+            hot_entries.append(
+                {
+                    "sample_id": sample_id,
+                    "pair": (sample_id, int(label)),
+                    "score": _importance_score(importance_tracker, sample_id),
+                    "home_batch": int(entry_idx) // max(1, int(batch_size)),
+                    "used": False,
+                }
+            )
+        hot_entries.sort(key=lambda item: float(item["score"]), reverse=True)
+
+        total_budget, batch_hot_quota, num_batches = self._epoch_budget(
+            epoch_size=len(epoch_pairs),
+            hot_count=len(hot_entries),
+            batch_size=batch_size,
+            rep_factor=rep_factor,
+        )
+        if total_budget <= 0 or batch_hot_quota <= 0:
+            return list(epoch_pairs), {
+                "sampler": "logical_hotset",
+                "resident_rate": resident_count / max(1, len(epoch_pairs)),
+                "resident_count": int(resident_count),
+                "nonresident_count": int(nonresident_count),
+                "resident_unique": int(resident_unique),
+                "nonresident_unique": len({int(sample_id) for sample_id, _ in epoch_pairs}) - int(resident_unique),
+                "boosted_resident": 0,
+                "resident_duplicates": 0,
+                "weighted_resident_draws": 0,
+                "replaced_nonresident": 0,
+                "batch_resident_fraction": float(self.hot_fraction),
+                "batch_resident_quota": int(batch_hot_quota),
+                "planned_size": len(epoch_pairs),
+                "hotset_size": len(hotset_ids),
+                "hotset_target_size": int(target_hotset_size),
+                "hotset_retained": int(hotset_retained),
+                "hotset_newcomers": int(hotset_newcomers),
+                "hotset_resident_overlap": sum(
+                    1 for sample_id in hotset_id_set
+                    if resident_lookup is not None and resident_lookup.get(int(sample_id), False)
+                ),
+                "locality_window_batches": int(self.locality_window_batches),
+                "locality_hot_draws": 0,
+                "ghost_size": 0,
+                "ghost_candidates": 0,
+                "ghost_admissions": 0,
+                "ghost_rejections": 0,
+            }
+
+        planned_pairs = list(epoch_pairs)
+        generator = torch.Generator()
+        generator.manual_seed(int(shuffle_seed))
+        used_budget = 0
+        locality_hot_draws = 0
+        for batch_idx in range(num_batches):
+            start = int(batch_idx) * int(batch_size)
+            end = min(len(epoch_pairs), start + int(batch_size))
+            batch_pairs = list(planned_pairs[start:end])
+            target_used = int(round((batch_idx + 1) * total_budget / max(1, num_batches)))
+            batch_budget = min(
+                int(batch_hot_quota),
+                max(0, target_used - used_budget),
+            )
+            if batch_budget <= 0:
+                continue
+
+            replace_positions = self._select_replace_positions(
+                batch_pairs=batch_pairs,
+                importance_tracker=importance_tracker,
+                hotset_ids=hotset_id_set,
+                quota=batch_budget,
+            )
+            if not replace_positions:
+                continue
+
+            batch_sample_ids = {int(sample_id) for sample_id, _label in batch_pairs}
+            local_candidates = [
+                entry for entry in hot_entries
+                if abs(int(entry["home_batch"]) - int(batch_idx)) <= self.locality_window_batches
+            ]
+            bonus_pairs, local_draws = self._draw_bonus_pairs(
+                candidate_entries=local_candidates,
+                excluded_ids=batch_sample_ids,
+                quota=len(replace_positions),
+                generator=generator,
+            )
+            if len(bonus_pairs) < len(replace_positions):
+                fallback_bonus, _fallback_count = self._draw_bonus_pairs(
+                    candidate_entries=hot_entries,
+                    excluded_ids=batch_sample_ids,
+                    quota=len(replace_positions) - len(bonus_pairs),
+                    generator=generator,
+                )
+                bonus_pairs.extend(fallback_bonus)
+            actual_replace = min(len(replace_positions), len(bonus_pairs))
+            if actual_replace <= 0:
+                continue
+
+            locality_hot_draws += int(local_draws)
+            for local_pos, bonus_pair in zip(replace_positions[:actual_replace], bonus_pairs[:actual_replace]):
+                batch_pairs[int(local_pos)] = bonus_pair
+            planned_pairs[start:end] = batch_pairs
+            used_budget += int(actual_replace)
+
+        resident_counter = Counter(int(sample_id) for sample_id, _ in planned_pairs)
+        resident_duplicates = sum(
+            max(0, count - 1)
+            for sample_id, count in resident_counter.items()
+            if sample_id in hotset_id_set
+        )
+        hotset_resident_overlap = sum(
+            1 for sample_id in hotset_id_set
+            if resident_lookup is not None and resident_lookup.get(int(sample_id), False)
+        )
+        total_unique = len({int(sample_id) for sample_id, _ in epoch_pairs})
+        return planned_pairs, {
+            "sampler": "logical_hotset",
+            "resident_rate": resident_count / max(1, len(epoch_pairs)),
+            "resident_count": int(resident_count),
+            "nonresident_count": int(nonresident_count),
+            "resident_unique": int(resident_unique),
+            "nonresident_unique": int(max(0, total_unique - resident_unique)),
+            "boosted_resident": int(used_budget),
+            "resident_duplicates": int(resident_duplicates),
+            "weighted_resident_draws": int(used_budget),
+            "replaced_nonresident": int(used_budget),
+            "batch_resident_fraction": float(self.hot_fraction),
+            "batch_resident_quota": int(batch_hot_quota),
+            "planned_size": len(planned_pairs),
+            "hotset_size": len(hotset_ids),
+            "hotset_target_size": int(target_hotset_size),
+            "hotset_retained": int(hotset_retained),
+            "hotset_newcomers": int(hotset_newcomers),
+            "hotset_resident_overlap": int(hotset_resident_overlap),
+            "locality_window_batches": int(self.locality_window_batches),
+            "locality_hot_draws": int(locality_hot_draws),
+            "ghost_size": 0,
+            "ghost_candidates": 0,
+            "ghost_admissions": 0,
+            "ghost_rejections": 0,
+        }

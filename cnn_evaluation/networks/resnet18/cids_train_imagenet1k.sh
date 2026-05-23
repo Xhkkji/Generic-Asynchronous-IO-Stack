@@ -29,6 +29,10 @@ ENABLE_PROFILE="${ENABLE_PROFILE:-1}"
 REGISTERED_SKIP_FRONT="${REGISTERED_SKIP_FRONT:-0}"
 COLD_START="${COLD_START:-1}"
 AUTO_LOG="${AUTO_LOG:-1}"
+# registered 调试/诊断开关
+CIDS_REGISTERED_TRACE_CALLS="${CIDS_REGISTERED_TRACE_CALLS:-0}"
+CIDS_REGISTERED_POLL_TIMEOUT_SEC="${CIDS_REGISTERED_POLL_TIMEOUT_SEC:-60}"
+CIDS_REGISTERED_POLL_LOG_INTERVAL="${CIDS_REGISTERED_POLL_LOG_INTERVAL:-128}"
 # shader cache相关
 SHUFFLE="${SHUFFLE:-1}"
 ENABLE_SAMPLE_CACHE="${ENABLE_SAMPLE_CACHE:-0}"
@@ -41,16 +45,21 @@ IMPORTANCE_TOPK="${IMPORTANCE_TOPK:-5}"
 # PADS resident 调度策略：
 # - replace: 轻量 resident 替换
 # - shade: 更接近 SHADE 的 locality replay
-PADS_STRATEGY="${PADS_STRATEGY:-shade}"  
+# - hotset: 逻辑 hotset 主导的“高质量样本 + 随机覆盖”混合提交
+PADS_STRATEGY="${PADS_STRATEGY:-hotset}"  
 if [[ -z "${PADS_BIAS_SCALE+x}" ]]; then
-  if [[ "${PADS_STRATEGY}" == "shade" ]]; then
+  if [[ "${PADS_STRATEGY}" == "hotset" ]]; then
+    PADS_BIAS_SCALE="0.0625"
+  elif [[ "${PADS_STRATEGY}" == "shade" ]]; then
     PADS_BIAS_SCALE="0.35"
   else
     PADS_BIAS_SCALE="0.10"
   fi
 fi
 if [[ -z "${PADS_MAX_REPLACE_FRACTION+x}" ]]; then
-  if [[ "${PADS_STRATEGY}" == "shade" ]]; then
+  if [[ "${PADS_STRATEGY}" == "hotset" ]]; then
+    PADS_MAX_REPLACE_FRACTION="0.008"
+  elif [[ "${PADS_STRATEGY}" == "shade" ]]; then
     PADS_MAX_REPLACE_FRACTION="0.008"
   else
     PADS_MAX_REPLACE_FRACTION="0.003"
@@ -74,7 +83,7 @@ if [[ "${AUTO_LOG}" == "1" ]]; then
     else
       LOG_SUFFIX="bam_nopolicy"
     fi
-    LOG_PATH="${SCRIPT_DIR}/output_${IO_MODE}_${LOG_SUFFIX}_cache4096_3epoch.log"
+    LOG_PATH="${SCRIPT_DIR}/output_${IO_MODE}_${LOG_SUFFIX}_cache4096_1epoch_hotest.log"
   fi
   exec > >(tee "${LOG_PATH}") 2>&1
   echo "[CIDS_RESNET18] auto log -> ${LOG_PATH}"
@@ -94,6 +103,9 @@ sudo env \
   CIDS_DEBUG="${CIDS_DEBUG:-0}" \
   CIDS_REGISTERED_TRY_WINDOW_SIZE="${CIDS_REGISTERED_TRY_WINDOW_SIZE:-2}" \
   CIDS_REGISTERED_POLL_DEBUG="${CIDS_REGISTERED_POLL_DEBUG:-0}" \
+  CIDS_REGISTERED_TRACE_CALLS="${CIDS_REGISTERED_TRACE_CALLS}" \
+  CIDS_REGISTERED_POLL_TIMEOUT_SEC="${CIDS_REGISTERED_POLL_TIMEOUT_SEC}" \
+  CIDS_REGISTERED_POLL_LOG_INTERVAL="${CIDS_REGISTERED_POLL_LOG_INTERVAL}" \
   CIDS_PROFILE_GPU_TIMING="${CIDS_PROFILE_GPU_TIMING:-0}" \
   /home/xhk/miniconda3/envs/pytorch/bin/python "${SCRIPT_DIR}/cids_train.py" \
   --train-root "${REPO_ROOT}/dataset/imagenet/imagenet1k_subset_190_20_pad416/cids_train_u8_pad416_bam" \

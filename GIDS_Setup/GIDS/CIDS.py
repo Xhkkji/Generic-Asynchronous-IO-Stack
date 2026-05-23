@@ -89,6 +89,15 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
             "CIDS_DEBUG", "0") not in ("0", "", "false", "False")
         self.profile_gpu_timing = os.environ.get(
             "CIDS_PROFILE_GPU_TIMING", "0") not in ("0", "", "false", "False")
+        self.trace_registered_calls = os.environ.get(
+            "CIDS_REGISTERED_TRACE_CALLS", "0") not in ("0", "", "false", "False")
+        # registered front-request 超时保护：
+        # 如果底层 request 长时间不进入 READY，就主动报错并打印状态，
+        # 避免训练线程无限挂在 next(data_iter) 上。
+        self.poll_timeout_sec = float(os.environ.get(
+            "CIDS_REGISTERED_POLL_TIMEOUT_SEC", "60"))
+        self.poll_log_interval = max(1, int(os.environ.get(
+            "CIDS_REGISTERED_POLL_LOG_INTERVAL", "128")))
 
         self._warmup_prefetch_queue()
 
@@ -96,6 +105,12 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
         # 统一调试输出入口，默认关闭。
         if self.debug:
             print(f"[CIDS] {message}", flush=True)
+
+    def _trace_registered_log(self, message):
+        # registered 关键调用跟踪：
+        # 打开后能区分是卡在 poll 还是卡在 get。
+        if self.trace_registered_calls:
+            print(f"[CIDS_REGISTERED_TRACE] {message}", flush=True)
 
     def _sync_for_profile_timing(self):
         # 仅在 profiling 时把异步 GPU 工作结算到当前阶段区间里，便于看到 submit/poll/get 的 GPU 时间。
@@ -304,6 +319,32 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
         self.CIDS_Loader.service_registered_try_poll_window_skip_front(
             self.try_window_size)
 
+    def _registered_queue_snapshot(self, max_entries=8):
+        # 抓一份 outstanding 队列摘要，方便超时后定位卡住的 request。
+        outstanding = int(self.CIDS_Loader.get_registered_outstanding_count())
+        ready_front = int(self.CIDS_Loader.get_registered_ready_front_request_id())
+        entries = []
+        for offset in range(min(max_entries, max(0, outstanding))):
+            try:
+                request_id = int(self.CIDS_Loader.get_registered_request_id_at(offset))
+                state = int(self.CIDS_Loader.get_registered_request_state_at(offset))
+            except Exception as exc:
+                entries.append({
+                    "offset": offset,
+                    "error": repr(exc),
+                })
+                break
+            entries.append({
+                "offset": offset,
+                "request_id": request_id,
+                "state": state,
+            })
+        return {
+            "outstanding": outstanding,
+            "ready_front": ready_front,
+            "entries": entries,
+        }
+
     def _poll_request_ready(self, expected_request_id):
         # 只等待当前 front 的一个 sub-request ready。
         if expected_request_id == 0:
@@ -317,16 +358,30 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
             f"ready_front={ready_front}"
         )
         try_loops = 0
+        wait_start_time = time.perf_counter()
         while True:
             # 对当前 front sub-request，始终优先走 compatible poll。
             # rowctx registered 的 front request 需要这个路径主动把 page 从
             # SUBMITTED/NV_NB 推进到 READY；try_poll 只做 completion/ready 检查，
             # 在 outstanding>1 时单独用它容易一直卡住。
             with record_function("cids.registered.poll"):
+                self._trace_registered_log(
+                    f"phase=poll_enter expected_request_id={expected_request_id} "
+                    f"ready_front={self.CIDS_Loader.get_registered_ready_front_request_id()} "
+                    f"outstanding={self.CIDS_Loader.get_registered_outstanding_count()} "
+                    f"loops={try_loops}"
+                )
                 request_id = self.CIDS_Loader.service_registered_poll_compatible()
+                self._trace_registered_log(
+                    f"phase=poll_return expected_request_id={expected_request_id} "
+                    f"returned_request_id={request_id} "
+                    f"ready_front={self.CIDS_Loader.get_registered_ready_front_request_id()} "
+                    f"outstanding={self.CIDS_Loader.get_registered_outstanding_count()} "
+                    f"loops={try_loops + 1}"
+                )
                 self._sync_for_profile_timing()
             try_loops += 1
-            if try_loops == 1 or try_loops % 16 == 0:
+            if try_loops == 1 or try_loops % self.poll_log_interval == 0:
                 self._debug_log(
                     f"等待中 expected={expected_request_id} "
                     f"returned={request_id} "
@@ -343,6 +398,16 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
                     f"returned={request_id} ready_front={ready_front} loops={try_loops}"
                 )
                 return
+            elapsed = time.perf_counter() - wait_start_time
+            if elapsed >= self.poll_timeout_sec:
+                snapshot = self._registered_queue_snapshot()
+                raise RuntimeError(
+                    "registered front request timed out while waiting for READY: "
+                    f"expected_request_id={expected_request_id} "
+                    f"last_returned_request_id={request_id} "
+                    f"elapsed_sec={elapsed:.2f} "
+                    f"queue_snapshot={snapshot}"
+                )
 
     def __iter__(self):
         return self
@@ -359,9 +424,19 @@ class _PrefetchingIter_async_registered_try_service_cids(object):
             self._debug_log(f"准备消费 sub-request request_id={request_id}")
             self._poll_request_ready(request_id)
             with record_function("cids.registered.get"):
+                self._trace_registered_log(
+                    f"phase=get_enter request_id={request_id} "
+                    f"ready_front={self.CIDS_Loader.get_registered_ready_front_request_id()} "
+                    f"outstanding={self.CIDS_Loader.get_registered_outstanding_count()}"
+                )
                 split_batches.append(
                     self.CIDS_Loader.fetch_samples_get_registered(
                         split_batch, self.CIDS_Loader.cids_device)
+                )
+                self._trace_registered_log(
+                    f"phase=get_return request_id={request_id} "
+                    f"ready_front={self.CIDS_Loader.get_registered_ready_front_request_id()} "
+                    f"outstanding={self.CIDS_Loader.get_registered_outstanding_count()}"
                 )
                 self._sync_for_profile_timing()
             self._debug_log(f"完成消费 sub-request request_id={request_id}")
