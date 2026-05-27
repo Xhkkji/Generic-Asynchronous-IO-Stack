@@ -718,6 +718,8 @@ class CIDS(object):
         self.return_sample_ids = False
 
         self.GIDS_submit_time = 0.0
+        self.GIDS_poll_time = 0.0
+        self.GIDS_get_time = 0.0
         self.GIDS_wait_time = 0.0
 
         self.GIDS_controller = BAM_Feature_Store.GIDS_Controllers()
@@ -1011,8 +1013,8 @@ class CIDS(object):
 
     def fetch_samples_submit_registered(self, batch, device):
         # 提交一个图片 batch 的异步 SSD->GPU 读取请求。
-        s_time = time.time()
         row_indices = self._build_row_indices_from_batch(batch)
+        s_time = time.time()
         request_id = self.BAM_FS.read_feature_submit_async_registered_rowctx(
             row_indices.data_ptr(),
             len(row_indices),
@@ -1051,7 +1053,6 @@ class CIDS(object):
 
     def fetch_samples_get_registered(self, batch, device):
         # 获取一个已经 ready 的图片 batch，并 reshape 回 [B, C, H, W]。
-        s_time = time.time()
         sample_ids = self._sample_ids_from_batch(batch)
         batch_size = len(sample_ids)
         images = torch.zeros(
@@ -1059,27 +1060,34 @@ class CIDS(object):
             dtype=self.return_dtype,
             device=self.cids_device,
         ).contiguous()
+        s_time = time.time()
         self.BAM_FS.read_feature_get_feature_light_registered_rowctx(
             images.data_ptr())
+        elapsed = time.time() - s_time
+        self.GIDS_get_time += elapsed
+        self.GIDS_wait_time += elapsed
         images = images.view(batch_size, self.storage_sample_dim)
         images = images[:, :self.sample_dim].contiguous()
         images = images.view(batch_size, *self.sample_shape)
         images = _images_to_training_tensor(images, self.sample_dtype_name)
-        self.GIDS_wait_time += time.time() - s_time
         return self._format_return_batch(batch, images)
 
     def service_registered_poll_compatible(self):
         # 单 outstanding 或兜底路径的阻塞轮询。
         s_time = time.time()
         request_id = self.BAM_FS.service_registered_poll_compatible()
-        self.GIDS_wait_time += time.time() - s_time
+        elapsed = time.time() - s_time
+        self.GIDS_poll_time += elapsed
+        self.GIDS_wait_time += elapsed
         return request_id
 
     def service_registered_try_poll(self):
         # front request 的主轮询入口。
         s_time = time.time()
         request_id = self.BAM_FS.service_registered_try_poll()
-        self.GIDS_wait_time += time.time() - s_time
+        elapsed = time.time() - s_time
+        self.GIDS_poll_time += elapsed
+        self.GIDS_wait_time += elapsed
         return request_id
 
     def service_registered_try_poll_window_skip_front(self, window_size):
@@ -1087,7 +1095,9 @@ class CIDS(object):
         s_time = time.time()
         request_id = self.BAM_FS.service_registered_try_poll_window_skip_front(
             window_size)
-        self.GIDS_wait_time += time.time() - s_time
+        elapsed = time.time() - s_time
+        self.GIDS_poll_time += elapsed
+        self.GIDS_wait_time += elapsed
         return request_id
 
     def get_registered_outstanding_count(self):

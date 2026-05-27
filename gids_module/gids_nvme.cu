@@ -7,8 +7,10 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <stdio.h>
@@ -59,6 +61,112 @@ uint64_t env_u64(const char *name, uint64_t fallback)
   }
 
   return static_cast<uint64_t>(parsed);
+}
+
+template <typename TYPE>
+std::string registered_queue_snapshot(const BaM_IOStack<TYPE> &iostack,
+                                      uint64_t max_entries = 4)
+{
+  std::ostringstream oss;
+  const uint64_t outstanding = iostack.outstanding_count();
+  oss << "outstanding=" << outstanding;
+  oss << " front_ready_request_id=" << iostack.front_ready_request_id();
+  oss << " last_consumed_request_id=" << iostack.get_last_consumed_request_id();
+  oss << " entries=[";
+  const uint64_t sample_count = outstanding < max_entries ? outstanding : max_entries;
+  for (uint64_t i = 0; i < sample_count; ++i)
+  {
+    const auto *meta = iostack.outstanding_at(i);
+    if (meta == nullptr)
+    {
+      break;
+    }
+    if (i != 0)
+    {
+      oss << "; ";
+    }
+    oss << "{offset=" << i
+        << ", request_id=" << meta->request_id
+        << ", state=" << static_cast<uint32_t>(meta->state)
+        << ", num_index=" << meta->num_index
+        << ", dim=" << meta->dim
+        << ", cache_dim=" << meta->cache_dim
+        << ", ctx_stride=" << meta->ctx_stride
+        << ", ctx_count=" << meta->ctx_count
+        << ", index_ptr=0x" << std::hex << meta->index_ptr << std::dec
+        << "}";
+  }
+  oss << "]";
+  return oss.str();
+}
+
+template <typename TYPE>
+void wait_for_registered_poll_kernel(BaM_IOStack<TYPE> &iostack,
+                                     const typename BaM_IOStack<TYPE>::outstanding_meta_t &meta,
+                                     uint64_t request_id,
+                                     bool debug_poll)
+{
+  const uint64_t timeout_sec = env_u64("CIDS_REGISTERED_POLL_TIMEOUT_SEC", 0);
+  if (timeout_sec == 0)
+  {
+    cuda_err_chk(cudaDeviceSynchronize());
+    return;
+  }
+
+  cudaEvent_t done_event = nullptr;
+  cuda_err_chk(cudaEventCreateWithFlags(&done_event, cudaEventDisableTiming));
+  cuda_err_chk(cudaEventRecord(done_event));
+
+  const auto start = Clock::now();
+  int64_t last_logged_sec = -1;
+  while (true)
+  {
+    const cudaError_t query_err = cudaEventQuery(done_event);
+    if (query_err == cudaSuccess)
+    {
+      cuda_err_chk(cudaEventDestroy(done_event));
+      return;
+    }
+    if (query_err != cudaErrorNotReady)
+    {
+      const std::string snapshot = registered_queue_snapshot(iostack);
+      cudaEventDestroy(done_event);
+      std::ostringstream oss;
+      oss << "registered poll kernel query failed request_id=" << request_id
+          << " cuda_error=" << static_cast<int>(query_err)
+          << " (" << cudaGetErrorString(query_err) << ") "
+          << snapshot;
+      throw std::runtime_error(oss.str());
+    }
+
+    const auto now = Clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
+    if (elapsed >= static_cast<int64_t>(timeout_sec))
+    {
+      const std::string snapshot = registered_queue_snapshot(iostack);
+      cudaEventDestroy(done_event);
+      std::ostringstream oss;
+      oss << "registered poll kernel timeout request_id=" << request_id
+          << " elapsed_sec=" << elapsed
+          << " num_index=" << meta.num_index
+          << " dim=" << meta.dim
+          << " cache_dim=" << meta.cache_dim
+          << " ctx_stride=" << meta.ctx_stride
+          << " ctx_count=" << meta.ctx_count
+          << " index_ptr=0x" << std::hex << meta.index_ptr << std::dec
+          << " " << snapshot;
+      throw std::runtime_error(oss.str());
+    }
+
+    if (debug_poll && elapsed > 0 && (elapsed % 5) == 0 && elapsed != last_logged_sec)
+    {
+      last_logged_sec = elapsed;
+      printf("[REGISTERED_POLL_COMPAT] waiting request_id=%llu elapsed_sec=%lld\n",
+             (unsigned long long)request_id,
+             (long long)elapsed);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 void dump_warp_ctxs(const char *stage, s_ctx *d_warp_ctxs, uint64_t total_warps)
@@ -1119,7 +1227,7 @@ uint64_t BAM_Feature_Store<TYPE>::service_registered_poll_compatible()
            static_cast<int>(launch_err),
            cudaGetErrorString(launch_err));
   }
-  cuda_err_chk(cudaDeviceSynchronize());
+  wait_for_registered_poll_kernel(this->iostack, *outstanding, request_id, debug_poll);
   if (debug_poll)
   {
     printf("[REGISTERED_POLL_COMPAT] synchronized request_id=%llu\n",

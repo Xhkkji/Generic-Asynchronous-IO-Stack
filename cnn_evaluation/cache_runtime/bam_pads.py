@@ -238,9 +238,9 @@ class ShadePADSPlanner(BAMPADSPlanner):
         self,
         ghost_capacity=8192,
         ghost_score_margin=0.5,
-        replay_bias_scale=1.0,
-        max_replace_fraction=0.0625,
-        locality_window=32,
+        replay_bias_scale=0.12,
+        max_replace_fraction=0.002,
+        locality_window=16,
     ):
         super().__init__(
             ghost_capacity=ghost_capacity,
@@ -438,6 +438,10 @@ class LogicalHotsetPADSPlanner:
     # - 主策略来源是 sample-level importance 表，而不是瞬时物理 resident 集
     # - resident lookup 只在 epoch 边界做一次低频校准，用来估计 hotset 容量
     # - 每个 batch 混入少量逻辑 hot sample，其余仍然保留随机/原始覆盖
+    # - 和 shade 的靠近方式：
+    #   1) hotset 仍然是主容器
+    #   2) resident overlap 参与 replay 排序
+    #   3) replay 优先落在短窗口内，主动制造 locality
     def __init__(
         self,
         hot_fraction=0.0625,
@@ -494,6 +498,15 @@ class LogicalHotsetPADSPlanner:
         total_budget = min(int(hot_count), int(capped_budget), int(scaled_budget))
         return int(total_budget), int(batch_hot_quota), int(num_batches)
 
+    def _score_hot_entry(self, entry):
+        # hotset 内部排序：
+        # - resident overlap 是加分项
+        # - importance 仍然是主信号
+        return (
+            1 if entry["resident"] else 0,
+            float(entry["score"]),
+        )
+
     def _select_replace_positions(self, batch_pairs, importance_tracker, hotset_ids, quota):
         if quota <= 0:
             return []
@@ -536,6 +549,63 @@ class LogicalHotsetPADSPlanner:
         for entry in selected:
             entry["used"] = True
         return [entry["pair"] for entry in selected], int(sample_count)
+
+    def _draw_bonus_pairs_staged(self, hot_entries, batch_idx, excluded_ids, quota, generator):
+        if quota <= 0:
+            return [], {
+                "resident_hot_draws": 0,
+                "fallback_hot_draws": 0,
+                "locality_hot_draws": 0,
+            }
+
+        local_entries = [
+            entry for entry in hot_entries
+            if abs(int(entry["home_batch"]) - int(batch_idx)) <= self.locality_window_batches
+        ]
+        local_resident = [entry for entry in local_entries if entry["resident"]]
+        local_nonresident = [entry for entry in local_entries if not entry["resident"]]
+        global_resident = [entry for entry in hot_entries if entry["resident"]]
+
+        selected_pairs = []
+        resident_hot_draws = 0
+        fallback_hot_draws = 0
+        locality_hot_draws = 0
+
+        # staged replay：
+        # 1) 优先复用窗口内且当前 resident 的 hot sample
+        # 2) 再退化到窗口内其它 hot sample
+        # 3) 最后才用全局 resident / 全局 hotset 兜底
+        stages = [
+            (local_resident, "local_resident"),
+            (local_nonresident, "local_hot"),
+            (global_resident, "global_resident"),
+            (hot_entries, "global_hot"),
+        ]
+        for candidates, stage_name in stages:
+            remaining = int(quota) - len(selected_pairs)
+            if remaining <= 0:
+                break
+            bonus_pairs, draw_count = self._draw_bonus_pairs(
+                candidate_entries=candidates,
+                excluded_ids=excluded_ids,
+                quota=remaining,
+                generator=generator,
+            )
+            if not bonus_pairs:
+                continue
+            selected_pairs.extend(bonus_pairs)
+            if stage_name in ("local_resident", "global_resident"):
+                resident_hot_draws += int(draw_count)
+            else:
+                fallback_hot_draws += int(draw_count)
+            if stage_name.startswith("local_"):
+                locality_hot_draws += int(draw_count)
+
+        return selected_pairs, {
+            "resident_hot_draws": int(resident_hot_draws),
+            "fallback_hot_draws": int(fallback_hot_draws),
+            "locality_hot_draws": int(locality_hot_draws),
+        }
 
     def build_next_epoch_plan(
         self,
@@ -600,10 +670,11 @@ class LogicalHotsetPADSPlanner:
                     "pair": (sample_id, int(label)),
                     "score": _importance_score(importance_tracker, sample_id),
                     "home_batch": int(entry_idx) // max(1, int(batch_size)),
+                    "resident": bool(resident_lookup is not None and resident_lookup.get(sample_id, False)),
                     "used": False,
                 }
             )
-        hot_entries.sort(key=lambda item: float(item["score"]), reverse=True)
+        hot_entries.sort(key=self._score_hot_entry, reverse=True)
 
         total_budget, batch_hot_quota, num_batches = self._epoch_budget(
             epoch_size=len(epoch_pairs),
@@ -647,6 +718,8 @@ class LogicalHotsetPADSPlanner:
         generator.manual_seed(int(shuffle_seed))
         used_budget = 0
         locality_hot_draws = 0
+        resident_hot_draws = 0
+        fallback_hot_draws = 0
         for batch_idx in range(num_batches):
             start = int(batch_idx) * int(batch_size)
             end = min(len(epoch_pairs), start + int(batch_size))
@@ -669,29 +742,20 @@ class LogicalHotsetPADSPlanner:
                 continue
 
             batch_sample_ids = {int(sample_id) for sample_id, _label in batch_pairs}
-            local_candidates = [
-                entry for entry in hot_entries
-                if abs(int(entry["home_batch"]) - int(batch_idx)) <= self.locality_window_batches
-            ]
-            bonus_pairs, local_draws = self._draw_bonus_pairs(
-                candidate_entries=local_candidates,
+            bonus_pairs, draw_summary = self._draw_bonus_pairs_staged(
+                hot_entries=hot_entries,
+                batch_idx=batch_idx,
                 excluded_ids=batch_sample_ids,
                 quota=len(replace_positions),
                 generator=generator,
             )
-            if len(bonus_pairs) < len(replace_positions):
-                fallback_bonus, _fallback_count = self._draw_bonus_pairs(
-                    candidate_entries=hot_entries,
-                    excluded_ids=batch_sample_ids,
-                    quota=len(replace_positions) - len(bonus_pairs),
-                    generator=generator,
-                )
-                bonus_pairs.extend(fallback_bonus)
             actual_replace = min(len(replace_positions), len(bonus_pairs))
             if actual_replace <= 0:
                 continue
 
-            locality_hot_draws += int(local_draws)
+            locality_hot_draws += int(draw_summary["locality_hot_draws"])
+            resident_hot_draws += int(draw_summary["resident_hot_draws"])
+            fallback_hot_draws += int(draw_summary["fallback_hot_draws"])
             for local_pos, bonus_pair in zip(replace_positions[:actual_replace], bonus_pairs[:actual_replace]):
                 batch_pairs[int(local_pos)] = bonus_pair
             planned_pairs[start:end] = batch_pairs
@@ -729,6 +793,8 @@ class LogicalHotsetPADSPlanner:
             "hotset_resident_overlap": int(hotset_resident_overlap),
             "locality_window_batches": int(self.locality_window_batches),
             "locality_hot_draws": int(locality_hot_draws),
+            "resident_hot_draws": int(resident_hot_draws),
+            "fallback_hot_draws": int(fallback_hot_draws),
             "ghost_size": 0,
             "ghost_candidates": 0,
             "ghost_admissions": 0,

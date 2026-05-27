@@ -358,11 +358,11 @@ def _format_bam_policy_summary(summary):
 
 def _zero_stage_times():
     # Stage 口径：
-    # - route: 策略/调度，包括 request submit 与 epoch 末重排
+    # - route: 策略/调度，包括预取提交、resident/hotset/shade 规划、loader 重建
     # - extract: 数据取回、4-row 组装、to(device)、预处理
-    # - compute: forward/backward/update 主训练计算
-    # - apply: step 结果落账、分数/importance/policy/reuse 元数据更新
-    # - io_stall: registered/sync 路径显式暴露出来的等待时间
+    # - compute: forward/backward/update 及其结果同步/落账
+    # - apply: 分数计数、importance/policy/hotset 等状态写回
+    # - io_stall: 显式轮询/等待时间
     return {
         "route_time_sec": 0.0,
         "extract_time_sec": 0.0,
@@ -524,6 +524,8 @@ def _format_pads_summary(summary):
         f"hotset_resident_overlap={summary.get('hotset_resident_overlap', 0)} "
         f"locality_window_batches={summary.get('locality_window_batches', 0)} "
         f"locality_hot_draws={summary.get('locality_hot_draws', 0)} "
+        f"resident_hot_draws={summary.get('resident_hot_draws', 0)} "
+        f"fallback_hot_draws={summary.get('fallback_hot_draws', 0)} "
         f"planned_size={summary.get('planned_size', 0)}"
     )
 
@@ -678,7 +680,7 @@ def train_one_epoch(
         logits = model(images)
         sample_losses = F.cross_entropy(logits, labels, reduction="none")
         loss = sample_losses.mean()
-        compute_prefix_time = time.perf_counter() - compute_start_time
+        stage_times["compute_time_sec"] += time.perf_counter() - compute_start_time
 
         sample_scores = None
         apply_start_time = time.perf_counter()
@@ -709,9 +711,6 @@ def train_one_epoch(
         compute_suffix_start_time = time.perf_counter()
         loss.backward()
         optimizer.step()
-        stage_times["compute_time_sec"] += compute_prefix_time + (time.perf_counter() - compute_suffix_start_time)
-
-        apply_tail_start_time = time.perf_counter()
         total_loss += loss.item() * images.size(0)
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
         total_samples += images.size(0)
@@ -726,12 +725,7 @@ def train_one_epoch(
             )
         if profiler is not None:
             profiler.step()
-        # 这部分属于所有分支共有的“结果落账/状态应用”：
-        # - 从本 step 结果提取标量
-        # - 更新运行期指标
-        # - profiler 结算当前 step
-        # 有 policy 的分支会在前面的 apply 块上再叠加 importance/bam policy 成本。
-        stage_times["apply_time_sec"] += time.perf_counter() - apply_tail_start_time
+        stage_times["compute_time_sec"] += time.perf_counter() - compute_suffix_start_time
         if max_iters is not None and step_idx >= max_iters:
             break
 
@@ -955,7 +949,7 @@ def main():
     elif pads_strategy == "hotset":
         pads_bias_scale = 0.0625 if args.io_mode == "registered" else 0.10
     elif pads_strategy == "shade":
-        pads_bias_scale = 0.35
+        pads_bias_scale = 0.12 if args.io_mode == "registered" else 0.18
     else:
         pads_bias_scale = 0.15 if args.io_mode == "registered" else 0.25
     if args.pads_max_replace_fraction >= 0.0:
@@ -963,7 +957,7 @@ def main():
     elif pads_strategy == "hotset":
         pads_max_replace_fraction = 0.008 if args.io_mode == "registered" else 0.015
     elif pads_strategy == "shade":
-        pads_max_replace_fraction = 0.008 if args.io_mode == "registered" else 0.03
+        pads_max_replace_fraction = 0.002 if args.io_mode == "registered" else 0.004
     else:
         pads_max_replace_fraction = 0.005 if args.io_mode == "registered" else 0.01
     if enable_sample_importance:
@@ -986,7 +980,7 @@ def main():
             pads_planner = ShadePADSPlanner(
                 replay_bias_scale=pads_bias_scale,
                 max_replace_fraction=pads_max_replace_fraction,
-                locality_window=32 if args.io_mode == "registered" else 16,
+                locality_window=16 if args.io_mode == "registered" else 8,
             )
         else:
             pads_planner = BAMPADSPlanner(
@@ -1190,6 +1184,8 @@ def main():
         for epoch in range(args.epochs):
             epoch_stage_times = _zero_stage_times()
             submit_time_before = train_cids.GIDS_submit_time if train_cids is not None else 0.0
+            poll_time_before = train_cids.GIDS_poll_time if train_cids is not None else 0.0
+            get_time_before = train_cids.GIDS_get_time if train_cids is not None else 0.0
             wait_time_before = train_cids.GIDS_wait_time if train_cids is not None else 0.0
             train_loss, train_acc, epoch_train_iters, epoch_pairs, train_stage_times = train_one_epoch(
                 model, train_loader, optimizer, criterion, device, image_preprocessor,
@@ -1204,15 +1200,26 @@ def main():
             )
             total_train_iters += epoch_train_iters
             submit_time = train_cids.GIDS_submit_time if train_cids is not None else 0.0
+            poll_time = train_cids.GIDS_poll_time if train_cids is not None else 0.0
+            get_time = train_cids.GIDS_get_time if train_cids is not None else 0.0
             wait_time = train_cids.GIDS_wait_time if train_cids is not None else 0.0
             submit_time_delta = max(0.0, submit_time - submit_time_before)
+            poll_time_delta = max(0.0, poll_time - poll_time_before)
+            get_time_delta = max(0.0, get_time - get_time_before)
             wait_time_delta = max(0.0, wait_time - wait_time_before)
-            epoch_stage_times["route_time_sec"] += submit_time_delta
-            epoch_stage_times["io_stall_time_sec"] += wait_time_delta
-            epoch_stage_times["extract_time_sec"] += max(
-                0.0,
-                train_stage_times["extract_time_sec"] - submit_time_delta - wait_time_delta,
-            )
+            if args.io_mode == "registered":
+                epoch_stage_times["route_time_sec"] += submit_time_delta
+                epoch_stage_times["io_stall_time_sec"] += poll_time_delta
+                epoch_stage_times["extract_time_sec"] += max(
+                    0.0,
+                    train_stage_times["extract_time_sec"] - submit_time_delta - poll_time_delta,
+                )
+            else:
+                epoch_stage_times["extract_time_sec"] += max(
+                    0.0,
+                    train_stage_times["extract_time_sec"] - wait_time_delta,
+                )
+                epoch_stage_times["io_stall_time_sec"] += wait_time_delta
             epoch_stage_times["compute_time_sec"] += train_stage_times["compute_time_sec"]
             epoch_stage_times["apply_time_sec"] += train_stage_times["apply_time_sec"]
             print(
@@ -1341,9 +1348,10 @@ def main():
                             epoch_pairs=planned_pairs,
                             batch_size=args.batch_size,
                         )
-                epoch_stage_times["route_time_sec"] += time.perf_counter() - pads_stage_start_time
+                pads_stage_elapsed = time.perf_counter() - pads_stage_start_time
+                epoch_stage_times["route_time_sec"] += pads_stage_elapsed
             print(
-                f"[CIDS_STAGE] epoch={epoch + 1}/{args.epochs} "
+                f"[CIDS_RECA] epoch={epoch + 1}/{args.epochs} "
                 f"{_format_stage_times(epoch_stage_times)}",
                 flush=True,
             )
@@ -1383,7 +1391,7 @@ def main():
             flush=True,
         )
         print(
-            f"[CIDS_STAGE_SUMMARY] {_format_stage_times(total_stage_times)}",
+            f"[CIDS_RECA_SUMMARY] {_format_stage_times(total_stage_times)}",
             flush=True,
         )
 

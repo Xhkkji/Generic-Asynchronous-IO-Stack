@@ -18,7 +18,7 @@ REPO_ROOT=/home/xhk/hyperion/GIDS
 # 训练配置
 IO_MODE="${IO_MODE:-registered}"
 TORCH_READ_MODE="${TORCH_READ_MODE:-mmap}"
-EPOCHS="${EPOCHS:-3}"
+EPOCHS="${EPOCHS:-2}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 MAX_TRAIN_ITERS="${MAX_TRAIN_ITERS:-0}"
 RUN_VAL="${RUN_VAL:-0}"
@@ -46,12 +46,26 @@ IMPORTANCE_TOPK="${IMPORTANCE_TOPK:-5}"
 # - replace: 轻量 resident 替换
 # - shade: 更接近 SHADE 的 locality replay
 # - hotset: 逻辑 hotset 主导的“高质量样本 + 随机覆盖”混合提交
-PADS_STRATEGY="${PADS_STRATEGY:-hotset}"  
+PADS_STRATEGY="${PADS_STRATEGY:-replace}"  
+if [[ -z "${PADS_REP_FACTOR+x}" ]]; then
+  if [[ "${PADS_STRATEGY}" == "shade" ]]; then
+    PADS_REP_FACTOR="1.20"
+  else
+    PADS_REP_FACTOR="1.50"
+  fi
+fi
+if [[ -z "${PADS_ADAPTIVE+x}" ]]; then
+  if [[ "${PADS_STRATEGY}" == "shade" ]]; then
+    PADS_ADAPTIVE="0"
+  else
+    PADS_ADAPTIVE="1"
+  fi
+fi
 if [[ -z "${PADS_BIAS_SCALE+x}" ]]; then
   if [[ "${PADS_STRATEGY}" == "hotset" ]]; then
     PADS_BIAS_SCALE="0.0625"
   elif [[ "${PADS_STRATEGY}" == "shade" ]]; then
-    PADS_BIAS_SCALE="0.35"
+    PADS_BIAS_SCALE="0.12"
   else
     PADS_BIAS_SCALE="0.10"
   fi
@@ -60,7 +74,7 @@ if [[ -z "${PADS_MAX_REPLACE_FRACTION+x}" ]]; then
   if [[ "${PADS_STRATEGY}" == "hotset" ]]; then
     PADS_MAX_REPLACE_FRACTION="0.008"
   elif [[ "${PADS_STRATEGY}" == "shade" ]]; then
-    PADS_MAX_REPLACE_FRACTION="0.008"
+    PADS_MAX_REPLACE_FRACTION="0.002"
   else
     PADS_MAX_REPLACE_FRACTION="0.003"
   fi
@@ -75,16 +89,24 @@ PROFILE_DIR="${PROFILE_DIR:-${SCRIPT_DIR}/profiles/${PROFILE_MODE}}"
 mkdir -p "${PROFILE_DIR}"
 
 if [[ "${AUTO_LOG}" == "1" ]]; then
+  if [[ "${MAX_TRAIN_ITERS}" == "0" ]]; then
+    ITER_TAG="full"
+  else
+    ITER_TAG="it${MAX_TRAIN_ITERS}"
+  fi
+  EPOCH_TAG="e${EPOCHS}"
+  BATCH_TAG="bs${BATCH_SIZE}"
   if [[ "${IO_MODE}" == "torch" ]]; then
-    LOG_PATH="${SCRIPT_DIR}/output_torch_${TORCH_READ_MODE}.log"
+    LOG_STEM="output_torch_${TORCH_READ_MODE}_${EPOCH_TAG}_${BATCH_TAG}_${ITER_TAG}"
   else
     if [[ "${ENABLE_BAM_POLICY_CACHE}" == "1" ]]; then
-      LOG_SUFFIX="bam_policy_${PADS_STRATEGY}"
+      LOG_MODE="bam-${PADS_STRATEGY}"
     else
-      LOG_SUFFIX="bam_nopolicy"
+      LOG_MODE="bam-nopolicy"
     fi
-    LOG_PATH="${SCRIPT_DIR}/output_${IO_MODE}_${LOG_SUFFIX}_cache4096_1epoch_hotest.log"
+    LOG_STEM="output_${IO_MODE}_${LOG_MODE}_c${CACHE_SIZE}_${EPOCH_TAG}_${BATCH_TAG}_${ITER_TAG}"
   fi
+  LOG_PATH="${SCRIPT_DIR}/${LOG_STEM}.log"
   exec > >(tee "${LOG_PATH}") 2>&1
   echo "[CIDS_RESNET18] auto log -> ${LOG_PATH}"
 fi
@@ -132,5 +154,7 @@ sudo env \
   --importance-ema-alpha "${IMPORTANCE_EMA_ALPHA}" \
   --importance-topk "${IMPORTANCE_TOPK}" \
   --pads-strategy "${PADS_STRATEGY}" \
+  --pads-rep-factor "${PADS_REP_FACTOR}" \
+  --pads-adaptive "${PADS_ADAPTIVE}" \
   --pads-bias-scale "${PADS_BIAS_SCALE}" \
   --pads-max-replace-fraction "${PADS_MAX_REPLACE_FRACTION}"
